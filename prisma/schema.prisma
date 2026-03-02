@@ -1,0 +1,181 @@
+generator client {
+  provider = "prisma-client-js"
+  output   = "../node_modules/.prisma/client"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model User {
+  id               Int       @id @default(autoincrement())
+  firstname        String
+  lastname         String
+  username         String?   @unique
+  email            String?   @unique
+  mobile           String
+  country_code     String
+  balance          Decimal    @default(0) @db.Decimal(15, 2)
+  currency_symbol  String    @default("₦")
+  profile_complete String    @default("0")
+  status           Int       @default(1)
+  role             String    @default("customer")
+  ev               String    @default("0")
+  sv               String    @default("0")
+  tv               String    @default("0")
+  kv               String    @default("0")
+  image            String?
+  address          String?
+  state            String?
+  city             String?
+  zip              String?
+  pin              String?
+  created_at       DateTime  @default(now())
+  updated_at       DateTime  @updatedAt
+
+  password_resets  PasswordReset[]
+
+  @@map("users")
+}
+
+model FundingTransaction {
+  id                 Int      @id @default(autoincrement())
+  user_id            Int
+  tx_ref             String   @unique
+  flutterwave_tx_id  String?  @unique
+  amount             Decimal  @db.Decimal(15, 2)
+  currency           String   @default("NGN")
+  status             String   @default("pending")
+  raw_payload        Json?
+  credited_at        DateTime?
+  created_at         DateTime @default(now())
+  updated_at         DateTime @updatedAt
+
+  @@map("funding_transactions")
+}
+
+model WalletTransaction {
+  id           Int      @id @default(autoincrement())
+  user_id      Int
+  trx          String   @unique
+  trx_type     String
+  amount       Decimal  @db.Decimal(15, 2)
+  charge       Decimal  @default(0) @db.Decimal(15, 2)
+  total_amount Decimal  @db.Decimal(15, 2)
+  remark       String
+  details      String?
+  other_data   Json?
+  meta         Json?
+  created_at   DateTime @default(now())
+  updated_at   DateTime @updatedAt
+
+  @@index([user_id, created_at])
+  @@map("wallet_transactions")
+}
+
+model MonthlyStatement {
+  id                       Int      @id @default(autoincrement())
+  user_id                  Int
+  year                     Int
+  month                    Int
+  starting_balance         Decimal  @db.Decimal(15, 2)
+  ending_balance           Decimal  @db.Decimal(15, 2)
+  total_transaction_amount Decimal  @db.Decimal(15, 2)
+  total_transaction_count  Int      @default(0)
+  airtime_spent            Decimal  @default(0) @db.Decimal(15, 2)
+  data_spent               Decimal  @default(0) @db.Decimal(15, 2)
+  electricity_spent        Decimal  @default(0) @db.Decimal(15, 2)
+  cable_spent              Decimal  @default(0) @db.Decimal(15, 2)
+  transactions_snapshot    Json?
+  generated_at             DateTime @default(now())
+  updated_at               DateTime @updatedAt
+
+  @@unique([user_id, year, month])
+  @@index([user_id, year, month])
+  @@map("monthly_statements")
+}
+
+model PushNotification {
+  id                Int      @id @default(autoincrement())
+  user_id           Int
+  subject           String
+  message           String
+  notification_type String   @default("general")
+  image             String?
+  data              Json?
+  client_message_id String?
+  user_read         Boolean  @default(false)
+  created_at        DateTime @default(now())
+  updated_at        DateTime @updatedAt
+
+  @@index([user_id, created_at])
+  @@unique([user_id, client_message_id])
+  @@map("push_notifications")
+}
+
+model Country {
+  id                  Int      @id @default(autoincrement())
+  name                String
+  code                String   @unique
+  dial_code           String
+  mobile_number_digit Int      @default(10)
+  status              Int      @default(1)
+  image_src           String   @default("")
+  created_at          DateTime @default(now())
+  updated_at          DateTime @updatedAt
+
+  @@map("countries")
+}
+
+model Language {
+  id         Int      @id @default(autoincrement())
+  name       String
+  code       String   @unique
+  image      String?
+  status     Int      @default(1)
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  translations LanguageTranslation[]
+
+  @@map("languages")
+}
+
+model LanguageTranslation {
+  id                Int      @id @default(autoincrement())
+  language_code     String
+  translation_key   String
+  translation_value String
+  created_at        DateTime @default(now())
+  updated_at        DateTime @updatedAt
+
+  language Language @relation(fields: [language_code], references: [code], onDelete: Cascade)
+
+  @@unique([language_code, translation_key])
+  @@map("language_translations")
+}
+
+model AppSetting {
+  id           Int      @id @default(autoincrement())
+  setting_key  String   @unique
+  setting_value String?
+  description  String?
+  created_at   DateTime @default(now())
+  updated_at   DateTime @updatedAt
+
+  @@map("app_settings")
+}
+
+model PasswordReset {
+  id         Int      @id @default(autoincrement())
+  user_id    Int?
+  email      String?
+  token      String
+  expires_at DateTime
+  used       Boolean  @default(false)
+  created_at DateTime @default(now())
+
+  user User? @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@map("password_resets")
+}
