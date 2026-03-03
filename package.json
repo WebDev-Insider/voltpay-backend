@@ -23,7 +23,7 @@
     "flutter",
     "postgresql"
   ],
-  "author": "Your Name",
+  "author": "Henry Dustin",
   "license": "MIT",
   "engines": {
     "node": ">=18"

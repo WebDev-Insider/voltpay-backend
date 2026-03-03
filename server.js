@@ -38,6 +38,7 @@ const adminRoutes = require('./src/routes/admin.routes');
 const adminAuth = require('./src/middlewares/adminAuth.middleware');
 const session = require('./src/services/session.service');
 const { ensurePasswordResetsTable } = require('./src/models/passwordReset.model');
+const userAuth = require('./src/middlewares/userAuth.middleware');
 // Prefer IPv4 and keep-alive at the fetch/Undici layer used by Resend SDK
 try {
   const { Agent, setGlobalDispatcher } = require('undici');
@@ -155,6 +156,29 @@ if (process.env.HTTP_LOGGING === '1' || process.env.NODE_ENV !== 'production') {
 
 // API base prefix to match Flutter's UrlContainer.baseUrl = `${domain}/api/`
 const API_PREFIX = process.env.API_PREFIX || '/api';
+
+// Require login for every API route except a short allowlist
+const PUBLIC_API_PATHS = [
+  '/login',
+  '/register',
+  '/authentication',
+  '/authorization',
+  '/password',
+  '/add-device-token',
+  '/health',
+  '/policies',
+  '/faq',
+  '/funding/webhook'
+];
+
+function enforceLogin(req, res, next) {
+  const route = req.path || '';
+  const isPublic = PUBLIC_API_PATHS.some(publicPath => route.startsWith(publicPath));
+  if (isPublic) return next();
+  return userAuth(req, res, next);
+}
+
+app.use(API_PREFIX, enforceLogin);
 
 // Mount modular routes
 app.use(API_PREFIX, passwordRoutes);
