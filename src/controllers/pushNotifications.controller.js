@@ -1,5 +1,20 @@
 const prisma = require('../../database/prisma');
 
+function isAccelerateCommError(e) {
+  return Boolean(e && (e.code === 'P6000' || e?.meta?.code === 'P6000'));
+}
+
+async function withDirectFallback(run) {
+  try {
+    return await run(prisma);
+  } catch (e) {
+    if (isAccelerateCommError(e) && prisma.$direct) {
+      return await run(prisma.$direct);
+    }
+    throw e;
+  }
+}
+
 function getBaseUrl(req) {
   const configured = process.env.PUBLIC_BASE_URL || process.env.APP_URL || process.env.BACKEND_URL;
   if (configured) return String(configured).trim().replace(/\/+$/, '');
@@ -50,15 +65,15 @@ async function list(req, res) {
 
     const where = { user_id: Number(user.id) };
 
-    const [total, rows] = await Promise.all([
-      prisma.pushNotification.count({ where }),
-      prisma.pushNotification.findMany({
+    const [total, rows] = await withDirectFallback(p => Promise.all([
+      p.pushNotification.count({ where }),
+      p.pushNotification.findMany({
         where,
         orderBy: { id: 'desc' },
         skip,
         take: perPage,
       }),
-    ]);
+    ]));
 
     const base = getBaseUrl(req);
     const path = `${process.env.API_PREFIX || '/api'}/push-notifications`;
@@ -132,7 +147,7 @@ async function ingest(req, res) {
 
     let created;
     try {
-      created = await prisma.pushNotification.create({
+      created = await withDirectFallback(p => p.pushNotification.create({
         data: {
           user_id: Number(user.id),
           subject,
@@ -142,7 +157,7 @@ async function ingest(req, res) {
           data,
           client_message_id: client_message_id || null,
         },
-      });
+      }));
     } catch (e) {
       if (e?.code === 'P2002') {
         return res.json({ remark: 'notification_exists', status: 'success', message: ['Notification already stored'], data: null });
@@ -197,7 +212,7 @@ async function getSettings(req, res) {
     }
 
     const key = `notification_settings:user:${Number(user.id)}`;
-    const row = await prisma.appSetting.findUnique({ where: { setting_key: key } });
+    const row = await withDirectFallback(p => p.appSetting.findUnique({ where: { setting_key: key } }));
 
     let settings = { en: '1', pn: '1', sn: '1', is_allow_promotional_notify: '1' };
     if (row?.setting_value) {
@@ -261,11 +276,11 @@ async function setSettings(req, res) {
     const key = `notification_settings:user:${Number(user.id)}`;
     const value = JSON.stringify(settings);
 
-    await prisma.appSetting.upsert({
+    await withDirectFallback(p => p.appSetting.upsert({
       where: { setting_key: key },
       update: { setting_value: value, description: 'User notification settings' },
       create: { setting_key: key, setting_value: value, description: 'User notification settings' },
-    });
+    }));
 
     return res.json({
       remark: 'notification_settings_updated',
@@ -287,4 +302,101 @@ async function setSettings(req, res) {
   }
 }
 
-module.exports = { list, ingest, getSettings, setSettings };
+async function unreadCount(req, res) {
+  try {
+    const user = req.user;
+    if (!user) {
+      return res.status(401).json({ remark: 'unauthorized', status: 'error', message: ['Please login first'], data: null });
+    }
+
+    if (!prisma.pushNotification) {
+      return res.status(500).json({
+        remark: 'server_error',
+        status: 'error',
+        message: ['PushNotification model is not available. Run prisma generate + db push/migrate and restart the server.'],
+        data: null,
+      });
+    }
+
+    const count = await withDirectFallback(p => p.pushNotification.count({
+      where: { user_id: Number(user.id), user_read: false },
+    }));
+
+    return res.json({
+      remark: 'push_notifications_unread_count',
+      status: 'success',
+      message: ['Unread count fetched'],
+      data: { unread_count: Number(count || 0) },
+    });
+  } catch (e) {
+    console.error('Push notifications unreadCount error:', e);
+    return res.status(500).json({ remark: 'error', status: 'error', message: ['Failed to fetch unread count'], data: null });
+  }
+}
+
+async function markRead(req, res) {
+  try {
+    const user = req.user;
+    if (!user) {
+      return res.status(401).json({ remark: 'unauthorized', status: 'error', message: ['Please login first'], data: null });
+    }
+
+    if (!prisma.pushNotification) {
+      return res.status(500).json({
+        remark: 'server_error',
+        status: 'error',
+        message: ['PushNotification model is not available. Run prisma generate + db push/migrate and restart the server.'],
+        data: null,
+      });
+    }
+
+    const id = parseInt(req.params.id, 10);
+    if (!id || Number.isNaN(id)) {
+      return res.status(400).json({ remark: 'validation_error', status: 'error', message: ['Invalid notification id'], data: null });
+    }
+
+    const updated = await withDirectFallback(p => p.pushNotification.updateMany({
+      where: { id: Number(id), user_id: Number(user.id) },
+      data: { user_read: true },
+    }));
+
+    if (!updated || Number(updated.count || 0) <= 0) {
+      return res.status(404).json({ remark: 'not_found', status: 'error', message: ['Notification not found'], data: null });
+    }
+
+    return res.json({ remark: 'push_notification_read', status: 'success', message: ['Notification marked as read'], data: { id } });
+  } catch (e) {
+    console.error('Push notifications markRead error:', e);
+    return res.status(500).json({ remark: 'error', status: 'error', message: ['Failed to mark notification as read'], data: null });
+  }
+}
+
+async function markAllRead(req, res) {
+  try {
+    const user = req.user;
+    if (!user) {
+      return res.status(401).json({ remark: 'unauthorized', status: 'error', message: ['Please login first'], data: null });
+    }
+
+    if (!prisma.pushNotification) {
+      return res.status(500).json({
+        remark: 'server_error',
+        status: 'error',
+        message: ['PushNotification model is not available. Run prisma generate + db push/migrate and restart the server.'],
+        data: null,
+      });
+    }
+
+    const updated = await withDirectFallback(p => p.pushNotification.updateMany({
+      where: { user_id: Number(user.id), user_read: false },
+      data: { user_read: true },
+    }));
+
+    return res.json({ remark: 'push_notifications_read_all', status: 'success', message: ['Notifications marked as read'], data: { updated: Number(updated?.count || 0) } });
+  } catch (e) {
+    console.error('Push notifications markAllRead error:', e);
+    return res.status(500).json({ remark: 'error', status: 'error', message: ['Failed to mark all notifications as read'], data: null });
+  }
+}
+
+module.exports = { list, ingest, getSettings, setSettings, unreadCount, markRead, markAllRead };

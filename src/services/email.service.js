@@ -14,20 +14,38 @@ try {
 
 async function sendResetEmail(toEmail, code, fromArg) {
   const from = fromArg || process.env.RESEND_FROM || process.env.SMTP_FROM || 'no-reply@voltpay.local';
-  const subject = 'Your VoltPay PIN Reset Code';
-  const text = `Use this code to reset your PIN: ${code}. This code will expire in 10 minutes.`;
+  const metaArg = arguments.length >= 4 ? arguments[3] : null;
+  const meta = typeof metaArg === 'string' ? { type: metaArg } : (metaArg || {});
+
+  const type = String(meta.type || 'pin_reset').trim().toLowerCase();
+  const isPasswordReset = type === 'password_reset' || type === 'password';
+  const isEmailVerification = type === 'email_verification' || type === 'verify_email' || type === 'verification';
+
+  const subject = isEmailVerification
+    ? 'Your VoltPay Verification Code'
+    : (isPasswordReset ? 'Your VoltPay Password Reset Code' : 'Your VoltPay PIN Reset Code');
+
+  const headerTitle = isEmailVerification
+    ? 'VoltPay Verification'
+    : (isPasswordReset ? 'VoltPay Password Reset' : 'VoltPay PIN Reset');
+
+  const actionText = isEmailVerification
+    ? 'verify your email'
+    : (isPasswordReset ? 'reset your password' : 'reset your PIN');
+
+  const text = `Use this code to ${actionText}: ${code}. This code will expire in 5 minutes.`;
   const html = `
     <div style="font-family:Arial,sans-serif;line-height:1.6">
-      <h2>VoltPay PIN Reset</h2>
-      <p>Use the code below to reset your PIN. It expires in <b>10 minutes</b>.</p>
+      <h2>${headerTitle}</h2>
+      <p>Use the code below to ${actionText}. It expires in <b>5 minutes</b>.</p>
       <div style="font-size:24px;font-weight:bold;letter-spacing:4px">${code}</div>
       <p>If you did not initiate this request, you can safely ignore this email.</p>
     </div>
   `;
 
   if (!resendClient) {
-    console.log(`✉️  [DEV MODE] Would send PIN reset code to ${toEmail}: ${code}`);
-    return { queued: false, dev: true };
+    console.log(`✉️  [DEV MODE] Would send ${type} code to ${toEmail}: ${code}`);
+    return { queued: true, dev: true };
   }
 
   const sendViaHttps = () => new Promise((resolve) => {
@@ -105,7 +123,7 @@ async function sendSupportTicketEmail({ to, fromArg, replyTo, subject, html, tex
 
   const normalizedAttachments = (attachments || []).map(f => ({
     filename: f.filename || 'attachment',
-    // The SDK accepts Buffer; HTTPS fallback will re-map to base64
+    // Omooooo The SDK accepts Buffer Godi; HTTPS fallback will re-map to base64.. omo this part is very important
     content: f.content
   }));
 

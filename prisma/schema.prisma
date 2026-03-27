@@ -30,10 +30,15 @@ model User {
   city             String?
   zip              String?
   pin              String?
+  password         String?
+  active_session_id String?
+  active_device_id  String?
+  pin_login_used   Boolean   @default(false)
   created_at       DateTime  @default(now())
   updated_at       DateTime  @updatedAt
 
   password_resets  PasswordReset[]
+  verification_codes VerificationCode[]
 
   @@map("users")
 }
@@ -98,6 +103,7 @@ model MonthlyStatement {
 model PushNotification {
   id                Int      @id @default(autoincrement())
   user_id           Int
+  campaign_id       Int?
   subject           String
   message           String
   notification_type String   @default("general")
@@ -108,9 +114,31 @@ model PushNotification {
   created_at        DateTime @default(now())
   updated_at        DateTime @updatedAt
 
+  campaign NotificationCampaign? @relation(fields: [campaign_id], references: [id], onDelete: SetNull)
+
   @@index([user_id, created_at])
+  @@index([campaign_id, created_at])
   @@unique([user_id, client_message_id])
   @@map("push_notifications")
+}
+
+model NotificationCampaign {
+  id                Int      @id @default(autoincrement())
+  title             String
+  message           String
+  notification_type String   @default("general")
+  image             String?
+  data              Json?
+  status            String   @default("draft")
+  recipient_count   Int      @default(0)
+  sent_at           DateTime?
+  created_at        DateTime @default(now())
+  updated_at        DateTime @updatedAt
+
+  notifications PushNotification[]
+
+  @@index([status, created_at])
+  @@map("notification_campaigns")
 }
 
 model Country {
@@ -170,6 +198,7 @@ model PasswordReset {
   id         Int      @id @default(autoincrement())
   user_id    Int?
   email      String?
+  type       String   @default("pin")
   token      String
   expires_at DateTime
   used       Boolean  @default(false)
@@ -178,4 +207,36 @@ model PasswordReset {
   user User? @relation(fields: [user_id], references: [id], onDelete: Cascade)
 
   @@map("password_resets")
+}
+
+model VerificationCode {
+  id         Int      @id @default(autoincrement())
+  user_id    Int
+  type       String
+  target     String?
+  code       String
+  expires_at DateTime
+  used       Boolean  @default(false)
+  created_at DateTime @default(now())
+
+  user User @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@index([user_id, type, created_at])
+  @@map("verification_codes")
+}
+
+model UserActivity {
+  id          Int      @id @default(autoincrement())
+  user_id     Int
+  event       String   @default("login")
+  ip          String?
+  device_id   String?
+  user_agent  String?
+  metadata    Json?
+  created_at  DateTime @default(now())
+
+  user User @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@index([user_id, created_at])
+  @@map("user_activity")
 }

@@ -7,4 +7,10 @@ router.post('/verification-process/verify/pin', userAuth, VerificationController
 
 router.post('/pin/validate', userAuth, VerificationController.validatePin);
 
+router.post('/verify-email', userAuth, VerificationController.verifyEmail);
+
+router.post('/verify-mobile', userAuth, VerificationController.verifyMobile);
+
+router.get('/resend-verify/:type', userAuth, VerificationController.resendVerify);
+
 module.exports = router;

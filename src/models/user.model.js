@@ -28,4 +28,12 @@ async function updatePinById(userId, pin) {
   });
 }
 
-module.exports = { findBasicByEmail, findByEmail, updatePinById };
+async function updatePasswordById(userId, password) {
+  const hashed = await bcrypt.hash(String(password), 10);
+  await prisma.user.update({
+    where: { id: Number(userId) },
+    data: { password: hashed },
+  });
+}
+
+module.exports = { findBasicByEmail, findByEmail, updatePinById, updatePasswordById };

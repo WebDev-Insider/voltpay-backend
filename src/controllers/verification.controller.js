@@ -5,11 +5,85 @@ const { addHistory, generateTrx } = require('../services/airtime.service');
 const { payElectricityV1, queryTransactionV1, buyDatabundleV1, buyAirtimeV1, payCableTVV1 } = require('../funding/clubkonnect.service');
 const { getCountryByCode } = require('../helpers/country.helper');
 const { Prisma } = require('@prisma/client');
+const { generateNumericCode } = require('../helpers/code.helper');
+const { sendResetEmail } = require('../services/email.service');
 
 function moneyStr(n) {
   const num = Number(n);
   if (!Number.isFinite(num)) return '0.00';
   return num.toFixed(2);
+}
+
+const VERIFICATION_CODE_TTL_MS = 5 * 60 * 1000;
+
+function normalizeVerificationType(type) {
+  const t = String(type || '').trim().toLowerCase();
+  if (t === 'email') return 'email';
+  if (t === 'mobile' || t === 'sms') return 'mobile';
+  return '';
+}
+
+async function issueVerificationCode({ userId, type, target }) {
+  const code = generateNumericCode(6);
+  const row = await prisma.verificationCode.create({
+    data: {
+      user_id: Number(userId),
+      type: String(type),
+      target: target ? String(target).trim() : null,
+      code: String(code),
+      expires_at: new Date(Date.now() + VERIFICATION_CODE_TTL_MS),
+      used: false,
+    },
+  });
+  return { row, code };
+}
+
+async function findValidVerificationCode({ userId, type, code }) {
+  const normalizedCode = String(code).trim().padStart(6, '0');
+  return await prisma.verificationCode.findFirst({
+    where: {
+      user_id: Number(userId),
+      type: String(type),
+      code: normalizedCode,
+      used: false,
+      expires_at: { gt: new Date() },
+    },
+    orderBy: { created_at: 'desc' },
+  });
+}
+
+function buildAuthLikeResponse({ remark, status, message, user }) {
+  const countryDetails = getCountryByCode(user.country_code);
+  return {
+    remark,
+    status,
+    message,
+    data: {
+      user: {
+        id: user.id,
+        firstname: user.firstname,
+        lastname: user.lastname,
+        username: user.username,
+        email: user.email,
+        mobile: user.mobile,
+        country_code: user.country_code,
+        country_name: countryDetails.name,
+        country_flag: countryDetails.image_src,
+        dial_code: countryDetails.dial_code,
+        balance: user.balance,
+        currency_symbol: user.currency_symbol || '₦',
+        profile_complete: user.profile_complete,
+        status: user.status,
+        ev: user.ev,
+        sv: user.sv,
+        tv: user.tv,
+        kv: user.kv,
+        image: user.image,
+        created_at: user.created_at,
+        updated_at: user.updated_at,
+      },
+    },
+  };
 }
 
 async function validatePin(req, res) {
@@ -745,4 +819,122 @@ async function verifyPin(req, res) {
   }
 }
 
-module.exports = { verifyPin, validatePin };
+async function verifyEmail(req, res) {
+  try {
+    const user = req.user;
+    if (!user) return res.status(401).json({ remark: 'unauthorized', status: 'error', message: ['Please login first'], data: null });
+
+    const code = req.body?.code;
+    if (!code) {
+      return res.status(200).json(buildAuthLikeResponse({ remark: 'validation_error', status: 'error', message: ['Code is required'], user }));
+    }
+
+    const found = await findValidVerificationCode({ userId: user.id, type: 'email', code });
+    if (!found) {
+      return res.status(200).json(buildAuthLikeResponse({ remark: 'invalid_or_expired_code', status: 'error', message: ['Invalid or expired verification code'], user }));
+    }
+
+    await prisma.$transaction([
+      prisma.verificationCode.update({ where: { id: found.id }, data: { used: true } }),
+      prisma.user.update({ where: { id: Number(user.id) }, data: { ev: '1' } }),
+    ]);
+
+    const updated = await prisma.user.findUnique({ where: { id: Number(user.id) } });
+    return res.json(buildAuthLikeResponse({ remark: 'email_verified', status: 'success', message: ['Email verified successfully'], user: updated }));
+  } catch (e) {
+    console.error('verifyEmail error:', e);
+    return res.status(500).json({ remark: 'error', status: 'error', message: ['Failed to verify email'], data: null });
+  }
+}
+
+async function verifyMobile(req, res) {
+  try {
+    const user = req.user;
+    if (!user) return res.status(401).json({ remark: 'unauthorized', status: 'error', message: ['Please login first'], data: null });
+
+    const code = req.body?.code;
+    if (!code) {
+      return res.status(200).json(buildAuthLikeResponse({ remark: 'validation_error', status: 'error', message: ['Code is required'], user }));
+    }
+
+    const found = await findValidVerificationCode({ userId: user.id, type: 'mobile', code });
+    if (!found) {
+      return res.status(200).json(buildAuthLikeResponse({ remark: 'invalid_or_expired_code', status: 'error', message: ['Invalid or expired verification code'], user }));
+    }
+
+    await prisma.$transaction([
+      prisma.verificationCode.update({ where: { id: found.id }, data: { used: true } }),
+      prisma.user.update({ where: { id: Number(user.id) }, data: { sv: '1' } }),
+    ]);
+
+    const updated = await prisma.user.findUnique({ where: { id: Number(user.id) } });
+    return res.json(buildAuthLikeResponse({ remark: 'mobile_verified', status: 'success', message: ['Mobile verified successfully'], user: updated }));
+  } catch (e) {
+    console.error('verifyMobile error:', e);
+    return res.status(500).json({ remark: 'error', status: 'error', message: ['Failed to verify mobile'], data: null });
+  }
+}
+
+async function resendVerify(req, res) {
+  try {
+    const user = req.user;
+    if (!user) return res.status(401).json({ remark: 'unauthorized', status: 'error', message: ['Please login first'], data: null });
+
+    const type = normalizeVerificationType(req.params?.type);
+    if (!type) {
+      return res.status(200).json(buildAuthLikeResponse({ remark: 'validation_error', status: 'error', message: ['Invalid verification type'], user }));
+    }
+
+    const fresh = await prisma.user.findUnique({ where: { id: Number(user.id) } });
+    if (!fresh) {
+      return res.status(401).json({ remark: 'unauthorized', status: 'error', message: ['Please login again'], data: null });
+    }
+
+    const target = type === 'email' ? fresh.email : fresh.mobile;
+    if (type === 'email' && (!target || !String(target).trim())) {
+      return res.status(200).json(buildAuthLikeResponse({ remark: 'validation_error', status: 'error', message: ['Email is required to resend code'], user: fresh }));
+    }
+
+    const { code } = await issueVerificationCode({ userId: fresh.id, type, target });
+
+    if (type === 'email') {
+      const sendResult = await sendResetEmail(String(fresh.email).trim(), code, process.env.RESEND_FROM, { type: 'email_verification' });
+      if (!sendResult || !sendResult.queued) {
+        console.error('❌ resendVerify email not queued:', sendResult && sendResult.error ? sendResult.error : 'unknown reason');
+
+        const devBypass = String(process.env.DEV_BYPASS_EMAIL_OTP || '').trim().toLowerCase() === 'true';
+        if (devBypass) {
+          console.log(`✉️  [DEV BYPASS] Email verification code for ${String(fresh.email).trim()}: ${code}`);
+
+          const includeCode = String(process.env.DEV_INCLUDE_OTP_IN_RESPONSE || '').trim().toLowerCase() === 'true';
+          const devMessage = includeCode
+            ? ['Verification code generated (dev bypass enabled).', `Code: ${String(code)}`]
+            : ['Verification code generated (dev bypass enabled). Check server logs for the code.'];
+
+          const response = buildAuthLikeResponse({
+            remark: 'code_resent',
+            status: 'success',
+            message: devMessage,
+            user: fresh,
+          });
+          response.data = response.data || {};
+          response.data.debug_code = includeCode ? String(code) : undefined;
+          response.data.email_delivery = 'bypassed';
+          return res.json(response);
+        }
+
+        return res.status(200).json(buildAuthLikeResponse({ remark: 'email_send_failed', status: 'error', message: ['Unable to resend code. Please try again later.'], user: fresh }));
+      }
+    } else {
+      // SMS sending not integrated yet; keep code stored and acknowledge for now.
+      console.log(`📱 [DEV MODE] Would send mobile verification code to ${target}: ${code}`);
+    }
+
+    return res.json(buildAuthLikeResponse({ remark: 'code_resent', status: 'success', message: ['Verification code resent successfully'], user: fresh }));
+  } catch (e) {
+    console.error('resendVerify error:', e);
+    return res.status(500).json({ remark: 'error', status: 'error', message: ['Failed to resend verification code'], data: null });
+  }
+}
+
+module.exports = { verifyPin, validatePin, verifyEmail, verifyMobile, resendVerify };

@@ -1,4 +1,3 @@
-const session = require('../services/session.service');
 const { getCountryByCode } = require('../helpers/country.helper');
 const prisma = require('../../database/prisma');
 
@@ -12,7 +11,7 @@ async function getDashboard(req, res) {
   try {
     console.log('📥 Dashboard request (controller)');
 
-    const currentUser = req.user || session.getCurrentUser();
+    const currentUser = req.user;
     if (!currentUser) {
       return res.status(401).json({
         remark: 'unauthorized',

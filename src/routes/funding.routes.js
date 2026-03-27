@@ -5,6 +5,7 @@ const userAuth = require('../middlewares/userAuth.middleware');
 const FundingController = require('../funding/funding.controller');
 
 router.post('/funding/initiate', userAuth, FundingController.initiate);
+router.get('/funding/virtual-account', userAuth, FundingController.virtualAccount);
 router.post('/funding/verify', userAuth, FundingController.verify);
 router.post('/funding/reconcile', userAuth, FundingController.reconcile);
 

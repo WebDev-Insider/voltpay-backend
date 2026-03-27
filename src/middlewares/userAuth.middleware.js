@@ -1,28 +1,8 @@
 const prisma = require('../../database/prisma');
-const session = require('../services/session.service');
+const jwt = require('jsonwebtoken');
 
 module.exports = async function userAuth(req, res, next) {
   try {
-    // If a session user already exists, refresh it from DB to avoid stale balances
-    const current = session.getCurrentUser && session.getCurrentUser();
-    if (current?.id != null) {
-      const fresh = await prisma.user.findUnique({ where: { id: Number(current.id) } });
-      if (fresh) {
-        // Blocked users should not access protected routes
-        if (Number(fresh.status) !== 1) {
-          return res.status(403).json({
-            remark: 'blocked',
-            status: 'error',
-            message: ['Your account is blocked. Please contact support.'],
-            data: null
-          });
-        }
-        session.setCurrentUser(fresh);
-        req.user = fresh;
-        return next();
-      }
-    }
-
     // Read token from Authorization header: Bearer <token>
     const authHeader = req.headers['authorization'] || req.headers['Authorization'];
     let token = null;
@@ -42,17 +22,39 @@ module.exports = async function userAuth(req, res, next) {
       });
     }
 
-    // Expect token like: token_<userId>_<timestamp>
-    let userId = null;
     if (typeof token === 'string' && token.startsWith('token_')) {
-      const parts = token.split('_');
-      if (parts.length >= 3) {
-        const maybeId = Number(parts[1]);
-        if (!Number.isNaN(maybeId)) userId = maybeId;
-      }
+      return res.status(401).json({
+        remark: 'unauthorized',
+        status: 'error',
+        message: ['Invalid access token'],
+        data: null
+      });
     }
 
-    if (!userId) {
+    const secret = process.env.JWT_SECRET;
+    if (!secret) {
+      return res.status(500).json({
+        remark: 'config_error',
+        status: 'error',
+        message: ['JWT_SECRET not configured'],
+        data: null
+      });
+    }
+
+    let payload = null;
+    try {
+      payload = jwt.verify(String(token), secret);
+    } catch (_) {
+      return res.status(401).json({
+        remark: 'unauthorized',
+        status: 'error',
+        message: ['Invalid access token'],
+        data: null
+      });
+    }
+
+    const userId = payload && payload.sub ? Number(payload.sub) : null;
+    if (!userId || Number.isNaN(userId)) {
       return res.status(401).json({
         remark: 'unauthorized',
         status: 'error',
@@ -71,6 +73,33 @@ module.exports = async function userAuth(req, res, next) {
       });
     }
 
+    const tokenSid = payload && payload.sid ? String(payload.sid) : '';
+    const activeSid = user.active_session_id ? String(user.active_session_id) : '';
+    if (!tokenSid || !activeSid || tokenSid !== activeSid) {
+      return res.status(401).json({
+        remark: 'session_revoked',
+        status: 'error',
+        message: ['Please login first'],
+        data: null
+      });
+    }
+
+    // Enforce strict single device: header/body/query device_id must match stored active_device_id
+    const requestDeviceId =
+      req.headers['x-device-id'] ||
+      req.body?.device_id ||
+      req.query?.device_id ||
+      '';
+    const activeDeviceId = user.active_device_id ? String(user.active_device_id) : '';
+    if (activeDeviceId && String(requestDeviceId || '').trim() !== activeDeviceId) {
+      return res.status(401).json({
+        remark: 'device_mismatch',
+        status: 'error',
+        message: ['Please login first'],
+        data: null
+      });
+    }
+
     // Blocked users should not access protected routes
     if (Number(user.status) !== 1) {
       return res.status(403).json({
@@ -81,8 +110,7 @@ module.exports = async function userAuth(req, res, next) {
       });
     }
 
-    // Bind to session and request
-    session.setCurrentUser(user);
+    // Bind to request
     req.user = user;
     return next();
   } catch (err) {

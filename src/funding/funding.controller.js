@@ -1,7 +1,7 @@
 const prisma = require('../../database/prisma');
 const { Prisma } = require('@prisma/client');
 
-const { initializeTransaction, verifyTransaction, verifyWebhookSignature } = require('./paystack.service');
+const { createVirtualAccount, verifyWebhookSignature } = require('./paymentpoint.service');
 
 const reconcileLocks = new Map();
 
@@ -33,6 +33,60 @@ function computeFundingFee(amountNaira) {
   return 0;
 }
 
+function parsePaymentPointBankCodes() {
+  const raw = (process.env.PAYMENTPOINT_BANK_CODES || '').trim();
+  if (!raw) return ['20946', '20897'];
+  return raw
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+}
+
+function getPaymentPointBusinessId() {
+  const v = (process.env.PAYMENTPOINT_BUSINESS_ID || '').trim();
+  if (!v) throw new Error('Missing required env: PAYMENTPOINT_BUSINESS_ID');
+  return v;
+}
+
+function buildCustomerName(user) {
+  const first = String(user?.firstname || '').trim();
+  const last = String(user?.lastname || '').trim();
+  const full = `${first} ${last}`.trim();
+  return full || `User ${user?.id || ''}`.trim();
+}
+
+function normalizePaymentPointPhoneNumber(phone) {
+  const digits = String(phone || '').replace(/\D/g, '');
+  if (!digits) return null;
+  if (digits.length === 11) return digits;
+  if (digits.length === 10) return `0${digits}`;
+  if (digits.startsWith('234') && digits.length === 13) return `0${digits.slice(3)}`;
+  if (digits.startsWith('2340') && digits.length === 14) return digits.slice(3);
+  const last11 = digits.slice(-11);
+  if (last11.length === 11 && last11.startsWith('0')) return last11;
+  return null;
+}
+
+function normalizeAmountToDecimal(amount) {
+  const cleaned = String(amount ?? '').replace(/,/g, '').trim();
+  const n = Number(cleaned);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return new Prisma.Decimal(n.toFixed(2));
+}
+
+function isSuccessfulPaymentPointPayload(payload) {
+  const txStatus = String(payload?.transaction_status || payload?.transactionStatus || payload?.status || '').toLowerCase();
+  const notif = String(payload?.notification_status || payload?.notificationStatus || '').toLowerCase();
+  const event = String(payload?.event || payload?.event_type || payload?.type || payload?.notificationType || '').toLowerCase();
+  return (
+    txStatus === 'success' ||
+    txStatus === 'successful' ||
+    notif === 'payment_successful' ||
+    event === 'payment_successful' ||
+    event === 'transfer_successful'
+  );
+}
+
 async function initiate(req, res) {
   try {
     const user = req.user;
@@ -49,58 +103,154 @@ async function initiate(req, res) {
       });
     }
 
-    const amountStr = toMoneyString(req.body?.amount);
-    if (!amountStr) {
-      return res.status(400).json({ remark: 'validation_error', status: 'error', message: ['Invalid amount'], data: null });
-    }
-
-    const tx_ref = txRefFor(user.id);
-    const callback_url = `${getBaseUrl(req)}/api/funding/callback?tx_ref=${encodeURIComponent(tx_ref)}`;
-
-    const funding = await prisma.fundingTransaction.create({
-      data: {
-        user_id: Number(user.id),
-        tx_ref,
-        amount: new Prisma.Decimal(amountStr),
-        currency: 'NGN',
-        status: 'pending',
-      },
-    });
-
-    const amountKobo = Math.round(Number(amountStr) * 100);
-    const { authorization_url, raw } = await initializeTransaction({
-      email: user.email || `user${user.id}@voltpay.local`,
-      amountKobo,
-      reference: tx_ref,
-      callback_url,
-      metadata: {
-        tx_ref,
-        user_id: Number(user.id),
-        purpose: 'wallet_funding',
-      },
-    });
-
-    await prisma.fundingTransaction.update({
-      where: { id: funding.id },
-      data: {
-        raw_payload: raw,
-      },
-    });
-
-    return res.json({
-      remark: 'funding_initiated',
-      status: 'success',
-      message: ['Proceed to payment'],
-      data: {
-        tx_ref,
-        redirect_url: authorization_url,
-        callback_url,
-      },
-    });
+    return virtualAccount(req, res);
   } catch (e) {
     console.error('Funding initiate error:', e);
     const status = Number(e?.statusCode) || 500;
     const msg = e?.message || 'Failed to initiate funding';
+    return res.status(status).json({ remark: 'error', status: 'error', message: [msg], data: null });
+  }
+}
+
+async function virtualAccount(req, res) {
+  try {
+    const user = req.user;
+    if (!user) {
+      return res.status(401).json({ remark: 'unauthorized', status: 'error', message: ['Please login first'], data: null });
+    }
+
+    if (!prisma.fundingTransaction) {
+      return res.status(500).json({
+        remark: 'server_error',
+        status: 'error',
+        message: ['FundingTransaction model is not available. Run prisma generate + db push/migrate and restart the server.'],
+        data: null,
+      });
+    }
+
+    const existing = await prisma.fundingTransaction.findFirst({
+      where: {
+        user_id: Number(user.id),
+        status: 'virtual_account',
+      },
+      orderBy: { id: 'desc' },
+    });
+
+    if (existing?.raw_payload?.bankAccounts?.length) {
+      return res.json({
+        remark: 'virtual_account',
+        status: 'success',
+        message: ['Virtual account is ready'],
+        data: {
+          provider: 'paymentpoint',
+          customer: existing.raw_payload.customer || null,
+          bankAccounts: existing.raw_payload.bankAccounts || [],
+        },
+      });
+    }
+
+    const bankCodes = parsePaymentPointBankCodes();
+    const businessId = getPaymentPointBusinessId();
+
+    const email = (user.email || '').toString().trim() || `user${user.id}@voltpay.local`;
+    const name = buildCustomerName(user);
+    const phoneNumber = normalizePaymentPointPhoneNumber(user.mobile);
+    if (!phoneNumber) {
+      return res.status(400).json({
+        remark: 'validation_error',
+        status: 'error',
+        message: ['Invalid phone number. Please update your phone number to an 11-digit Nigerian number (e.g., 08012345678).'],
+        data: null,
+      });
+    }
+
+    const { raw } = await createVirtualAccount({
+      email,
+      name,
+      phoneNumber,
+      bankCode: bankCodes,
+      businessId,
+    });
+
+    const customerId = raw?.customer?.customer_id;
+    if (!customerId) {
+      return res.status(500).json({
+        remark: 'provider_error',
+        status: 'error',
+        message: ['PaymentPoint did not return customer_id'],
+        data: null,
+      });
+    }
+
+    const tx_ref = `ppcust_${String(customerId)}`;
+    const amount = new Prisma.Decimal('0.00');
+
+    try {
+      if (existing) {
+        await prisma.fundingTransaction.update({
+          where: { id: existing.id },
+          data: {
+            tx_ref,
+            amount,
+            currency: 'NGN',
+            status: 'virtual_account',
+            raw_payload: raw,
+          },
+        });
+      } else {
+        await prisma.fundingTransaction.create({
+          data: {
+            user_id: Number(user.id),
+            tx_ref,
+            amount,
+            currency: 'NGN',
+            status: 'virtual_account',
+            raw_payload: raw,
+          },
+        });
+      }
+    } catch (e) {
+      if (e?.code === 'P2002') {
+        const byRef = await prisma.fundingTransaction.findUnique({ where: { tx_ref } });
+        if (byRef && Number(byRef.user_id) !== Number(user.id)) {
+          return res.status(409).json({
+            remark: 'conflict',
+            status: 'error',
+            message: ['Virtual account reference conflict'],
+            data: null,
+          });
+        }
+
+        if (byRef?.raw_payload?.bankAccounts?.length) {
+          return res.json({
+            remark: 'virtual_account',
+            status: 'success',
+            message: ['Virtual account is ready'],
+            data: {
+              provider: 'paymentpoint',
+              customer: byRef.raw_payload.customer || null,
+              bankAccounts: byRef.raw_payload.bankAccounts || [],
+            },
+          });
+        }
+      }
+      throw e;
+    }
+
+    return res.json({
+      remark: 'virtual_account',
+      status: 'success',
+      message: [raw?.message || 'Virtual account created successfully'],
+      data: {
+        provider: 'paymentpoint',
+        customer: raw?.customer || null,
+        bankAccounts: raw?.bankAccounts || [],
+      },
+    });
+  } catch (e) {
+    console.error('Virtual account error:', e);
+    const status = Number(e?.statusCode) || 500;
+    const msg = e?.message || 'Failed to create virtual account';
     return res.status(status).json({ remark: 'error', status: 'error', message: [msg], data: null });
   }
 }
@@ -122,118 +272,29 @@ async function verify(req, res) {
     }
 
     const tx_ref = String(req.body?.tx_ref || '').trim();
-    const reference = String(req.body?.transaction_id || req.body?.reference || req.body?.trxref || '').trim();
-
-    if (!tx_ref || !reference) {
-      return res.status(400).json({ remark: 'validation_error', status: 'error', message: ['tx_ref and reference are required'], data: null });
+    if (!tx_ref) {
+      return res.status(400).json({ remark: 'validation_error', status: 'error', message: ['tx_ref is required'], data: null });
     }
 
     const funding = await prisma.fundingTransaction.findUnique({ where: { tx_ref } });
-    if (!funding || Number(funding.user_id) !== Number(user.id)) {
-      return res.status(404).json({ remark: 'not_found', status: 'error', message: ['Funding transaction not found'], data: null });
-    }
-
-    if (funding.credited_at) {
-      return res.json({ remark: 'funding_already_credited', status: 'success', message: ['Payment already processed'], data: { tx_ref, status: funding.status } });
-    }
-
-    const { data, raw } = await verifyTransaction(reference);
-
-    const paystackStatus = (data?.status || '').toString().toLowerCase();
-    const paystackCurrency = (data?.currency || '').toString().toUpperCase();
-    const paystackReference = (data?.reference || '').toString();
-    const paystackId = data?.id != null ? String(data.id) : null;
-    const amountKobo = Number(data?.amount);
-
-    if (paystackReference && paystackReference !== tx_ref) {
-      return res.status(400).json({ remark: 'mismatch', status: 'error', message: ['Transaction reference mismatch'], data: null });
-    }
-
-    if (paystackStatus !== 'success') {
-      await prisma.fundingTransaction.update({
-        where: { tx_ref },
-        data: { status: paystackStatus || 'failed', flutterwave_tx_id: paystackId, raw_payload: raw },
-      });
-
-      return res.status(400).json({ remark: 'payment_not_successful', status: 'error', message: ['Payment not successful'], data: { status: paystackStatus } });
-    }
-
-    if (paystackCurrency !== 'NGN') {
-      return res.status(400).json({ remark: 'currency_mismatch', status: 'error', message: ['Currency must be NGN'], data: null });
-    }
-
-    const expected = Number(funding.amount?.toString?.() ?? funding.amount);
-    const paid = Number.isFinite(amountKobo) ? amountKobo / 100 : NaN;
-    if (!Number.isFinite(paid) || !Number.isFinite(expected) || paid < expected) {
-      return res.status(400).json({ remark: 'amount_mismatch', status: 'error', message: ['Amount mismatch'], data: null });
-    }
-
-    const fee = computeFundingFee(expected);
-    const net = Math.max(0, expected - fee);
-    const creditAmount = new Prisma.Decimal(net.toFixed(2));
-    const feeAmount = new Prisma.Decimal(fee.toFixed(2));
-    const grossAmount = new Prisma.Decimal(expected.toFixed(2));
-
-    await prisma.$transaction(async tx => {
-      const latest = await tx.fundingTransaction.findUnique({ where: { tx_ref } });
-      if (latest?.credited_at) return;
-
-      await tx.user.update({
-        where: { id: Number(user.id) },
+    if (funding && Number(funding.user_id) === Number(user.id) && funding.status === 'virtual_account') {
+      return res.json({
+        remark: 'virtual_account',
+        status: 'success',
+        message: ['Virtual account is ready'],
         data: {
-          balance: { increment: creditAmount },
-          currency_symbol: '₦',
+          provider: 'paymentpoint',
+          customer: funding.raw_payload?.customer || null,
+          bankAccounts: funding.raw_payload?.bankAccounts || [],
         },
       });
+    }
 
-      if (tx.walletTransaction) {
-        try {
-          await tx.walletTransaction.create({
-            data: {
-              user_id: Number(user.id),
-              trx: String(tx_ref),
-              trx_type: '+',
-              amount: creditAmount,
-              charge: feeAmount,
-              total_amount: grossAmount,
-              remark: 'fund_account',
-              details: 'Wallet funding',
-              other_data: {
-                title: 'Transfer to Wallet',
-                subtitle: 'Wallet Funding',
-                feedback: 'Successful',
-                note: 'Paystack',
-                image_src: '',
-              },
-              meta: {
-                gross_amount: expected,
-                fee,
-                credited_amount: net,
-                paystack_id: paystackId,
-              },
-            },
-          });
-        } catch (e) {
-          if (e?.code !== 'P2002') throw e;
-        }
-      }
-
-      await tx.fundingTransaction.update({
-        where: { tx_ref },
-        data: {
-          status: 'successful',
-          flutterwave_tx_id: paystackId,
-          credited_at: new Date(),
-          raw_payload: raw,
-        },
-      });
-    });
-
-    return res.json({
-      remark: 'funding_success',
-      status: 'success',
-      message: ['Wallet funded successfully'],
-      data: { tx_ref, amount: expected, fee, credited_amount: net },
+    return res.status(400).json({
+      remark: 'not_supported',
+      status: 'error',
+      message: ['PaymentPoint funding is credited automatically after your transfer is confirmed.'],
+      data: null,
     });
   } catch (e) {
     console.error('Funding verify error:', e);
@@ -244,110 +305,7 @@ async function verify(req, res) {
 }
 
 async function reconcileWorker({ userId, pending }) {
-  if (!pending?.length) return;
-  if (reconcileLocks.get(userId)) return;
-  reconcileLocks.set(userId, true);
-
-  try {
-    const results = [];
-
-    for (const funding of pending) {
-      const tx_ref = String(funding.tx_ref || '').trim();
-      if (!tx_ref) continue;
-
-      try {
-        const { data, raw } = await verifyTransaction(tx_ref);
-        const paystackStatus = (data?.status || '').toString().toLowerCase();
-        const paystackCurrency = (data?.currency || '').toString().toUpperCase();
-        const paystackId = data?.id != null ? String(data.id) : null;
-        const amountKobo = Number(data?.amount);
-
-        if (paystackStatus !== 'success' || paystackCurrency !== 'NGN') {
-          await prisma.fundingTransaction.update({
-            where: { tx_ref },
-            data: { status: paystackStatus || 'failed', flutterwave_tx_id: paystackId, raw_payload: raw },
-          });
-          results.push({ tx_ref, status: paystackStatus || 'failed', credited: false });
-          continue;
-        }
-
-        const expected = Number(funding.amount?.toString?.() ?? funding.amount);
-        const paid = Number.isFinite(amountKobo) ? amountKobo / 100 : NaN;
-        if (!Number.isFinite(paid) || !Number.isFinite(expected) || paid < expected) {
-          results.push({ tx_ref, status: 'amount_mismatch', credited: false });
-          continue;
-        }
-
-        const fee = computeFundingFee(expected);
-        const net = Math.max(0, expected - fee);
-        const creditAmount = new Prisma.Decimal(net.toFixed(2));
-        const feeAmount = new Prisma.Decimal(fee.toFixed(2));
-        const grossAmount = new Prisma.Decimal(expected.toFixed(2));
-
-        await prisma.$transaction(async tx => {
-          const latest = await tx.fundingTransaction.findUnique({ where: { tx_ref } });
-          if (latest?.credited_at) return;
-
-          await tx.user.update({
-            where: { id: userId },
-            data: { balance: { increment: creditAmount }, currency_symbol: '₦' },
-          });
-
-          if (tx.walletTransaction) {
-            try {
-              await tx.walletTransaction.create({
-                data: {
-                  user_id: userId,
-                  trx: String(tx_ref),
-                  trx_type: '+',
-                  amount: creditAmount,
-                  charge: feeAmount,
-                  total_amount: grossAmount,
-                  remark: 'fund_account',
-                  details: 'Wallet funding',
-                  other_data: {
-                    title: 'Transfer to Wallet',
-                    subtitle: 'Wallet Funding',
-                    feedback: 'Successful',
-                    note: 'Paystack',
-                    image_src: '',
-                  },
-                  meta: {
-                    gross_amount: expected,
-                    fee,
-                    credited_amount: net,
-                    paystack_id: paystackId,
-                  },
-                },
-              });
-            } catch (e) {
-              if (e?.code !== 'P2002') throw e;
-            }
-          }
-
-          await tx.fundingTransaction.update({
-            where: { tx_ref },
-            data: {
-              status: 'successful',
-              flutterwave_tx_id: paystackId,
-              credited_at: new Date(),
-              raw_payload: raw,
-            },
-          });
-        });
-
-        results.push({ tx_ref, status: 'successful', credited: true, fee, credited_amount: net });
-      } catch (e) {
-        results.push({ tx_ref, status: 'error', credited: false, message: e?.message || String(e) });
-      }
-    }
-
-    if (results.length) {
-      console.log('Funding reconcile worker results:', { userId, resultsCount: results.length });
-    }
-  } finally {
-    reconcileLocks.delete(userId);
-  }
+  return;
 }
 
 async function reconcile(req, res) {
@@ -366,34 +324,7 @@ async function reconcile(req, res) {
       });
     }
 
-    const userId = Number(user.id);
-    if (reconcileLocks.get(userId)) {
-      return res.json({ remark: 'reconcile_running', status: 'success', message: ['Reconcile already running'], data: { queued: true } });
-    }
-
-    const pending = await prisma.fundingTransaction.findMany({
-      where: {
-        user_id: userId,
-        credited_at: null,
-      },
-      orderBy: { id: 'desc' },
-      take: 10,
-    });
-
-    if (!pending.length) {
-      return res.json({ remark: 'reconcile_done', status: 'success', message: ['No pending funding to reconcile'], data: { results: [] } });
-    }
-
-    setImmediate(() => {
-      reconcileWorker({ userId, pending }).catch(e => console.error('Funding reconcile worker error:', e));
-    });
-
-    return res.json({
-      remark: 'reconcile_queued',
-      status: 'success',
-      message: ['Reconcile queued'],
-      data: { queued: true, pending_count: pending.length },
-    });
+    return res.json({ remark: 'reconcile_disabled', status: 'success', message: ['Reconcile is not required for PaymentPoint funding'], data: { results: [] } });
   } catch (e) {
     console.error('Funding reconcile error:', e);
     const status = Number(e?.statusCode) || 500;
@@ -408,101 +339,181 @@ async function webhook(req, res) {
       return res.status(200).json({ received: true });
     }
 
-    const signature = req.headers['x-paystack-signature'];
+    const signature =
+      req.headers['paymentpoint-signature'] ||
+      req.headers['x-paymentpoint-signature'] ||
+      req.headers['x-webhook-signature'] ||
+      req.headers['x-signature'];
     const rawBody = req.rawBody ? req.rawBody.toString('utf8') : '';
     if (!verifyWebhookSignature({ rawBody, signature })) {
+      console.warn('PaymentPoint webhook signature verification failed', {
+        hasRawBody: Boolean(rawBody),
+        hasSignature: Boolean(signature),
+        headerKeys: Object.keys(req.headers || {}),
+      });
       return res.status(401).send('Unauthorized');
     }
 
-    const reference = req.body?.data?.reference || req.body?.reference;
-    if (!reference) {
-      return res.status(200).json({ received: true });
-    }
+    console.log('PaymentPoint webhook received', {
+      headerKeys: Object.keys(req.headers || {}),
+    });
 
-    const tx_ref = String(reference);
-
-    // Try to verify + credit (idempotent)
-    const funding = await prisma.fundingTransaction.findUnique({ where: { tx_ref } });
-    if (!funding || funding.credited_at) {
-      return res.status(200).json({ received: true });
-    }
-
-    const { data, raw } = await verifyTransaction(tx_ref);
-    const paystackStatus = (data?.status || '').toString().toLowerCase();
-    const paystackCurrency = (data?.currency || '').toString().toUpperCase();
-    const paystackId = data?.id != null ? String(data.id) : null;
-    const amountKobo = Number(data?.amount);
-
-    if (paystackStatus !== 'success' || paystackCurrency !== 'NGN') {
-      await prisma.fundingTransaction.update({
-        where: { tx_ref },
-        data: { status: paystackStatus || 'failed', flutterwave_tx_id: paystackId, raw_payload: raw },
+    const root = req.body || {};
+    const payload = root?.data && typeof root.data === 'object' ? root.data : root;
+    if (!isSuccessfulPaymentPointPayload(root) && !isSuccessfulPaymentPointPayload(payload)) {
+      console.log('PaymentPoint webhook ignored (not successful)', {
+        keys: Object.keys(payload || {}),
       });
       return res.status(200).json({ received: true });
     }
 
-    const expectedAmount = Number(funding.amount?.toString?.() ?? funding.amount);
-    const paid = Number.isFinite(amountKobo) ? amountKobo / 100 : NaN;
-    if (!Number.isFinite(paid) || !Number.isFinite(expectedAmount) || paid < expectedAmount) {
+    const customerId =
+      payload?.customer_id ||
+      payload?.customerId ||
+      payload?.customer?.customer_id ||
+      payload?.customer?.id ||
+      payload?.customer?.customerId;
+
+    const transactionId =
+      payload?.transaction_id ||
+      payload?.transactionId ||
+      payload?.transaction?.transaction_id ||
+      payload?.transaction?.id ||
+      payload?.transaction?.transactionId ||
+      payload?.id ||
+      payload?.reference;
+
+    const grossAmountDec = normalizeAmountToDecimal(
+      payload?.amount_paid ??
+        payload?.amountPaid ??
+        payload?.amount ??
+        payload?.transaction_amount ??
+        payload?.transactionAmount ??
+        payload?.transaction?.amount ??
+        payload?.transaction?.transaction_amount
+    );
+
+    const settlementAmountDec = normalizeAmountToDecimal(
+      payload?.settlement_amount ?? payload?.settlementAmount ?? payload?.settled_amount ?? payload?.settledAmount
+    );
+
+    const settlementFeeDec = normalizeAmountToDecimal(payload?.settlement_fee ?? payload?.settlementFee ?? payload?.fee);
+
+    const creditAmountDec = settlementAmountDec || grossAmountDec;
+    const currency = (payload?.currency || 'NGN').toString().toUpperCase();
+
+    if (!customerId || !transactionId || !creditAmountDec) {
+      console.log('PaymentPoint webhook ignored (missing required fields)', {
+        hasCustomerId: Boolean(customerId),
+        hasTransactionId: Boolean(transactionId),
+        hasAmount: Boolean(creditAmountDec),
+        keys: Object.keys(payload || {}),
+      });
       return res.status(200).json({ received: true });
     }
 
-    const fee = computeFundingFee(expectedAmount);
-    const net = Math.max(0, expectedAmount - fee);
-    const creditAmount = new Prisma.Decimal(net.toFixed(2));
-    const feeAmount = new Prisma.Decimal(fee.toFixed(2));
-    const grossAmount = new Prisma.Decimal(expectedAmount.toFixed(2));
+    if (currency !== 'NGN') {
+      return res.status(200).json({ received: true });
+    }
 
-    await prisma.$transaction(async tx => {
-      const latest = await tx.fundingTransaction.findUnique({ where: { tx_ref } });
-      if (latest?.credited_at) return;
-
-      await tx.user.update({
-        where: { id: Number(funding.user_id) },
-        data: { balance: { increment: creditAmount }, currency_symbol: '₦' },
+    const virtualRef = `ppcust_${String(customerId)}`;
+    const vaRecord = await prisma.fundingTransaction.findUnique({ where: { tx_ref: virtualRef } });
+    if (!vaRecord) {
+      console.log('PaymentPoint webhook ignored (virtual account not found)', {
+        virtualRef,
       });
+      return res.status(200).json({ received: true });
+    }
 
-      if (tx.walletTransaction) {
+    const tx_ref = `pp_${String(transactionId)}`;
+    const creditAmount = creditAmountDec;
+    const grossAmount = grossAmountDec || creditAmount;
+    const feeAmount = settlementFeeDec || new Prisma.Decimal('0.00');
+    const fee = Number(feeAmount.toString());
+
+    await prisma.$transaction(
+      async tx => {
         try {
-          await tx.walletTransaction.create({
+          await tx.fundingTransaction.create({
             data: {
-              user_id: Number(funding.user_id),
-              trx: String(tx_ref),
-              trx_type: '+',
+              user_id: Number(vaRecord.user_id),
+              tx_ref,
               amount: creditAmount,
-              charge: feeAmount,
-              total_amount: grossAmount,
-              remark: 'fund_account',
-              details: 'Wallet funding',
-              other_data: {
-                title: 'Transfer to Wallet',
-                subtitle: 'Wallet Funding',
-                feedback: 'Successful',
-                note: 'Paystack',
-                image_src: '',
-              },
-              meta: {
-                gross_amount: expectedAmount,
-                fee,
-                credited_amount: net,
-                paystack_id: paystackId,
-              },
+              currency: 'NGN',
+              status: 'pending',
+              raw_payload: payload,
             },
           });
         } catch (e) {
           if (e?.code !== 'P2002') throw e;
         }
-      }
 
-      await tx.fundingTransaction.update({
-        where: { tx_ref },
-        data: {
-          status: 'successful',
-          flutterwave_tx_id: paystackId,
-          credited_at: new Date(),
-          raw_payload: raw,
-        },
-      });
+        const creditedAt = new Date();
+        const claimed = await tx.fundingTransaction.updateMany({
+          where: {
+            tx_ref,
+            credited_at: null,
+          },
+          data: {
+            status: 'successful',
+            credited_at: creditedAt,
+            amount: creditAmount,
+            currency: 'NGN',
+            raw_payload: payload,
+          },
+        });
+
+        if (!claimed?.count) return;
+
+        await tx.user.update({
+          where: { id: Number(vaRecord.user_id) },
+          data: { balance: { increment: creditAmount }, currency_symbol: '₦' },
+        });
+
+        if (tx.walletTransaction) {
+          try {
+            await tx.walletTransaction.create({
+              data: {
+                user_id: Number(vaRecord.user_id),
+                trx: String(tx_ref),
+                trx_type: '+',
+                amount: creditAmount,
+                charge: feeAmount,
+                total_amount: grossAmount,
+                remark: 'fund_account',
+                details: 'Wallet funding',
+                other_data: {
+                  title: 'Transfer to Wallet',
+                  subtitle: 'Wallet Funding',
+                  feedback: 'Successful',
+                  note: 'PaymentPoint',
+                  image_src: '',
+                },
+                meta: {
+                  gross_amount: Number(grossAmount.toString()),
+                  fee,
+                  credited_amount: Number(creditAmount.toString()),
+                  settlement_amount: Number(creditAmount.toString()),
+                  paymentpoint_transaction_id: String(transactionId),
+                  customer_id: String(customerId),
+                },
+              },
+            });
+          } catch (e) {
+            if (e?.code !== 'P2002') throw e;
+          }
+        }
+      },
+      {
+        maxWait: 10_000,
+        timeout: 15_000,
+      }
+    );
+
+    console.log('PaymentPoint wallet credited', {
+      tx_ref: `pp_${String(transactionId)}`,
+      user_id: Number(vaRecord.user_id),
+      amount: Number(creditAmount.toString()),
     });
 
     return res.status(200).json({ received: true });
@@ -541,6 +552,7 @@ async function callback(req, res) {
 
 module.exports = {
   initiate,
+  virtualAccount,
   verify,
   reconcile,
   webhook,

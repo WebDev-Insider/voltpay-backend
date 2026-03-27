@@ -1,6 +1,6 @@
 
 const path = require('path');
-require('dotenv').config({ path: path.resolve(__dirname, '.env') });
+require('dotenv').config({ path: path.resolve(__dirname, '.env'), override: true });
 
 const express = require('express');
 const cors = require('cors');
@@ -36,7 +36,6 @@ const contentRoutes = require('./src/routes/content.routes');
 const supportRoutes = require('./src/routes/support.routes');
 const adminRoutes = require('./src/routes/admin.routes');
 const adminAuth = require('./src/middlewares/adminAuth.middleware');
-const session = require('./src/services/session.service');
 const { ensurePasswordResetsTable } = require('./src/models/passwordReset.model');
 const userAuth = require('./src/middlewares/userAuth.middleware');
 // Prefer IPv4 and keep-alive at the fetch/Undici layer used by Resend SDK
@@ -147,6 +146,9 @@ app.use(
   express.urlencoded({
     limit: process.env.URLENCODED_BODY_LIMIT || '1mb',
     extended: true,
+    verify: (req, res, buf) => {
+      req.rawBody = buf;
+    },
   })
 );
 
@@ -164,6 +166,14 @@ const PUBLIC_API_PATHS = [
   '/authentication',
   '/authorization',
   '/password',
+  '/verify-email',
+  '/verify-mobile',
+  '/resend-verify',
+  '/get-countries',
+  '/language',
+  '/general-setting',
+  '/module-setting',
+  '/user-data-submit',
   '/add-device-token',
   '/health',
   '/policies',
@@ -173,6 +183,7 @@ const PUBLIC_API_PATHS = [
 
 function enforceLogin(req, res, next) {
   const route = req.path || '';
+  if (route.startsWith('/admin')) return next();
   const isPublic = PUBLIC_API_PATHS.some(publicPath => route.startsWith(publicPath));
   if (isPublic) return next();
   return userAuth(req, res, next);

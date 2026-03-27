@@ -95,7 +95,8 @@ async function getGeneralSetting(req, res) {
           cur_sym: '₦',
           app_name: 'VoltPay',
           app_version: settings.app_version || '1.0.0',
-          maintenance_mode: settings.maintenance_mode === 'true'
+          maintenance_mode: settings.maintenance_mode === 'true',
+          user_pin_digits: String(settings.user_pin_digits || settings.userPinDigits || '6')
         }
       }
     };

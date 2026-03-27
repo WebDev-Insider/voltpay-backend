@@ -1,8 +1,28 @@
 const prisma = require('../../database/prisma');
 const cloudinary = require('cloudinary').v2;
 const { getCountryByCode } = require('../helpers/country.helper');
-const session = require('../services/session.service');
 const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const { randomUUID } = require('crypto');
+
+function signAccessToken(userId, sessionId) {
+  const secret = process.env.JWT_SECRET;
+  if (!secret) return null;
+  const expiresIn = process.env.JWT_EXPIRES_IN || '30d';
+  return jwt.sign({ sub: String(userId), typ: 'access', sid: String(sessionId) }, secret, { expiresIn });
+}
+
+async function rotateUserSession(userId, deviceId) {
+  const sid = randomUUID();
+  await prisma.user.update({
+    where: { id: Number(userId) },
+    data: {
+      active_session_id: sid,
+      active_device_id: deviceId ? String(deviceId) : null,
+    },
+  });
+  return sid;
+}
 
 function normalizeLookupUserInput(input) {
   const raw = String(input || '').trim();
@@ -23,9 +43,18 @@ function normalizeLookupUserInput(input) {
   return { username: raw, mobile: '' };
 }
 
+function validatePasswordComplexity(password) {
+  const p = String(password || '');
+  if (p.length < 8 || p.length > 16) return 'Password must be between 8 and 16 characters';
+  if (!/[A-Z]/.test(p)) return 'Password must include at least one uppercase letter';
+  if (!/[0-9]/.test(p)) return 'Password must include at least one number';
+  if (!/[^A-Za-z0-9]/.test(p)) return 'Password must include at least one symbol';
+  return '';
+}
+
 async function userExist(req, res) {
   try {
-    const currentUser = req.user || session.getCurrentUser();
+    const currentUser = req.user;
     if (!currentUser) {
       return res.status(401).json({ remark: 'unauthorized', status: 'error', message: ['Please login first'], data: null });
     }
@@ -92,7 +121,7 @@ async function userExist(req, res) {
 async function userInfo(req, res) {
   try {
     console.log('📥 User info request (controller)');
-    const currentUser = session.getCurrentUser();
+    const currentUser = req.user;
     if (!currentUser) {
       return res.status(401).json({
         remark: 'unauthorized',
@@ -112,7 +141,8 @@ async function userInfo(req, res) {
           ...currentUser,
           country_name: countryDetails.name,
           country_flag: countryDetails.image_src,
-          dial_code: countryDetails.dial_code
+          dial_code: countryDetails.dial_code,
+          pn: currentUser.pin ? '1' : '0'
         }
       }
     });
@@ -129,7 +159,7 @@ async function userInfo(req, res) {
 
 async function profileSetting(req, res) {
   try {
-    const currentUser = session.getCurrentUser();
+    const currentUser = req.user;
     if (!currentUser) {
       return res.status(401).json({
         remark: 'unauthorized',
@@ -142,6 +172,10 @@ async function profileSetting(req, res) {
     const { firstname, lastname, email, username, address, state, city, zip } = req.body;
     console.log('📥 Profile setting request (controller):', req.body);
     console.log('📥 Image file:', req.file ? 'Present' : 'Not provided');
+
+    const currentUserId = Number(currentUser.id);
+    const cleanedEmail = typeof email === 'string' ? email.trim() : '';
+    const cleanedUsername = typeof username === 'string' ? username.trim() : '';
 
     let profileImageUrl = null;
     if (req.file) {
@@ -170,13 +204,49 @@ async function profileSetting(req, res) {
     }
 
     try {
+      if (cleanedEmail) {
+        const emailUser = await prisma.user.findFirst({
+          where: {
+            email: { equals: cleanedEmail, mode: 'insensitive' },
+            id: { not: currentUserId },
+          },
+          select: { id: true },
+        });
+        if (emailUser) {
+          return res.status(409).json({
+            remark: 'email_exists',
+            status: 'error',
+            message: ['An account with this email address already exists. Please use a different email or try logging in.'],
+            data: null
+          });
+        }
+      }
+
+      if (cleanedUsername) {
+        const usernameUser = await prisma.user.findFirst({
+          where: {
+            username: { equals: cleanedUsername, mode: 'insensitive' },
+            id: { not: currentUserId },
+          },
+          select: { id: true },
+        });
+        if (usernameUser) {
+          return res.status(409).json({
+            remark: 'username_exists',
+            status: 'error',
+            message: ['This username is already taken. Please choose a different username.'],
+            data: null
+          });
+        }
+      }
+
       const updated = await prisma.user.update({
-        where: { id: Number(currentUser.id) },
+        where: { id: currentUserId },
         data: {
           firstname: firstname ?? undefined,
           lastname: lastname ?? undefined,
-          username: username ?? undefined,
-          email: email ?? undefined,
+          username: cleanedUsername || undefined,
+          email: cleanedEmail || undefined,
           address: address ?? undefined,
           state: state ?? undefined,
           city: city ?? undefined,
@@ -184,7 +254,6 @@ async function profileSetting(req, res) {
           image: profileImageUrl ?? undefined,
         },
       });
-      session.setCurrentUser(updated);
       const countryDetails = getCountryByCode(updated.country_code);
       return res.json({
         remark: 'profile_updated',
@@ -195,12 +264,40 @@ async function profileSetting(req, res) {
             ...updated,
             country_name: countryDetails.name,
             country_flag: countryDetails.image_src,
-            dial_code: countryDetails.dial_code
+            dial_code: countryDetails.dial_code,
+            pn: updated.pin ? '1' : '0'
           }
         }
       });
     } catch (dbError) {
       console.error('❌ Error updating profile in database:', dbError);
+
+      if (dbError && dbError.code === 'P2002') {
+        const target = Array.isArray(dbError.meta?.target) ? dbError.meta.target.join(',') : (dbError.meta?.target || '').toString();
+        if (target.toLowerCase().includes('email')) {
+          return res.status(409).json({
+            remark: 'email_exists',
+            status: 'error',
+            message: ['An account with this email address already exists. Please use a different email or try logging in.'],
+            data: null
+          });
+        }
+        if (target.toLowerCase().includes('username')) {
+          return res.status(409).json({
+            remark: 'username_exists',
+            status: 'error',
+            message: ['This username is already taken. Please choose a different username.'],
+            data: null
+          });
+        }
+        return res.status(409).json({
+          remark: 'unique_constraint',
+          status: 'error',
+          message: ['A unique field already exists. Please use different values and try again.'],
+          data: null
+        });
+      }
+
       return res.status(500).json({
         remark: 'database_error',
         status: 'error',
@@ -223,17 +320,61 @@ module.exports = { userInfo, profileSetting };
 
 async function userDataSubmit(req, res) {
   try {
-    const { firstname, lastname, email, pin, country_code, mobile_number } = req.body;
+    const {
+      firstname,
+      lastname,
+      email,
+      pin,
+      country_code,
+      mobile_number,
+      password,
+      password_confirmation,
+    } = req.body;
+    const effectiveDeviceId = req.body?.device_id || req.headers['x-device-id'];
     console.log('📥 User data submit request (controller):', req.body);
     console.log('📥 Image file:', req.file ? 'Present' : 'Not provided');
 
-    if (!firstname || !lastname || !pin) {
+    const cleanedEmail = typeof email === 'string' ? email.trim() : '';
+    const cleanedUsername = typeof req.body.username === 'string' ? req.body.username.trim() : '';
+
+    const wantsPasswordSetup = !!(password || password_confirmation);
+    if (!firstname || !lastname || (!wantsPasswordSetup && !pin)) {
       return res.status(400).json({
         remark: 'validation_error',
         status: 'error',
-        message: ['First name, last name, and PIN are required'],
+        message: [wantsPasswordSetup ? 'First name, last name, and password are required' : 'First name, last name, and PIN are required'],
         data: null
       });
+    }
+
+    if (wantsPasswordSetup) {
+      if (!password || !password_confirmation) {
+        return res.status(400).json({
+          remark: 'validation_error',
+          status: 'error',
+          message: ['Password and confirmation are required'],
+          data: null
+        });
+      }
+
+      if (String(password) !== String(password_confirmation)) {
+        return res.status(400).json({
+          remark: 'password_mismatch',
+          status: 'error',
+          message: ["Password and confirmation password don't match"],
+          data: null
+        });
+      }
+
+      const pwdErr = validatePasswordComplexity(password);
+      if (pwdErr) {
+        return res.status(400).json({
+          remark: 'weak_password',
+          status: 'error',
+          message: [pwdErr],
+          data: null
+        });
+      }
     }
 
     let profileImageUrl = null;
@@ -280,8 +421,14 @@ async function userDataSubmit(req, res) {
         user = existingUser;
       }
 
-      if (email) {
-        const emailUser = await prisma.user.findFirst({ where: { email: String(email) } });
+      if (cleanedEmail) {
+        const emailUser = await prisma.user.findFirst({
+          where: {
+            email: { equals: cleanedEmail, mode: 'insensitive' },
+            ...(user ? { id: { not: Number(user.id) } } : {}),
+          },
+          select: { id: true },
+        });
         if (emailUser) {
           return res.status(409).json({
             remark: 'email_exists',
@@ -292,37 +439,66 @@ async function userDataSubmit(req, res) {
         }
       }
 
+      if (cleanedUsername) {
+        const usernameUser = await prisma.user.findFirst({
+          where: {
+            username: { equals: cleanedUsername, mode: 'insensitive' },
+            ...(user ? { id: { not: Number(user.id) } } : {}),
+          },
+          select: { id: true },
+        });
+        if (usernameUser) {
+          return res.status(409).json({
+            remark: 'username_exists',
+            status: 'error',
+            message: ['This username is already taken. Please choose a different username.'],
+            data: null
+          });
+        }
+      }
+
       if (user) {
-        const hashedPin = await bcrypt.hash(String(pin), 10);
+        const updateData = {
+          firstname,
+          lastname,
+          username: cleanedUsername || user.username,
+          email: cleanedEmail || user.email,
+          profile_complete: '1',
+          ev: '1',
+          sv: '1',
+          kv: '1',
+          image: profileImageUrl || user.image,
+          address: req.body.address || user.address,
+          state: req.body.state || user.state,
+          city: req.body.city || user.city,
+          zip: req.body.zip || user.zip,
+        };
+
+        if (pin) {
+          updateData.pin = await bcrypt.hash(String(pin), 10);
+        }
+
+        if (wantsPasswordSetup) {
+          updateData.password = await bcrypt.hash(String(password), 10);
+        }
+
         user = await prisma.user.update({
           where: { id: Number(user.id) },
           data: {
-            firstname,
-            lastname,
-            username: req.body.username || user.username,
-            email: email || user.email,
-            pin: hashedPin,
-            profile_complete: '1',
-            ev: '1',
-            sv: '1',
-            kv: '1',
-            image: profileImageUrl || user.image,
-            address: req.body.address || user.address,
-            state: req.body.state || user.state,
-            city: req.body.city || user.city,
-            zip: req.body.zip || user.zip,
+            ...updateData,
           },
         });
         console.log(`✅ User profile updated in database: ${user.firstname} ${user.lastname}`);
       } else {
         console.log(`👤 Creating new user with mobile: ${mobile_number}`);
-        const hashedPin = await bcrypt.hash(String(pin), 10);
+        const hashedPin = pin ? await bcrypt.hash(String(pin), 10) : null;
+        const hashedPassword = wantsPasswordSetup ? await bcrypt.hash(String(password), 10) : null;
         user = await prisma.user.create({
           data: {
             firstname,
             lastname,
-            username: req.body.username || '',
-            email: email || null,
+            username: cleanedUsername || null,
+            email: cleanedEmail || null,
             mobile: String(mobile_number || ''),
             country_code: String(country_code || ''),
             balance: '0',
@@ -338,13 +514,46 @@ async function userDataSubmit(req, res) {
             state: req.body.state || '',
             city: req.body.city || '',
             zip: req.body.zip || '',
-            pin: hashedPin,
+            ...(hashedPin ? { pin: hashedPin } : {}),
+            ...(hashedPassword ? { password: hashedPassword } : {}),
           },
         });
         console.log(`✅ User saved to database: ${user.firstname} ${user.lastname}`);
       }
     } catch (dbError) {
       console.error('❌ Error with database operation (submit):', dbError);
+
+      if (dbError && dbError.code === 'P2002') {
+        const target = Array.isArray(dbError.meta?.target)
+          ? dbError.meta.target.join(',')
+          : (dbError.meta?.target || '').toString();
+
+        if (target.toLowerCase().includes('email')) {
+          return res.status(409).json({
+            remark: 'email_exists',
+            status: 'error',
+            message: ['An account with this email address already exists. Please use a different email or try logging in.'],
+            data: null
+          });
+        }
+
+        if (target.toLowerCase().includes('username')) {
+          return res.status(409).json({
+            remark: 'username_exists',
+            status: 'error',
+            message: ['This username is already taken. Please choose a different username.'],
+            data: null
+          });
+        }
+
+        return res.status(409).json({
+          remark: 'unique_constraint',
+          status: 'error',
+          message: ['A unique field already exists. Please use different values and try again.'],
+          data: null
+        });
+      }
+
       return res.status(500).json({
         remark: 'database_error',
         status: 'error',
@@ -353,13 +562,34 @@ async function userDataSubmit(req, res) {
       });
     }
 
-    session.setCurrentUser(user);
+    let sessionId;
+    try {
+      sessionId = await rotateUserSession(user.id, effectiveDeviceId);
+    } catch (e) {
+      console.error('❌ Failed to persist active session during user data submit:', e);
+      return res.status(500).json({
+        remark: 'database_error',
+        status: 'error',
+        message: ['Failed to create login session'],
+        data: null
+      });
+    }
+
+    const accessToken = signAccessToken(user.id, sessionId);
+    if (!accessToken) {
+      return res.status(500).json({
+        remark: 'config_error',
+        status: 'error',
+        message: ['JWT_SECRET not configured'],
+        data: null
+      });
+    }
     return res.json({
       remark: 'profile_complete',
       status: 'success',
       message: ['Profile completed successfully'],
       data: {
-        access_token: `token_${user.id}_${Date.now()}`,
+        access_token: accessToken,
         token_type: 'Bearer',
         user: {
           id: user.id,
@@ -377,6 +607,7 @@ async function userDataSubmit(req, res) {
           sv: user.sv,
           tv: user.tv,
           kv: user.kv,
+          pn: user.pin ? '1' : '0',
           image: user.image,
           created_at: user.created_at,
           updated_at: user.updated_at
@@ -396,7 +627,7 @@ async function userDataSubmit(req, res) {
 
 async function changePassword(req, res) {
   try {
-    const currentUser = session.getCurrentUser();
+    const currentUser = req.user;
     if (!currentUser) {
       return res.status(401).json({
         remark: 'unauthorized',
@@ -406,33 +637,144 @@ async function changePassword(req, res) {
       });
     }
 
-    const { current_pin, pin, pin_confirmation } = req.body || {};
+    const body = req.body || {};
+    const wantsPasswordChange = !!(
+      body.password ||
+      body.password_confirmation ||
+      body.new_password ||
+      body.confirm_password ||
+      body.current_password
+    );
+
+    if (wantsPasswordChange) {
+      const current_password = body.current_password;
+      const password = body.password ?? body.new_password;
+      const password_confirmation = body.password_confirmation ?? body.confirm_password;
+
+      console.log('📥 Change password request (controller):', { current_password: !!current_password, password: !!password, password_confirmation: !!password_confirmation });
+
+      if (!password || !password_confirmation) {
+        return res.status(200).json({
+          remark: 'validation_error',
+          status: 'error',
+          message: ['New password and confirmation are required'],
+          data: null
+        });
+      }
+
+      if (String(password) !== String(password_confirmation)) {
+        return res.status(200).json({
+          remark: 'password_mismatch',
+          status: 'error',
+          message: ["Password and confirmation password don't match"],
+          data: null
+        });
+      }
+
+      const pwdErr = validatePasswordComplexity(password);
+      if (pwdErr) {
+        return res.status(200).json({
+          remark: 'weak_password',
+          status: 'error',
+          message: [pwdErr],
+          data: null
+        });
+      }
+
+      try {
+        const dbUser = await prisma.user.findUnique({ where: { id: Number(currentUser.id) }, select: { id: true, password: true } });
+        if (!dbUser) {
+          return res.status(404).json({
+            remark: 'user_not_found',
+            status: 'error',
+            message: ['User not found'],
+            data: null
+          });
+        }
+
+        const hasPassword = !!(dbUser.password && String(dbUser.password).trim());
+        if (hasPassword) {
+          if (!current_password) {
+            return res.status(200).json({
+              remark: 'validation_error',
+              status: 'error',
+              message: ['Current password is required'],
+              data: null
+            });
+          }
+          const storedPassword = String(dbUser.password || '');
+          const looksHashed = storedPassword.startsWith('$2a$') || storedPassword.startsWith('$2b$') || storedPassword.startsWith('$2y$');
+          const valid = looksHashed ? (await bcrypt.compare(String(current_password), storedPassword)) : storedPassword === String(current_password);
+          if (!valid) {
+            return res.status(200).json({
+              remark: 'invalid_current_password',
+              status: 'error',
+              message: ['Current password is incorrect'],
+              data: null
+            });
+          }
+          if (String(current_password) === String(password)) {
+            return res.status(200).json({
+              remark: 'password_same_as_current',
+              status: 'error',
+              message: ['New password must be different from current password'],
+              data: null
+            });
+          }
+        }
+
+        const updated = await prisma.user.update({
+          where: { id: Number(currentUser.id) },
+          data: { password: await bcrypt.hash(String(password), 10) },
+        });
+
+        return res.json({
+          remark: 'password_changed',
+          status: 'success',
+          message: ['Password changed successfully'],
+          data: { user: updated }
+        });
+      } catch (err) {
+        console.error('❌ Error changing password:', err);
+        return res.status(500).json({
+          remark: 'database_error',
+          status: 'error',
+          message: ['Failed to change password. Please try again later.'],
+          data: null
+        });
+      }
+    }
+
+    const { current_pin, pin, pin_confirmation } = body;
     console.log('📥 Change PIN request (controller):', { current_pin: !!current_pin, pin: !!pin, pin_confirmation: !!pin_confirmation });
 
-    if (!current_pin || !pin || !pin_confirmation) {
+    if (!pin || !pin_confirmation) {
       return res.status(200).json({
         remark: 'validation_error',
         status: 'error',
-        message: ['Current PIN, new PIN, and confirmation are required'],
+        message: ['New PIN and confirmation are required'],
         data: null
       });
     }
 
-    if (String(pin) !== String(pin_confirmation)) {
+    const normalizedPin = String(pin).trim();
+    const normalizedPinConfirmation = String(pin_confirmation).trim();
+    const PIN_DIGITS = 6;
+
+    if (!/^\d+$/.test(normalizedPin) || normalizedPin.length !== PIN_DIGITS) {
+      return res.status(200).json({
+        remark: 'invalid_pin_format',
+        status: 'error',
+        message: [`PIN must be exactly ${PIN_DIGITS} digits`],
+        data: null
+      });
+    }
+
+    if (normalizedPin !== normalizedPinConfirmation) {
       return res.status(200).json({
         remark: 'pin_mismatch',
         status: 'error',
         message: ["PIN and confirmation PIN don't match"],
-        data: null
-      });
-    }
-
-    // Optional: Disallow same PIN as current
-    if (String(current_pin) === String(pin)) {
-      return res.status(200).json({
-        remark: 'pin_same_as_current',
-        status: 'error',
-        message: ['New PIN must be different from current PIN'],
         data: null
       });
     }
@@ -449,29 +791,48 @@ async function changePassword(req, res) {
       }
 
       const storedPin = String(dbUser.pin || '');
-      const looksHashed = storedPin.startsWith('$2a$') || storedPin.startsWith('$2b$') || storedPin.startsWith('$2y$');
-      const valid = looksHashed ? (await bcrypt.compare(String(current_pin), storedPin)) : storedPin === String(current_pin);
-      if (!valid) {
-        return res.status(200).json({
-          remark: 'invalid_current_pin',
-          status: 'error',
-          message: ['Current PIN is incorrect'],
-          data: null
-        });
+      const hasExistingPin = storedPin.trim().length > 0;
+
+      if (hasExistingPin) {
+        if (!current_pin) {
+          return res.status(200).json({
+            remark: 'validation_error',
+            status: 'error',
+            message: ['Current PIN is required'],
+            data: null
+          });
+        }
+
+        if (String(current_pin).trim() === normalizedPin) {
+          return res.status(200).json({
+            remark: 'pin_same_as_current',
+            status: 'error',
+            message: ['New PIN must be different from current PIN'],
+            data: null
+          });
+        }
+
+        const looksHashed = storedPin.startsWith('$2a$') || storedPin.startsWith('$2b$') || storedPin.startsWith('$2y$');
+        const valid = looksHashed ? (await bcrypt.compare(String(current_pin), storedPin)) : storedPin === String(current_pin);
+        if (!valid) {
+          return res.status(200).json({
+            remark: 'invalid_current_pin',
+            status: 'error',
+            message: ['Current PIN is incorrect'],
+            data: null
+          });
+        }
       }
 
       const updated = await prisma.user.update({
         where: { id: Number(currentUser.id) },
-        data: { pin: await bcrypt.hash(String(pin), 10) },
+        data: { pin: await bcrypt.hash(normalizedPin, 10) },
       });
 
-      // Refresh session user
-      session.setCurrentUser(updated);
-
       return res.json({
-        remark: 'pin_changed',
+        remark: hasExistingPin ? 'pin_changed' : 'pin_set',
         status: 'success',
-        message: ['Pin change successfully'],
+        message: [hasExistingPin ? 'Pin change successfully' : 'Pin set successfully'],
         data: { user: updated }
       });
     } catch (err) {
@@ -496,7 +857,7 @@ async function changePassword(req, res) {
 
 async function deleteAccount(req, res) {
   try {
-    const currentUser = session.getCurrentUser();
+    const currentUser = req.user;
     if (!currentUser) {
       return res.status(401).json({
         remark: 'unauthorized',
@@ -506,18 +867,18 @@ async function deleteAccount(req, res) {
       });
     }
 
-    const { pin } = req.body || {};
-    if (!pin) {
+    const { password } = req.body || {};
+    if (!password) {
       return res.status(200).json({
         remark: 'validation_error',
         status: 'error',
-        message: ['PIN is required to delete account'],
+        message: ['Password is required to delete account'],
         data: null
       });
     }
 
     try {
-      const dbUser = await prisma.user.findUnique({ where: { id: Number(currentUser.id) }, select: { id: true, pin: true } });
+      const dbUser = await prisma.user.findUnique({ where: { id: Number(currentUser.id) }, select: { id: true, password: true } });
       if (!dbUser) {
         return res.status(404).json({
           remark: 'user_not_found',
@@ -527,23 +888,29 @@ async function deleteAccount(req, res) {
         });
       }
 
-      const storedPin = String(dbUser.pin || '');
-      const looksHashed = storedPin.startsWith('$2a$') || storedPin.startsWith('$2b$') || storedPin.startsWith('$2y$');
-      const valid = looksHashed ? (await bcrypt.compare(String(pin), storedPin)) : storedPin === String(pin);
+      const storedPassword = String(dbUser.password || '');
+      if (!storedPassword.trim()) {
+        return res.status(200).json({
+          remark: 'password_required',
+          status: 'error',
+          message: ['Password is required to delete account'],
+          data: null
+        });
+      }
+
+      const looksHashed = storedPassword.startsWith('$2a$') || storedPassword.startsWith('$2b$') || storedPassword.startsWith('$2y$');
+      const valid = looksHashed ? (await bcrypt.compare(String(password), storedPassword)) : storedPassword === String(password);
       if (!valid) {
         return res.status(200).json({
-          remark: 'invalid_pin',
+          remark: 'invalid_password',
           status: 'error',
-          message: ['PIN is incorrect'],
+          message: ['Password is incorrect'],
           data: null
         });
       }
 
       // Hard delete the user account
       await prisma.user.delete({ where: { id: Number(currentUser.id) } });
-
-      // Clear session
-      session.setCurrentUser(null);
 
       return res.json({
         remark: 'account_deleted',
