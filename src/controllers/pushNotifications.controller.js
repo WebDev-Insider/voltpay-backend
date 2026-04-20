@@ -399,4 +399,36 @@ async function markAllRead(req, res) {
   }
 }
 
-module.exports = { list, ingest, getSettings, setSettings, unreadCount, markRead, markAllRead };
+async function clearAll(req, res) {
+  try {
+    const user = req.user;
+    if (!user) {
+      return res.status(401).json({ remark: 'unauthorized', status: 'error', message: ['Please login first'], data: null });
+    }
+
+    if (!prisma.pushNotification) {
+      return res.status(500).json({
+        remark: 'server_error',
+        status: 'error',
+        message: ['PushNotification model is not available. Run prisma generate + db push/migrate and restart the server.'],
+        data: null,
+      });
+    }
+
+    const deleted = await withDirectFallback(p => p.pushNotification.deleteMany({
+      where: { user_id: Number(user.id) },
+    }));
+
+    return res.json({
+      remark: 'push_notifications_cleared',
+      status: 'success',
+      message: ['Notifications cleared'],
+      data: { deleted: Number(deleted?.count || 0) },
+    });
+  } catch (e) {
+    console.error('Push notifications clearAll error:', e);
+    return res.status(500).json({ remark: 'error', status: 'error', message: ['Failed to clear notifications'], data: null });
+  }
+}
+
+module.exports = { list, ingest, getSettings, setSettings, unreadCount, markRead, markAllRead, clearAll };

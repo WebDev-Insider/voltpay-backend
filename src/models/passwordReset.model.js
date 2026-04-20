@@ -2,6 +2,7 @@ const prisma = require('../../database/prisma');
 
 function normalizeResetType(type) {
   const t = String(type || 'pin').trim().toLowerCase();
+  if (t === 'signup' || t === 'register' || t === 'registration') return 'signup';
   if (t === 'password' || t === 'password_reset') return 'password';
   return 'pin';
 }

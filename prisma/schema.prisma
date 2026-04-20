@@ -39,6 +39,10 @@ model User {
 
   password_resets  PasswordReset[]
   verification_codes VerificationCode[]
+  activities       UserActivity[]
+  bill_hero_claims BillHeroClaim[]
+  staffpay_companies StaffPayCompany[]
+  staffpay_funding_transactions StaffPayFundingTransaction[]
 
   @@map("users")
 }
@@ -239,4 +243,165 @@ model UserActivity {
 
   @@index([user_id, created_at])
   @@map("user_activity")
+}
+
+model BillHeroClaim {
+  id          Int      @id @default(autoincrement())
+  user_id     Int
+  week_key    String
+  reward_type String
+  phone       String
+  network     String
+  status      String   @default("claimed")
+  provider    String   @default("clubkonnect")
+  provider_ref String?
+  provider_payload Json?
+  claimed_at  DateTime @default(now())
+  created_at  DateTime @default(now())
+  updated_at  DateTime @updatedAt
+
+  user User @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@unique([user_id, week_key, reward_type])
+  @@index([week_key, reward_type])
+  @@index([user_id, claimed_at])
+  @@map("bill_hero_claims")
+}
+
+model StaffPayCompany {
+  id               Int      @id @default(autoincrement())
+  owner_user_id    Int
+  name             String
+  address          String
+  cac_number       String?
+  phone            String
+  email            String
+  auto_pay_enabled Boolean  @default(true)
+  payout_time       String?
+  payout_timezone   String   @default("Africa/Lagos")
+  virtual_account_tx_ref     String?  @unique
+  virtual_account_number     String?
+  virtual_account_bank_name  String?
+  virtual_account_order_ref  String?
+  virtual_account_flw_ref    String?
+  virtual_account_expires_at DateTime?
+  low_balance_alert_enabled Boolean @default(true)
+  low_balance_threshold     Decimal @default(10000) @db.Decimal(15, 2)
+  created_at       DateTime @default(now())
+  updated_at       DateTime @updatedAt
+
+  owner       User              @relation(fields: [owner_user_id], references: [id], onDelete: Cascade)
+  wallet      StaffPayWallet?
+  staff       StaffPayStaff[]
+  funding     StaffPayFundingTransaction[]
+  payrollRuns StaffPayPayrollRun[]
+
+  @@index([owner_user_id, created_at])
+  @@map("staffpay_companies")
+}
+
+model StaffPayWallet {
+  id         Int      @id @default(autoincrement())
+  company_id Int      @unique
+  balance    Decimal  @default(0) @db.Decimal(15, 2)
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  company StaffPayCompany @relation(fields: [company_id], references: [id], onDelete: Cascade)
+
+  @@map("staffpay_wallets")
+}
+
+model StaffPayStaff {
+  id                  Int      @id @default(autoincrement())
+  company_id           Int
+  full_name            String
+  phone                String
+  bank_code            String
+  bank_name            String?
+  bank_branch_code     String?
+  bank_branch_name     String?
+  account_number_enc   String
+  account_number_last4 String
+  account_name         String?
+  salary_amount        Decimal  @db.Decimal(15, 2)
+  frequency            String
+  payment_day          Int?
+  start_date           DateTime
+  last_paid_at         DateTime?
+  is_active            Boolean  @default(true)
+  created_at           DateTime @default(now())
+  updated_at           DateTime @updatedAt
+
+  company      StaffPayCompany     @relation(fields: [company_id], references: [id], onDelete: Cascade)
+  payrollItems StaffPayPayrollItem[]
+
+  @@index([company_id, is_active])
+  @@map("staffpay_staff")
+}
+
+model StaffPayFundingTransaction {
+  id                Int      @id @default(autoincrement())
+  company_id         Int
+  user_id            Int
+  tx_ref             String   @unique
+  flutterwave_tx_id  String?  @unique
+  amount             Decimal  @db.Decimal(15, 2)
+  currency           String   @default("NGN")
+  status             String   @default("pending")
+  raw_payload        Json?
+  credited_at        DateTime?
+  created_at         DateTime @default(now())
+  updated_at         DateTime @updatedAt
+
+  company StaffPayCompany @relation(fields: [company_id], references: [id], onDelete: Cascade)
+  user    User            @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@index([company_id, created_at])
+  @@map("staffpay_funding_transactions")
+}
+
+model StaffPayPayrollRun {
+  id                   Int      @id @default(autoincrement())
+  company_id            Int
+  title                String
+  batch_id             Int?
+  status               String   @default("queued")
+  total_salary         Decimal  @db.Decimal(15, 2)
+  flutterwave_fee_total Decimal @default(0) @db.Decimal(15, 2)
+  voltpay_fee_total     Decimal @default(0) @db.Decimal(15, 2)
+  vat_total             Decimal @default(0) @db.Decimal(15, 2)
+  total_debit          Decimal  @db.Decimal(15, 2)
+  created_at           DateTime @default(now())
+  updated_at           DateTime @updatedAt
+
+  company StaffPayCompany      @relation(fields: [company_id], references: [id], onDelete: Cascade)
+  items   StaffPayPayrollItem[]
+
+  @@index([company_id, created_at])
+  @@map("staffpay_payroll_runs")
+}
+
+model StaffPayPayrollItem {
+  id                   Int      @id @default(autoincrement())
+  payroll_run_id        Int
+  staff_id             Int
+  amount               Decimal  @db.Decimal(15, 2)
+  flutterwave_fee      Decimal  @default(0) @db.Decimal(15, 2)
+  voltpay_fee           Decimal  @default(0) @db.Decimal(15, 2)
+  vat                  Decimal  @default(0) @db.Decimal(15, 2)
+  status               String   @default("NEW")
+  flutterwave_transfer_id Int?
+  reference            String?
+  complete_message     String?
+  raw_payload          Json?
+  created_at           DateTime @default(now())
+  updated_at           DateTime @updatedAt
+
+  payroll_run StaffPayPayrollRun @relation(fields: [payroll_run_id], references: [id], onDelete: Cascade)
+  staff       StaffPayStaff      @relation(fields: [staff_id], references: [id], onDelete: Cascade)
+
+  @@index([payroll_run_id, status])
+  @@index([staff_id, created_at])
+  @@map("staffpay_payroll_items")
 }

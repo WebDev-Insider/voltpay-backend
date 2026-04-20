@@ -7,6 +7,8 @@ router.post('/verification-process/verify/pin', userAuth, VerificationController
 
 router.post('/pin/validate', userAuth, VerificationController.validatePin);
 
+router.post('/password/validate', userAuth, VerificationController.validatePassword);
+
 router.post('/verify-email', userAuth, VerificationController.verifyEmail);
 
 router.post('/verify-mobile', userAuth, VerificationController.verifyMobile);

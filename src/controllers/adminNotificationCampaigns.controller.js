@@ -1,4 +1,5 @@
 const prisma = require('../../database/prisma')
+const { broadcastToUserIds } = require('../services/notificationWs.service')
 
 function isAccelerateCommError(e) {
   return Boolean(e && (e.code === 'P6000' || e?.meta?.code === 'P6000'))
@@ -220,11 +221,12 @@ async function sendCampaign(req, res) {
     }
 
     const status = String(campaign.status || 'draft').toLowerCase()
-    if (status === 'sent') {
+    const force = String(req.query?.force || '').trim() === '1'
+    if (status === 'sent' && !force) {
       return res.json({ remark: 'notification_campaign_sent', status: 'success', data: { id: campaign.id, status: 'sent', recipient_count: campaign.recipient_count || 0 } })
     }
 
-    const recipientsWhere = { role: 'customer' }
+    const recipientsWhere = { status: 1 }
     const totalRecipients = await withDirectFallback(p => p.user.count({ where: recipientsWhere }))
 
     const now = new Date()
@@ -268,6 +270,18 @@ async function sendCampaign(req, res) {
         data,
         skipDuplicates: true,
       }))
+
+       try {
+         broadcastToUserIds(
+           users.map(u => Number(u.id)),
+           {
+             event: 'notification.created',
+             data: {
+               campaign_id: id,
+             },
+           }
+         )
+       } catch (_) {}
     }
 
     await withDirectFallback(p => p.notificationCampaign.update({
@@ -282,4 +296,47 @@ async function sendCampaign(req, res) {
   }
 }
 
-module.exports = { listCampaigns, createCampaign, getCampaign, sendCampaign }
+async function deleteCampaign(req, res) {
+  try {
+    if (!prisma.notificationCampaign) {
+      return res.status(500).json({ remark: 'server_error', status: 'error', message: ['NotificationCampaign model is not available. Run prisma generate + db push/migrate and restart the server.'], data: null })
+    }
+
+    const id = parseInt(req.params.id, 10)
+    if (!id || Number.isNaN(id)) {
+      return res.status(400).json({ remark: 'bad_request', status: 'error', message: ['Invalid campaign id'], data: null })
+    }
+
+    let deletedNotifications = 0
+    try {
+      if (prisma.pushNotification) {
+        const result = await withDirectFallback(p => p.$transaction([
+          p.pushNotification.deleteMany({ where: { campaign_id: id } }),
+          p.notificationCampaign.delete({ where: { id } }),
+        ]))
+        deletedNotifications = Number(result?.[0]?.count || 0)
+      } else {
+        await withDirectFallback(p => p.notificationCampaign.delete({ where: { id } }))
+      }
+    } catch (e) {
+      if (e?.code === 'P2025') {
+        return res.status(404).json({ remark: 'not_found', status: 'error', message: ['Campaign not found'], data: null })
+      }
+      throw e
+    }
+
+    return res.json({
+      remark: 'notification_campaign_deleted',
+      status: 'success',
+      data: {
+        id,
+        deleted_notifications: deletedNotifications,
+      }
+    })
+  } catch (e) {
+    console.error('admin.deleteNotificationCampaign error', e)
+    return res.status(500).json({ remark: 'error', status: 'error', message: ['Failed to delete campaign'], data: null })
+  }
+}
+
+module.exports = { listCampaigns, createCampaign, getCampaign, sendCampaign, deleteCampaign }

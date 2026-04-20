@@ -35,6 +35,14 @@ function getClubKonnectCreds() {
   return { userId, apiKey };
 }
 
+function getBettingCreds() {
+  const userId = String(process.env.BETTING_USER_ID || process.env.CLUBKONNECT_USER_ID || '').trim();
+  const apiKey = String(process.env.BETTING_API_KEY || process.env.CLUBKONNECT_API_KEY || '').trim();
+  if (!userId) throw new Error('Missing required env: BETTING_USER_ID');
+  if (!apiKey) throw new Error('Missing required env: BETTING_API_KEY');
+  return { userId, apiKey };
+}
+
 function httpsRequest(url) {
   return new Promise((resolve, reject) => {
     const u = new URL(url);
@@ -276,6 +284,38 @@ async function buyDatabundleV1({ mobileNetwork, dataPlan, mobileNumber, requestI
   });
 }
 
+async function listBettingCompaniesV2() {
+  const userId = String(process.env.BETTING_USER_ID || process.env.CLUBKONNECT_USER_ID || '').trim();
+  if (!userId) throw new Error('Missing required env: BETTING_USER_ID');
+  const apiKey = String(process.env.BETTING_API_KEY || process.env.CLUBKONNECT_API_KEY || '').trim();
+  const params = { UserID: userId };
+  if (apiKey) params.APIKey = apiKey;
+  return await ckGet('/APIBettingCompaniesV2.asp', params);
+}
+
+async function verifyBettingCustomerV1({ bettingCompany, customerId }) {
+  const { userId, apiKey } = getBettingCreds();
+  return await ckGet('/APIVerifyBettingV1.asp', {
+    UserID: userId,
+    APIKey: apiKey,
+    BettingCompany: bettingCompany,
+    CustomerID: customerId,
+  });
+}
+
+async function fundBettingWalletV1({ bettingCompany, customerId, amount, requestId, callbackUrl }) {
+  const { userId, apiKey } = getBettingCreds();
+  return await ckGet('/APIBettingV1.asp', {
+    UserID: userId,
+    APIKey: apiKey,
+    BettingCompany: bettingCompany,
+    CustomerID: customerId,
+    Amount: amount,
+    RequestID: requestId,
+    CallBackURL: callbackUrl,
+  });
+}
+
 module.exports = {
   listElectricityDiscosV2,
   verifyElectricityMeterV1,
@@ -290,5 +330,8 @@ module.exports = {
   listCableTVPackagesV2Cached,
   verifyCableTVV1,
   payCableTVV1,
+  listBettingCompaniesV2,
+  verifyBettingCustomerV1,
+  fundBettingWalletV1,
   meterTypeToCode,
 };

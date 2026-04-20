@@ -38,35 +38,46 @@ async function getStats(req, res) {
 
     })
 
-    const today = new Date()
+    const timeZone = process.env.APP_TIMEZONE
 
-    today.setHours(0, 0, 0, 0)
+    const dateKeyForStats = d => {
+      if (timeZone) {
+        try {
+          const parts = new Intl.DateTimeFormat('en', {
+            timeZone,
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit'
+          }).formatToParts(d)
 
-    const keyFor = d => {
+          const y = parts.find(p => p.type === 'year')?.value
+          const m = parts.find(p => p.type === 'month')?.value
+          const day = parts.find(p => p.type === 'day')?.value
+          if (y && m && day) return `${y}-${m}-${day}`
+        } catch (_) {}
+      }
 
-      const y = d.getFullYear()
-
-      const m = String(d.getMonth() + 1).padStart(2, '0')
-
-      const day = String(d.getDate()).padStart(2, '0')
-
-      return `daily_login_users:${y}-${m}-${day}`
-
+      const dt = new Date(d)
+      dt.setHours(0, 0, 0, 0)
+      const y = dt.getFullYear()
+      const m = String(dt.getMonth() + 1).padStart(2, '0')
+      const day = String(dt.getDate()).padStart(2, '0')
+      return `${y}-${m}-${day}`
     }
 
-    const days = [...Array(7)].map((_, i) => {
+    const base = new Date()
+    base.setHours(12, 0, 0, 0)
 
-      const d = new Date(today)
-
-      d.setDate(today.getDate() - (6 - i))
-
-      return d
-
+    const weeklyLoginDates = [...Array(7)].map((_, i) => {
+      const d = new Date(base)
+      d.setDate(base.getDate() - (6 - i))
+      return dateKeyForStats(d)
     })
 
-    const keys = days.map(keyFor)
+    const keys = weeklyLoginDates.map(d => `daily_login_users:${d}`)
 
     let weeklyLogins = keys.map(() => 0)
+    let weeklyUniqueUsers = 0
 
     let dailyLoginToday = 0
 
@@ -75,6 +86,8 @@ async function getStats(req, res) {
       const rows = await prisma.appSetting.findMany({ where: { setting_key: { in: keys } }, select: { setting_key: true, setting_value: true } })
 
       const map = new Map(rows.map(r => [r.setting_key, r.setting_value]))
+
+      const weeklyUserSet = new Set()
 
       weeklyLogins = keys.map(k => {
 
@@ -86,7 +99,14 @@ async function getStats(req, res) {
 
           const arr = JSON.parse(raw)
 
-          return Array.isArray(arr) ? arr.length : 0
+          if (!Array.isArray(arr)) return 0
+
+          for (const id of arr) {
+            const n = Number(id)
+            if (!Number.isNaN(n)) weeklyUserSet.add(n)
+          }
+
+          return arr.length
 
         } catch {
 
@@ -95,6 +115,8 @@ async function getStats(req, res) {
         }
 
       })
+
+      weeklyUniqueUsers = weeklyUserSet.size
 
       dailyLoginToday = weeklyLogins[weeklyLogins.length - 1] || 0
 
@@ -106,7 +128,7 @@ async function getStats(req, res) {
 
 
 
-    res.json({ remark: 'admin_stats', status: 'success', data: { totalUsers, activeUsers, blockedUsers, totalBalance, recent, dailyLoginToday, weeklyLogins } })
+    res.json({ remark: 'admin_stats', status: 'success', data: { totalUsers, activeUsers, blockedUsers, totalBalance, recent, dailyLoginToday, weeklyLogins, weeklyLoginDates, weeklyUniqueUsers } })
 
   } catch (e) {
 

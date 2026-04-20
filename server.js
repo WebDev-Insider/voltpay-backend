@@ -17,6 +17,7 @@ const dns = require('dns');
 const passwordRoutes = require('./src/routes/password.routes');
 const settingsRoutes = require('./src/routes/settings.routes');
 const authRoutes = require('./src/routes/auth.routes');
+const signupRoutes = require('./src/routes/signup.routes');
 const userRoutes = require('./src/routes/user.routes');
 const uploadRoutes = require('./src/routes/upload.routes');
 const dashboardRoutes = require('./src/routes/dashboard.routes');
@@ -25,6 +26,8 @@ const airtimeRoutes = require('./src/routes/airtime.routes');
 const dataRoutes = require('./src/routes/data.routes');
 const electricityRoutes = require('./src/routes/electricity.routes');
 const cableRoutes = require('./src/routes/cable.routes');
+const bettingRoutes = require('./src/routes/betting.routes');
+const billHeroRoutes = require('./src/routes/billHero.routes');
 const sendMoneyRoutes = require('./src/routes/sendMoney.routes');
 const verificationRoutes = require('./src/routes/verification.routes');
 const statementsRoutes = require('./src/routes/statements.routes');
@@ -34,10 +37,13 @@ const pushNotificationsRoutes = require('./src/routes/pushNotifications.routes')
 const assetsRoutes = require('./src/routes/assets.routes');
 const contentRoutes = require('./src/routes/content.routes');
 const supportRoutes = require('./src/routes/support.routes');
+const staffPayRoutes = require('./src/routes/staffpay.routes');
 const adminRoutes = require('./src/routes/admin.routes');
 const adminAuth = require('./src/middlewares/adminAuth.middleware');
 const { ensurePasswordResetsTable } = require('./src/models/passwordReset.model');
 const userAuth = require('./src/middlewares/userAuth.middleware');
+const { startStaffPayScheduler } = require('./src/services/staffpayScheduler.service');
+const { initNotificationWs } = require('./src/services/notificationWs.service');
 // Prefer IPv4 and keep-alive at the fetch/Undici layer used by Resend SDK
 try {
   const { Agent, setGlobalDispatcher } = require('undici');
@@ -163,6 +169,7 @@ const API_PREFIX = process.env.API_PREFIX || '/api';
 const PUBLIC_API_PATHS = [
   '/login',
   '/register',
+  '/signup',
   '/authentication',
   '/authorization',
   '/password',
@@ -178,7 +185,10 @@ const PUBLIC_API_PATHS = [
   '/health',
   '/policies',
   '/faq',
-  '/funding/webhook'
+  '/funding/webhook',
+  '/staffpay/wallet/webhook',
+  '/staffpay/wallet/fund/callback',
+  '/betting/callback'
 ];
 
 function enforceLogin(req, res, next) {
@@ -195,6 +205,7 @@ app.use(API_PREFIX, enforceLogin);
 app.use(API_PREFIX, passwordRoutes);
 app.use(API_PREFIX, settingsRoutes);
 app.use(API_PREFIX, authRoutes);
+app.use(API_PREFIX, signupRoutes);
 app.use(API_PREFIX, userRoutes);
 app.use(API_PREFIX, uploadRoutes);
 app.use(API_PREFIX, dashboardRoutes);
@@ -205,12 +216,15 @@ app.use(API_PREFIX, airtimeRoutes);
 app.use(API_PREFIX, dataRoutes);
 app.use(API_PREFIX, electricityRoutes);
 app.use(API_PREFIX, cableRoutes);
+app.use(API_PREFIX, bettingRoutes);
+app.use(API_PREFIX, billHeroRoutes);
 app.use(API_PREFIX, sendMoneyRoutes);
 app.use(API_PREFIX, verificationRoutes);
 app.use(API_PREFIX, miscRoutes);
 app.use(API_PREFIX, pushNotificationsRoutes);
 app.use(API_PREFIX, contentRoutes);
 app.use(API_PREFIX, supportRoutes);
+app.use(API_PREFIX, staffPayRoutes);
 app.use(`${API_PREFIX}/admin`, adminAuth, adminRoutes);
 app.use(assetsRoutes);
 
@@ -341,6 +355,10 @@ const server = app.listen(PORT, () => {
   console.log(`🌍 Countries API: http://localhost:${PORT}${API_PREFIX}/get-countries`);
   console.log(`🌐 Language API: http://localhost:${PORT}${API_PREFIX}/language/en`);
 });
+
+initNotificationWs(server);
+
+startStaffPayScheduler();
 
 server.keepAliveTimeout = Number(process.env.KEEP_ALIVE_TIMEOUT_MS || 61_000);
 server.headersTimeout = Number(process.env.HEADERS_TIMEOUT_MS || 65_000);

@@ -5,6 +5,21 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { randomUUID } = require('crypto');
 
+function isAccelerateCommError(e) {
+  return Boolean(e && (e.code === 'P6000' || e?.meta?.code === 'P6000'));
+}
+
+async function withDirectFallback(run) {
+  try {
+    return await run(prisma);
+  } catch (e) {
+    if (isAccelerateCommError(e) && prisma.$direct) {
+      return await run(prisma.$direct);
+    }
+    throw e;
+  }
+}
+
 function normalizeNigeriaMobileVariants(mobileNumberRaw) {
   const digits = String(mobileNumberRaw || '').replace(/\D/g, '');
   if (!digits) return [];
@@ -52,17 +67,34 @@ function signAccessToken(userId, sessionId) {
 
 async function rotateUserSession(userId, deviceId) {
   const sid = randomUUID();
-  await prisma.user.update({
+  await withDirectFallback(p => p.user.update({
     where: { id: Number(userId) },
     data: {
       active_session_id: sid,
       active_device_id: deviceId ? String(deviceId) : null,
     },
-  });
+  }));
   return sid;
 }
 
 function dateKey(d = new Date()) {
+  const timeZone = process.env.APP_TIMEZONE;
+  if (timeZone) {
+    try {
+      const parts = new Intl.DateTimeFormat('en', {
+        timeZone,
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+      }).formatToParts(new Date(d));
+
+      const y = parts.find(p => p.type === 'year')?.value;
+      const m = parts.find(p => p.type === 'month')?.value;
+      const day = parts.find(p => p.type === 'day')?.value;
+      if (y && m && day) return `${y}-${m}-${day}`;
+    } catch (_) {}
+  }
+
   const dt = new Date(d);
   dt.setHours(0, 0, 0, 0);
   const y = dt.getFullYear();
@@ -74,7 +106,7 @@ function dateKey(d = new Date()) {
 async function recordDailyLogin(userId) {
   try {
     const key = `daily_login_users:${dateKey()}`;
-    const existing = await prisma.appSetting.findUnique({ where: { setting_key: key } });
+    const existing = await withDirectFallback(p => p.appSetting.findUnique({ where: { setting_key: key } }));
     let set = new Set();
     if (existing?.setting_value) {
       try {
@@ -86,9 +118,9 @@ async function recordDailyLogin(userId) {
       set.add(Number(userId));
       const value = JSON.stringify(Array.from(set));
       if (existing) {
-        await prisma.appSetting.update({ where: { setting_key: key }, data: { setting_value: value } });
+        await withDirectFallback(p => p.appSetting.update({ where: { setting_key: key }, data: { setting_value: value } }));
       } else {
-        await prisma.appSetting.create({ data: { setting_key: key, setting_value: value, description: 'Unique user IDs that logged in on this date' } });
+        await withDirectFallback(p => p.appSetting.create({ data: { setting_key: key, setting_value: value, description: 'Unique user IDs that logged in on this date' } }));
       }
     }
   } catch (e) {
@@ -114,12 +146,12 @@ async function login(req, res) {
 
     let user = null;
     try {
-      user = await prisma.user.findFirst({
+      user = await withDirectFallback(p => p.user.findFirst({
         where: {
           country_code: String(country),
           ...buildMobileWhereForCountry({ mobile_number, country }),
         },
-      });
+      }));
       if (user) {
         console.log(`✅ User found in database: ${user.firstname} ${user.lastname}`);
       } else {
@@ -208,10 +240,10 @@ async function login(req, res) {
       }
 
       try {
-        await prisma.user.update({
+        await withDirectFallback(p => p.user.update({
           where: { id: Number(user.id) },
           data: { pin_login_used: true },
-        });
+        }));
         user.pin_login_used = true;
       } catch (e) {
         console.warn('⚠️ Failed to mark pin_login_used:', e?.message || e);
@@ -336,12 +368,12 @@ async function register(req, res) {
     }
 
     try {
-      const existingUser = await prisma.user.findFirst({
+      const existingUser = await withDirectFallback(p => p.user.findFirst({
         where: {
           country_code: String(country),
           ...buildMobileWhereForCountry({ mobile_number, country }),
         },
-      });
+      }));
 
       if (existingUser) {
         if (existingUser.profile_complete === '1') {
@@ -421,7 +453,8 @@ async function register(req, res) {
     }
 
     try {
-      const newUser = await prisma.user.create({
+      const hashedPassword = wantsPasswordRegistration ? await bcrypt.hash(String(password), 10) : null;
+      const newUser = await withDirectFallback(p => p.user.create({
         data: {
           firstname: wantsPasswordRegistration ? String(firstname) : '',
           lastname: wantsPasswordRegistration ? String(lastname) : '',
@@ -439,9 +472,9 @@ async function register(req, res) {
           kv: '0',
           image: null,
           pin: null,
-          password: wantsPasswordRegistration ? await bcrypt.hash(String(password), 10) : null,
+          password: hashedPassword,
         },
-      });
+      }));
 
       if (wantsPasswordRegistration) {
         let sessionId;
@@ -629,12 +662,12 @@ async function authentication(req, res) {
       // Maintain compatibility: handle login here when PIN is provided
       let user = null;
       try {
-        user = await prisma.user.findFirst({
+        user = await withDirectFallback(p => p.user.findFirst({
           where: {
             country_code: String(country),
             ...buildMobileWhereForCountry({ mobile_number, country }),
           },
-        });
+        }));
       } catch (dbError) {
         console.error('❌ Database query error (authentication):', dbError);
         return res.status(500).json({
@@ -807,14 +840,14 @@ async function postAuthorization(req, res) {
       }
 
       // Ensure user exists (OTP can be used pre-PIN in some flows)
-      let user = await prisma.user.findFirst({
+      let user = await withDirectFallback(p => p.user.findFirst({
         where: {
           country_code: String(country),
           ...buildMobileWhereForCountry({ mobile_number, country }),
         },
-      });
+      }));
       if (!user) {
-        user = await prisma.user.create({
+        user = await withDirectFallback(p => p.user.create({
           data: {
             firstname: '',
             lastname: '',
@@ -833,7 +866,7 @@ async function postAuthorization(req, res) {
             image: null,
             pin: null,
           },
-        });
+        }));
       }
 
       let sessionId;

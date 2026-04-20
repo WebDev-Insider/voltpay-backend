@@ -2,7 +2,14 @@ const prisma = require('../../database/prisma');
 const bcrypt = require('bcryptjs');
 const { getPending, clearPending } = require('../services/pending.service');
 const { addHistory, generateTrx } = require('../services/airtime.service');
-const { payElectricityV1, queryTransactionV1, buyDatabundleV1, buyAirtimeV1, payCableTVV1 } = require('../funding/clubkonnect.service');
+const {
+  payElectricityV1,
+  queryTransactionV1,
+  buyDatabundleV1,
+  buyAirtimeV1,
+  payCableTVV1,
+  fundBettingWalletV1,
+} = require('../funding/clubkonnect.service');
 const { getCountryByCode } = require('../helpers/country.helper');
 const { Prisma } = require('@prisma/client');
 const { generateNumericCode } = require('../helpers/code.helper');
@@ -111,6 +118,34 @@ async function validatePin(req, res) {
   }
 }
 
+async function validatePassword(req, res) {
+  try {
+    const user = req.user;
+    if (!user) return res.status(401).json({ remark: 'unauthorized', status: 'error', message: ['Please login first'], data: null });
+
+    const passwordInput = String(req.body?.password || '').trim();
+    if (!passwordInput) return res.status(400).json({ remark: 'validation_error', status: 'error', message: ['Password is required'], data: null });
+
+    const freshUser = await prisma.user.findUnique({ where: { id: Number(user.id) } });
+    if (!freshUser) return res.status(401).json({ remark: 'unauthorized', status: 'error', message: ['Please login again'], data: null });
+
+    const storedPassword = String(freshUser.password || '').trim();
+    if (!storedPassword) {
+      return res.status(400).json({ remark: 'password_not_set', status: 'error', message: ['Password not set for this account'], data: null });
+    }
+
+    const valid = await bcrypt.compare(passwordInput, storedPassword);
+    if (!valid) {
+      return res.status(401).json({ remark: 'invalid_password', status: 'error', message: ['Invalid password'], data: null });
+    }
+
+    return res.json({ remark: 'password_valid', status: 'success', message: ['Password verified'], data: null });
+  } catch (e) {
+    console.error('validatePassword error:', e);
+    return res.status(500).json({ remark: 'error', status: 'error', message: ['Failed to validate password'], data: null });
+  }
+}
+
 function normalizeMsisdn({ calling_code, mobile_number }) {
   const cc = String(calling_code || '').replace('+', '');
   const raw = String(mobile_number || '').replace(/\D/g, '');
@@ -178,6 +213,7 @@ async function verifyPin(req, res) {
       else if (remark === 'data_bundle') msg = 'No pending data transaction';
       else if (remark === 'cable_tv') msg = 'No pending cable TV transaction';
       else if (remark === 'send_money') msg = 'No pending send money transaction';
+      else if (remark === 'betting') msg = 'No pending betting transaction';
       return res.status(400).json({ remark: 'no_pending', status: 'error', message: [msg], data: null });
     }
 
@@ -436,9 +472,11 @@ async function verifyPin(req, res) {
     const trx = generateTrx(
       remark === 'data_bundle'
         ? 'data'
+        : (remark === 'betting'
+          ? 'bet'
         : (remark === 'electricity'
           ? 'ele'
-          : (remark === 'cable_tv' ? 'cbl' : 'air'))
+          : (remark === 'cable_tv' ? 'cbl' : 'air')))
     );
 
     const preBalance = Number(freshUser.balance?.toString?.() ?? freshUser.balance);
@@ -548,6 +586,34 @@ async function verifyPin(req, res) {
           const orderStatus = String(flw?.orderstatus || flw?.OrderStatus || flw?.status || '').trim();
           bill_status = orderStatus || statusCode;
         } catch (_) {}
+      } else if (remark === 'betting') {
+        const betting_company = String(pending.betting_company || pending.biller_code || '').trim().toUpperCase();
+        const customer_id = String(pending.customer_id || '').trim().replace(/\s+/g, '');
+        const customer_name = String(pending.customer_name || '').trim();
+        if (!betting_company || !customer_id) {
+          return res.status(400).json({ remark: 'validation_error', status: 'error', message: ['Invalid betting pending payload'], data: null });
+        }
+
+        flw_tx_ref = trx;
+        flw = await fundBettingWalletV1({
+          bettingCompany: betting_company,
+          customerId: customer_id,
+          amount,
+          requestId: trx,
+          callbackUrl: undefined,
+        });
+
+        try {
+          flw_reference = String(flw?.orderid || flw?.OrderID || flw?.order_id || flw?.orderID || '').trim();
+        } catch (_) {}
+        try {
+          const statusCode = String(flw?.statuscode || flw?.StatusCode || '').trim();
+          const orderStatus = String(flw?.orderstatus || flw?.OrderStatus || flw?.status || '').trim();
+          bill_status = orderStatus || statusCode;
+        } catch (_) {}
+
+        // ensure we keep verified name if any
+        pending.customer_name = customer_name || String(flw?.customer_name || flw?.CustomerName || '').trim() || pending.customer_name;
       } else {
         const ckNetwork = String(pending.ck_network_code || '').trim() || ckNetworkFromOperatorName(pending.operator_name);
         if (!ckNetwork) {
@@ -577,11 +643,13 @@ async function verifyPin(req, res) {
           ? 'ClubKonnect data purchase failed'
           : (remark === 'electricity'
             ? 'ClubKonnect electricity purchase failed'
+            : (remark === 'betting'
+              ? 'ClubKonnect betting wallet funding failed'
             : (remark === 'cable_tv'
               ? 'ClubKonnect cable TV purchase failed'
-              : 'ClubKonnect airtime purchase failed'))
+              : 'ClubKonnect airtime purchase failed')))
       );
-      if (remark === 'electricity' || remark === 'data_bundle' || remark === 'cable_tv' || remark === 'air_time') {
+      if (remark === 'electricity' || remark === 'data_bundle' || remark === 'cable_tv' || remark === 'air_time' || remark === 'betting') {
         const payload = err?.clubkonnect || null;
         return res.status(400).json({ remark: 'provider_error', status: 'error', message: [msg], data: payload });
       }
@@ -596,11 +664,13 @@ async function verifyPin(req, res) {
 
     const detailsStr = remark === 'electricity'
       ? `${pending.operator_name || pending.biller_code || ''} ${pending.meter_type || ''} - ${pending.meter_number}`.trim()
+      : (remark === 'betting'
+        ? `${String(pending.betting_company || 'Betting').trim()} - ${String(pending.customer_id || '').trim()}`.trim()
       : (remark === 'data_bundle'
         ? `${pending.operator_name} Data - ${pending.item_name} - ${pending.calling_code}${pending.mobile_number}`
         : (remark === 'cable_tv'
           ? `${pending.operator_name || pending.biller_code || 'Cable TV'} - ${pending.smart_number || ''}`.trim()
-          : `${pending.operator_name} - ${pending.calling_code}${pending.mobile_number}`));
+          : `${pending.operator_name} - ${pending.calling_code}${pending.mobile_number}`)));
 
     const debit = new Prisma.Decimal(amount.toFixed(2));
     const zero = new Prisma.Decimal('0.00');
@@ -617,8 +687,12 @@ async function verifyPin(req, res) {
       if (tx.walletTransaction) {
         const dbRemark = remark === 'electricity'
           ? 'utility_bill'
-          : (remark === 'cable_tv' ? 'cable_tv' : 'mobile_recharge');
-        const provider = String(pending.operator_name || pending.biller_code || '');
+          : (remark === 'cable_tv'
+            ? 'cable_tv'
+            : (remark === 'betting' ? 'betting' : 'mobile_recharge'));
+        const provider = remark === 'betting'
+          ? String(pending.betting_company || pending.operator_name || pending.biller_code || '')
+          : String(pending.operator_name || pending.biller_code || '');
         const meterType = String(pending.meter_type || '').trim().toLowerCase();
         const meterNumber = String(pending.meter_number || pending.customer_id || '').trim().replace(/\s+/g, '');
         const customerName = String(pending.customer_name || '').trim();
@@ -629,7 +703,19 @@ async function verifyPin(req, res) {
         const itemCode = String(pending.item_code || '').trim();
         const itemName = String(pending.item_name || '').trim();
 
-        const other_data = dbRemark === 'utility_bill'
+        const bettingCompany = String(pending.betting_company || '').trim().toUpperCase();
+        const bettingCustomerId = String(pending.customer_id || '').trim().replace(/\s+/g, '');
+        const bettingCustomerName = String(pending.customer_name || '').trim();
+
+        const other_data = dbRemark === 'betting'
+          ? {
+            title: 'Betting',
+            subtitle: `${bettingCompany || provider || 'Betting'} - ${bettingCustomerId || '-'}`.trim(),
+            feedback: 'Successful',
+            note: bettingCustomerName || 'Wallet',
+            image_src: '',
+          }
+          : (dbRemark === 'utility_bill'
           ? {
             title: provider || 'Electricity',
             subtitle: `${(meterType || 'prepaid').toUpperCase()} - ${meterNumber || '-'}`,
@@ -651,10 +737,23 @@ async function verifyPin(req, res) {
             feedback: 'Successful',
             note: remark === 'data_bundle' ? bundleName : 'Airtime',
             image_src: '',
-          });
+          }));
 
-        const meta = dbRemark === 'utility_bill'
-          ? {
+        let meta;
+        if (dbRemark === 'betting') {
+          meta = {
+            provider: bettingCompany || provider,
+            betting_company: bettingCompany || provider,
+            customer_id: bettingCustomerId,
+            customer_name: bettingCustomerName,
+            flw_tx_ref: flw_tx_ref || '',
+            flw_reference: flw_reference || '',
+            bill_status: bill_status || '',
+            ck_request_id: flw_tx_ref || '',
+            ck_order_id: flw_reference || '',
+          };
+        } else if (dbRemark === 'utility_bill') {
+          meta = {
             provider,
             meter_number: meterNumber,
             meter_type: meterType,
@@ -667,45 +766,44 @@ async function verifyPin(req, res) {
             bill_status: bill_status || '',
             ck_request_id: flw_tx_ref || '',
             ck_order_id: flw_reference || '',
+          };
+        } else if (dbRemark === 'cable_tv') {
+          meta = {
+            provider,
+            biller_code: String(pending.biller_code || '').trim().toLowerCase(),
+            item_code: itemCode,
+            item_name: itemName,
+            smart_number: smartNumber,
+            customer_id: smartNumber,
+            customer_name: '',
+            address: '',
+            flw_tx_ref: flw_tx_ref || '',
+            flw_reference: flw_reference || '',
+            bill_status: bill_status || '',
+            ck_request_id: flw_tx_ref || '',
+            ck_order_id: flw_reference || '',
+          };
+        } else {
+          meta = {
+            operator: String(pending.operator_name || ''),
+            mobile: msisdnForDb,
+            bundle: bundleName,
+            type: remark === 'data_bundle' ? 'data' : 'airtime',
+          };
+          if (remark === 'air_time') {
+            meta.ck_request_id = flw_tx_ref || '';
+            meta.ck_order_id = flw_reference || '';
+            meta.bill_status = bill_status || '';
+            meta.ck_network_code = String(pending.ck_network_code || ckNetworkFromOperatorName(pending.operator_name) || '');
           }
-          : (dbRemark === 'cable_tv'
-            ? {
-              provider,
-              biller_code: String(pending.biller_code || '').trim().toLowerCase(),
-              item_code: itemCode,
-              item_name: itemName,
-              smart_number: smartNumber,
-              customer_id: smartNumber,
-              customer_name: '',
-              address: '',
-              flw_tx_ref: flw_tx_ref || '',
-              flw_reference: flw_reference || '',
-              bill_status: bill_status || '',
-              ck_request_id: flw_tx_ref || '',
-              ck_order_id: flw_reference || '',
-            }
-            : (() => {
-              const base = {
-                operator: String(pending.operator_name || ''),
-                mobile: msisdnForDb,
-                bundle: bundleName,
-                type: remark === 'data_bundle' ? 'data' : 'airtime',
-              };
-              if (remark === 'air_time') {
-                base.ck_request_id = flw_tx_ref || '';
-                base.ck_order_id = flw_reference || '';
-                base.bill_status = bill_status || '';
-                base.ck_network_code = String(pending.ck_network_code || ckNetworkFromOperatorName(pending.operator_name) || '');
-              }
-              if (remark === 'data_bundle') {
-                base.ck_request_id = flw_tx_ref || '';
-                base.ck_order_id = flw_reference || '';
-                base.bill_status = bill_status || '';
-                base.ck_network_code = String(pending.ck_network_code || '');
-                base.dataplan = String(pending.item_code || '');
-              }
-              return base;
-            })());
+          if (remark === 'data_bundle') {
+            meta.ck_request_id = flw_tx_ref || '';
+            meta.ck_order_id = flw_reference || '';
+            meta.bill_status = bill_status || '';
+            meta.ck_network_code = String(pending.ck_network_code || '');
+            meta.dataplan = String(pending.item_code || '');
+          }
+        }
 
         try {
           await tx.walletTransaction.create({
@@ -732,7 +830,9 @@ async function verifyPin(req, res) {
 
     const operator = remark === 'electricity'
       ? { id: pending.operator_id || 0, name: pending.biller_code || 'Electricity', logo_urls: [''] }
-      : { id: pending.operator_id, name: pending.operator_name, logo_urls: [''] };
+      : (remark === 'betting'
+        ? { id: 0, name: 'Betting', logo_urls: [''] }
+        : { id: pending.operator_id, name: pending.operator_name, logo_urls: [''] });
 
     const details = detailsStr;
 
@@ -755,7 +855,7 @@ async function verifyPin(req, res) {
           ? 'electricity'
           : (remark === 'cable_tv'
             ? 'cable_tv'
-            : 'air_time')),
+            : (remark === 'betting' ? 'betting' : 'air_time'))),
     };
     addHistory(user.id, record);
 
@@ -777,7 +877,7 @@ async function verifyPin(req, res) {
             ? 'electricity'
             : (remark === 'cable_tv'
               ? 'cable_tv'
-              : 'air_time')),
+              : (remark === 'betting' ? 'betting' : 'air_time'))),
         details: record.details,
         receiver_id: null,
         receiver_type: null,
@@ -796,7 +896,7 @@ async function verifyPin(req, res) {
         ? 'data_success'
         : (remark === 'cable_tv'
           ? 'cable_tv_success'
-          : 'airtime_success'));
+          : (remark === 'betting' ? 'betting_success' : 'airtime_success')));
 
     const isElectricityProcessing = remark === 'electricity'
       && dbElectricityMeterType === 'prepaid'
@@ -810,7 +910,7 @@ async function verifyPin(req, res) {
         ? 'Data purchased successfully'
         : (remark === 'cable_tv'
           ? 'Cable TV purchased successfully'
-          : 'Airtime purchased successfully'));
+          : (remark === 'betting' ? 'Betting wallet funded successfully' : 'Airtime purchased successfully')));
 
     return res.json({ remark: successRemark, status: 'success', message: [successMsg], data });
   } catch (e) {
@@ -937,4 +1037,4 @@ async function resendVerify(req, res) {
   }
 }
 
-module.exports = { verifyPin, validatePin, verifyEmail, verifyMobile, resendVerify };
+module.exports = { verifyPin, validatePin, validatePassword, verifyEmail, verifyMobile, resendVerify };

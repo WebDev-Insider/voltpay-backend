@@ -80,12 +80,13 @@ function httpsRequest(url, { method = 'GET', headers = {}, body } = {}) {
   });
 }
 
-async function flwRequest(path, { method = 'GET', body } = {}) {
+async function flwRequest(path, { method = 'GET', body, headers: extraHeaders } = {}) {
   const bearerToken = getFlutterwaveBearerToken();
   const url = `${FLW_BASE_URL}${path}`;
   const headers = {
     Authorization: `Bearer ${bearerToken}`,
     'Content-Type': 'application/json',
+    ...(extraHeaders || {}),
   };
 
   const res = fetchFn
@@ -111,6 +112,71 @@ async function flwRequest(path, { method = 'GET', body } = {}) {
   return json;
 }
 
+async function createCustomer({ first_name, last_name, email }) {
+  const mail = String(email || '').trim();
+  const first = String(first_name || '').trim();
+  const last = String(last_name || '').trim();
+  if (!mail) throw new Error('email is required');
+  if (!first || !last) throw new Error('first_name and last_name are required');
+
+  const body = {
+    name: {
+      first,
+      last,
+    },
+    email: mail,
+  };
+
+  const json = await flwRequest('/customers', { method: 'POST', body });
+  return { raw: json, data: json?.data };
+}
+
+async function createVirtualAccount({
+  tx_ref,
+  customer_id,
+  amount,
+  currency = 'NGN',
+  type,
+  narration,
+  bvn,
+  nin,
+  bank_code,
+  expiry_time,
+  idempotencyKey,
+}) {
+  const ref = String(tx_ref || '').trim();
+  const customerId = String(customer_id || '').trim();
+  const amt = Number(amount);
+  if (!ref) throw new Error('tx_ref is required');
+  if (!customerId) throw new Error('customer_id is required');
+  if (!Number.isFinite(amt) || amt < 0) throw new Error('Invalid amount');
+
+  const vaType = String(type || '').trim().toLowerCase();
+  if (vaType !== 'static' && vaType !== 'dynamic') {
+    throw new Error('type must be static or dynamic');
+  }
+
+  const body = {
+    tx_ref: ref,
+    customer_id: customerId,
+    amount: amt,
+    currency: String(currency || 'NGN').toUpperCase(),
+    type: vaType,
+  };
+
+  if (narration) body.narration = String(narration);
+  if (expiry_time) body.expiry_time = String(expiry_time);
+  if (bvn) body.bvn = String(bvn);
+  if (nin) body.nin = String(nin);
+  if (bank_code) body.bank_code = String(bank_code);
+
+  const headers = {};
+  if (idempotencyKey) headers['X-Idempotency-Key'] = String(idempotencyKey);
+
+  const json = await flwRequest('/virtual-accounts', { method: 'POST', body, headers });
+  return { raw: json, data: json?.data };
+}
+
 async function createPaymentLink({ tx_ref, amount, currency = 'NGN', redirect_url, customer, customizations }) {
   const body = {
     tx_ref,
@@ -132,10 +198,78 @@ async function createPaymentLink({ tx_ref, amount, currency = 'NGN', redirect_ur
   return { link, raw: json };
 }
 
+async function createVirtualAccountNumber({
+  email,
+  amount,
+  tx_ref,
+  phonenumber,
+  firstname,
+  lastname,
+  narration,
+  is_permanent,
+  bvn,
+  bank_code,
+}) {
+  const mail = String(email || '').trim();
+  const ref = String(tx_ref || '').trim();
+  if (!mail) throw new Error('email is required');
+  if (!ref) throw new Error('tx_ref is required');
+
+  const permanent = is_permanent != null ? Boolean(is_permanent) : false;
+  const hasAmount = !(amount == null || String(amount).trim() === '');
+  const amt = hasAmount ? Number(amount) : null;
+  if (!hasAmount && !permanent) throw new Error('amount is required');
+  if (hasAmount && (!Number.isFinite(amt) || amt <= 0)) throw new Error('Invalid amount');
+
+  const body = {
+    email: mail,
+    tx_ref: ref,
+  };
+
+  if (hasAmount) body.amount = amt;
+
+  if (phonenumber) body.phonenumber = String(phonenumber);
+  if (firstname) body.firstname = String(firstname);
+  if (lastname) body.lastname = String(lastname);
+  if (narration) body.narration = String(narration);
+  if (is_permanent != null) body.is_permanent = permanent;
+  if (bvn) body.bvn = String(bvn);
+  if (bank_code) body.bank_code = String(bank_code);
+
+  const json = await flwRequest('/virtual-account-numbers', { method: 'POST', body });
+  return { raw: json, data: json?.data };
+}
+
 async function verifyTransaction(transactionId) {
   if (!transactionId) throw new Error('transactionId is required');
   const json = await flwRequest(`/transactions/${encodeURIComponent(String(transactionId))}/verify`, { method: 'GET' });
   return { raw: json, data: json?.data };
+}
+
+async function listTransactions({
+  from,
+  to,
+  status,
+  tx_ref,
+  customer_email,
+  page,
+} = {}) {
+  const qs = new URLSearchParams();
+  if (from) qs.set('from', String(from));
+  if (to) qs.set('to', String(to));
+  if (status) qs.set('status', String(status));
+  if (tx_ref) qs.set('tx_ref', String(tx_ref));
+  if (customer_email) qs.set('customer_email', String(customer_email));
+  if (page != null) qs.set('page', String(page));
+
+  const path = qs.toString() ? `/transactions?${qs.toString()}` : '/transactions';
+  const json = await flwRequest(path, { method: 'GET' });
+
+  const data = json?.data;
+  if (Array.isArray(data)) return { raw: json, data };
+  if (Array.isArray(data?.data)) return { raw: json, data: data.data };
+  if (Array.isArray(json?.data?.transactions)) return { raw: json, data: json.data.transactions };
+  return { raw: json, data: [] };
 }
 
 // Flutterwave Bills - Airtime purchase (V3)
@@ -352,9 +486,112 @@ async function purchaseData({ reference, country = 'NG', customer, amount, item_
   return { raw: json, data: json?.data };
 }
 
+async function listBanks({ country = 'NG' } = {}) {
+  const cc = String(country || 'NG').trim().toUpperCase();
+  if (!cc) throw new Error('country is required');
+
+  try {
+    const json = await flwRequest(`/banks/${encodeURIComponent(cc)}`, { method: 'GET' });
+    const banks = json?.data || json?.banks || [];
+    return Array.isArray(banks) ? banks : [];
+  } catch (e) {
+    const qs = new URLSearchParams({ country: cc });
+    const json = await flwRequest(`/banks?${qs.toString()}`, { method: 'GET' });
+    const banks = json?.data || json?.banks || [];
+    return Array.isArray(banks) ? banks : [];
+  }
+}
+
+async function listBanksCached({ country = 'NG', ttlMs = 12 * 60 * 60_000 } = {}) {
+  const key = `flw:banks:${String(country || 'NG').toUpperCase()}`;
+  const cached = cacheGet(key);
+  if (cached) return cached;
+  const banks = await listBanks({ country });
+  cacheSet(key, banks, Array.isArray(banks) && banks.length > 0 ? ttlMs : 30_000);
+  return banks;
+}
+
+async function resolveAccount({ account_number, account_bank }) {
+  const acct = String(account_number || '').trim();
+  const bank = String(account_bank || '').trim();
+  if (!acct || !bank) throw new Error('account_number and account_bank are required');
+  const body = { account_number: acct, account_bank: bank };
+  const json = await flwRequest('/accounts/resolve', { method: 'POST', body });
+  return { raw: json, data: json?.data };
+}
+
+async function listBankBranches({ bank_id } = {}) {
+  const bid = String(bank_id || '').trim();
+  if (!bid) throw new Error('bank_id is required');
+  const json = await flwRequest(`/banks/${encodeURIComponent(bid)}/branches`, { method: 'GET' });
+  const branches = json?.data || json?.branches || [];
+  return Array.isArray(branches) ? branches : [];
+}
+
+async function createBeneficiary({ account_number, account_bank, beneficiary_name, currency = 'NGN' }) {
+  const acct = String(account_number || '').trim();
+  const bank = String(account_bank || '').trim();
+  const name = String(beneficiary_name || '').trim();
+  const cur = String(currency || 'NGN').trim().toUpperCase();
+  if (!acct || !bank || !name) throw new Error('account_number, account_bank and beneficiary_name are required');
+  const body = {
+    account_number: acct,
+    account_bank: bank,
+    beneficiary_name: name,
+    currency: cur,
+  };
+  const json = await flwRequest('/beneficiaries', { method: 'POST', body });
+  return { raw: json, data: json?.data };
+}
+
+async function createBulkTransfer({ title, bulk_data }) {
+  const t = String(title || '').trim() || `bulk_${Date.now()}`;
+  if (!Array.isArray(bulk_data) || bulk_data.length === 0) throw new Error('bulk_data must be a non-empty array');
+  const body = {
+    title: t,
+    bulk_data,
+  };
+  const json = await flwRequest('/bulk-transfers', { method: 'POST', body });
+  return { raw: json, data: json?.data };
+}
+
+async function getBulkTransfer({ batch_id }) {
+  const bid = String(batch_id || '').trim();
+  if (!bid) throw new Error('batch_id is required');
+  const qs = new URLSearchParams({ batch_id: bid });
+  const json = await flwRequest(`/bulk-transfers?${qs.toString()}`, { method: 'GET' });
+  return { raw: json, data: json?.data };
+}
+
+async function getTransferFee({ amount, currency = 'NGN', type = 'account' }) {
+  const amt = Number(amount);
+  const cur = String(currency || 'NGN').toUpperCase();
+  const t = String(type || 'account').trim().toLowerCase() || 'account';
+  if (!Number.isFinite(amt) || amt <= 0) throw new Error('Invalid amount');
+
+  const key = `flw_transfer_fee_${cur}_${t}_${amt.toFixed(2)}`;
+  const cached = cacheGet(key);
+  if (cached != null) return { raw: null, data: cached };
+
+  const qs = new URLSearchParams({ amount: String(amt), currency: cur, type: t });
+  const json = await flwRequest(`/transfers/fee?${qs.toString()}`, { method: 'GET' });
+  const fee = json?.data?.fee ?? json?.data?.data?.fee;
+  const res = {
+    fee: fee != null ? Number(fee) : 0,
+    currency: cur,
+    type: t,
+  };
+  cacheSet(key, res, 5 * 60_000);
+  return { raw: json, data: res };
+}
+
 module.exports = {
   createPaymentLink,
+  createVirtualAccountNumber,
+  createCustomer,
+  createVirtualAccount,
   verifyTransaction,
+  listTransactions,
   purchaseAirtime,
   listDataBundles,
   listDataBundlesCached,
@@ -366,4 +603,12 @@ module.exports = {
   validateCustomerDetails,
   createBillPayment,
   getBillStatusVerbose,
+  listBanks,
+  listBanksCached,
+  listBankBranches,
+  resolveAccount,
+  createBeneficiary,
+  createBulkTransfer,
+  getBulkTransfer,
+  getTransferFee,
 };

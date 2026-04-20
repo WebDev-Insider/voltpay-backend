@@ -10,6 +10,7 @@ router.post('/push-notifications/ingest', userAuth, PushNotificationsController.
 router.get('/push-notifications/unread-count', userAuth, PushNotificationsController.unreadCount);
 router.post('/push-notifications/:id/read', userAuth, PushNotificationsController.markRead);
 router.post('/push-notifications/read-all', userAuth, PushNotificationsController.markAllRead);
+router.delete('/push-notifications/clear', userAuth, PushNotificationsController.clearAll);
 
 router.get('/notification/settings', userAuth, PushNotificationsController.getSettings);
 router.post('/notification/settings', userAuth, PushNotificationsController.setSettings);

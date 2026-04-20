@@ -17,5 +17,6 @@ router.get('/notification-campaigns', AdminNotificationCampaignsController.listC
 router.post('/notification-campaigns', AdminNotificationCampaignsController.createCampaign)
 router.get('/notification-campaigns/:id', AdminNotificationCampaignsController.getCampaign)
 router.post('/notification-campaigns/:id/send', AdminNotificationCampaignsController.sendCampaign)
+router.delete('/notification-campaigns/:id', AdminNotificationCampaignsController.deleteCampaign)
 
 module.exports = router
