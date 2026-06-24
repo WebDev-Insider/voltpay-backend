@@ -1,40 +1,137 @@
 const https = require('https');
-const { Resend } = require('resend');
-const nodemailer = require('nodemailer');
 
-// Initialize Resend client
-let resendClient = null;
-try {
-  const apiKey = process.env.RESEND_API_KEY;
-  if (apiKey) {
-    resendClient = new Resend(apiKey);
-  }
-} catch (_) {
-  resendClient = null;
+const BREVO_API_HOST = 'api.brevo.com';
+const BREVO_API_PATH = '/v3/smtp/email';
+
+function getBrevoApiKey() {
+  return process.env.BREVO_API_KEY || null;
 }
 
-let smtpTransporter = null;
-try {
-  const host = process.env.SMTP_HOST;
-  const user = process.env.SMTP_USER;
-  const pass = process.env.SMTP_PASS;
-  const port = process.env.SMTP_PORT ? Number(process.env.SMTP_PORT) : 587;
-  const secure = String(process.env.SMTP_SECURE || '').trim().toLowerCase() === 'true' || port === 465;
+function parseSender(fromArg) {
+  // Brevo expects sender as { email, name? }. fromArg may be:
+  // - a plain email string: "no-reply@voltpay.local"
+  // - a "Name <email>" string
+  // - already an object: { email, name }
+  const raw = fromArg || process.env.BREVO_FROM || process.env.EMAIL_FROM || 'no-reply@voltpay.local';
 
-  if (host && user && pass) {
-    smtpTransporter = nodemailer.createTransport({
-      host: String(host),
-      port,
-      secure,
-      auth: { user: String(user), pass: String(pass) },
-    });
+  if (raw && typeof raw === 'object' && raw.email) {
+    return { email: raw.email, name: raw.name || process.env.EMAIL_BRAND_NAME || undefined };
   }
-} catch (_) {
-  smtpTransporter = null;
+
+  const str = String(raw).trim();
+  const match = str.match(/^(.*)<(.+)>$/);
+  if (match) {
+    const name = match[1].trim().replace(/^["']|["']$/g, '');
+    const email = match[2].trim();
+    return { email, name: name || undefined };
+  }
+  return { email: str, name: process.env.EMAIL_BRAND_NAME || undefined };
+}
+
+function parseRecipients(to) {
+  // Accepts a single email string, comma-separated string, or array of strings/objects
+  if (Array.isArray(to)) {
+    return to.map(t => (typeof t === 'string' ? { email: t.trim() } : { email: t.email, name: t.name }));
+  }
+  if (typeof to === 'string') {
+    return to.split(',').map(t => ({ email: t.trim() })).filter(t => t.email);
+  }
+  if (to && typeof to === 'object' && to.email) {
+    return [{ email: to.email, name: to.name }];
+  }
+  return [];
+}
+
+/**
+ * Sends an email via Brevo's transactional email HTTPS API.
+ * Docs: https://developers.brevo.com/reference/sendtransacemail
+ */
+function sendViaBrevo({ from, to, subject, html, text, replyTo, attachments = [] }) {
+  return new Promise((resolve) => {
+    try {
+      const apiKey = getBrevoApiKey();
+      if (!apiKey) {
+        console.log(`✉️  [DEV MODE] BREVO_API_KEY not set. Would send "${subject}" to ${JSON.stringify(to)}`);
+        resolve({ queued: true, dev: true });
+        return;
+      }
+
+      const sender = parseSender(from);
+      const recipients = parseRecipients(to);
+
+      const body = {
+        sender,
+        to: recipients,
+        subject,
+        htmlContent: html,
+      };
+
+      if (text) body.textContent = text;
+
+      if (replyTo) {
+        const rt = parseSender(replyTo);
+        body.replyTo = rt;
+      }
+
+      if (attachments && attachments.length > 0) {
+        body.attachment = attachments.map(a => ({
+          name: a.filename || 'attachment',
+          content: Buffer.isBuffer(a.content) ? a.content.toString('base64') : String(a.content),
+        }));
+      }
+
+      const payload = JSON.stringify(body);
+
+      const req = https.request({
+        hostname: BREVO_API_HOST,
+        port: 443,
+        path: BREVO_API_PATH,
+        method: 'POST',
+        headers: {
+          'api-key': apiKey,
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+          'Content-Length': Buffer.byteLength(payload),
+        },
+        family: 4,
+        timeout: 8000,
+      }, (res) => {
+        let resBody = '';
+        res.on('data', (chunk) => resBody += chunk);
+        res.on('end', () => {
+          try {
+            const json = resBody ? JSON.parse(resBody) : {};
+            if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
+              console.log('✅ Brevo email queued. messageId:', json.messageId);
+              resolve({ queued: true, id: json.messageId, provider: 'brevo' });
+            } else {
+              console.error('❌ Brevo API error:', res.statusCode, json);
+              resolve({ queued: false, error: json || { statusCode: res.statusCode }, provider: 'brevo' });
+            }
+          } catch (parseErr) {
+            console.error('❌ Brevo API parse error:', parseErr, resBody);
+            resolve({ queued: false, error: parseErr, provider: 'brevo' });
+          }
+        });
+      });
+
+      req.on('timeout', () => {
+        req.destroy(new Error('request_timeout'));
+      });
+      req.on('error', (err) => {
+        console.error('❌ Brevo API request exception:', err);
+        resolve({ queued: false, error: err, provider: 'brevo' });
+      });
+      req.write(payload);
+      req.end();
+    } catch (err) {
+      console.error('❌ Brevo API setup error:', err);
+      resolve({ queued: false, error: err, provider: 'brevo' });
+    }
+  });
 }
 
 async function sendResetEmail(toEmail, code, fromArg) {
-  const from = fromArg || process.env.RESEND_FROM || process.env.SMTP_FROM || 'no-reply@voltpay.local';
   const metaArg = arguments.length >= 4 ? arguments[3] : null;
   const meta = typeof metaArg === 'string' ? { type: metaArg } : (metaArg || {});
 
@@ -150,217 +247,11 @@ async function sendResetEmail(toEmail, code, fromArg) {
   </body>
 </html>`;
 
-  if (smtpTransporter) {
-    try {
-      const smtpFrom = process.env.SMTP_FROM || from;
-      const info = await smtpTransporter.sendMail({
-        from: smtpFrom,
-        to: toEmail,
-        subject,
-        html,
-        text,
-      });
-      return { queued: true, id: info && info.messageId ? info.messageId : undefined, provider: 'smtp' };
-    } catch (smtpError) {
-      console.error('❌ SMTP email error:', smtpError);
-      if (!resendClient) {
-        return { queued: false, error: smtpError, provider: 'smtp' };
-      }
-    }
-  }
-
-  if (!resendClient) {
-    console.log(`✉️  [DEV MODE] Would send ${type} code to ${toEmail}: ${code}`);
-    return { queued: true, dev: true };
-  }
-
-  const sendViaHttps = () => new Promise((resolve) => {
-    try {
-      const apiKey = process.env.RESEND_API_KEY;
-      const payload = JSON.stringify({ from, to: toEmail, subject, html, text });
-
-      const req = https.request({
-        hostname: 'api.resend.com',
-        port: 443,
-        path: '/emails',
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${apiKey}`,
-          'Content-Type': 'application/json',
-          'Content-Length': Buffer.byteLength(payload)
-        },
-        family: 4,
-        timeout: 8000,
-      }, (res) => {
-        let body = '';
-        res.on('data', (chunk) => body += chunk);
-        res.on('end', () => {
-          try {
-            const json = body ? JSON.parse(body) : {};
-            if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300 && json && json.id) {
-              console.log('✅ Resend HTTPS fallback queued. id:', json.id);
-              resolve({ queued: true, id: json.id });
-            } else {
-              console.error('❌ Resend HTTPS fallback error:', res.statusCode, json);
-              resolve({ queued: false, error: json || { statusCode: res.statusCode } });
-            }
-          } catch (parseErr) {
-            console.error('❌ Resend HTTPS fallback parse error:', parseErr, body);
-            resolve({ queued: false, error: parseErr });
-          }
-        });
-      });
-
-      req.on('timeout', () => {
-        req.destroy(new Error('request_timeout'));
-      });
-      req.on('error', (err) => {
-        console.error('❌ Resend HTTPS fallback exception:', err);
-        resolve({ queued: false, error: err });
-      });
-      req.write(payload);
-      req.end();
-    } catch (err) {
-      console.error('❌ Resend HTTPS fallback setup error:', err);
-      resolve({ queued: false, error: err });
-    }
-  });
-
-  try {
-    const result = await resendClient.emails.send({ from, to: toEmail, subject, html, text });
-    if (result && result.error) {
-      console.error('❌ Resend email error:', result.error);
-      return await sendViaHttps();
-    }
-    const id = result && result.data ? result.data.id : undefined;
-    console.log('✅ Resend email queued. id:', id);
-    return { queued: true, id };
-  } catch (e) {
-    console.error('❌ Resend email exception:', e);
-    const first = await sendViaHttps();
-    if (first.queued) return first;
-    await new Promise(r => setTimeout(r, 1200));
-    return await sendViaHttps();
-  }
+  return await sendViaBrevo({ from: fromArg, to: toEmail, subject, html, text });
 }
 
 async function sendSupportTicketEmail({ to, fromArg, replyTo, subject, html, text, attachments = [] }) {
-  const from = fromArg || process.env.RESEND_FROM || process.env.SMTP_FROM || 'no-reply@voltpay.local';
-
-  const normalizedAttachments = (attachments || []).map(f => ({
-    filename: f.filename || 'attachment',
-    // Omooooo The SDK accepts Buffer Godi; HTTPS fallback will re-map to base64.. omo this part is very important
-    content: f.content
-  }));
-
-  if (smtpTransporter) {
-    try {
-      const smtpFrom = process.env.SMTP_FROM || from;
-      const info = await smtpTransporter.sendMail({
-        from: smtpFrom,
-        to,
-        subject,
-        html,
-        text,
-        replyTo: replyTo || undefined,
-        attachments: normalizedAttachments.map(a => ({
-          filename: a.filename,
-          content: a.content,
-        })),
-      });
-      return { queued: true, id: info && info.messageId ? info.messageId : undefined, provider: 'smtp' };
-    } catch (smtpError) {
-      console.error('❌ SMTP support email error:', smtpError);
-      if (!resendClient) {
-        return { queued: false, error: smtpError, provider: 'smtp' };
-      }
-    }
-  }
-
-  if (!resendClient) {
-    console.log(`✉️  [DEV MODE] Would send support ticket to ${to} with subject: ${subject}`);
-    return { queued: false, dev: true };
-  }
-
-  const sendViaHttps = () => new Promise((resolve) => {
-    try {
-      const apiKey = process.env.RESEND_API_KEY;
-      const payload = JSON.stringify({
-        from,
-        to,
-        subject,
-        html,
-        text,
-        reply_to: replyTo,
-        attachments: normalizedAttachments.map(a => ({ filename: a.filename, content: Buffer.isBuffer(a.content) ? a.content.toString('base64') : String(a.content) }))
-      });
-
-      const req = https.request({
-        hostname: 'api.resend.com',
-        port: 443,
-        path: '/emails',
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${apiKey}`,
-          'Content-Type': 'application/json',
-          'Content-Length': Buffer.byteLength(payload)
-        },
-        family: 4,
-        timeout: 8000,
-      }, (res) => {
-        let body = '';
-        res.on('data', (chunk) => body += chunk);
-        res.on('end', () => {
-          try {
-            const json = body ? JSON.parse(body) : {};
-            if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300 && json && json.id) {
-              console.log('✅ Resend HTTPS support email queued. id:', json.id);
-              resolve({ queued: true, id: json.id });
-            } else {
-              console.error('❌ Resend HTTPS support email error:', res.statusCode, json);
-              resolve({ queued: false, error: json || { statusCode: res.statusCode } });
-            }
-          } catch (parseErr) {
-            console.error('❌ Resend HTTPS support email parse error:', parseErr, body);
-            resolve({ queued: false, error: parseErr });
-          }
-        });
-      });
-
-      req.on('timeout', () => { req.destroy(new Error('request_timeout')); });
-      req.on('error', (err) => { console.error('❌ Resend HTTPS support email exception:', err); resolve({ queued: false, error: err }); });
-      req.write(payload);
-      req.end();
-    } catch (err) {
-      console.error('❌ Resend HTTPS support email setup error:', err);
-      resolve({ queued: false, error: err });
-    }
-  });
-
-  try {
-    const result = await resendClient.emails.send({
-      from,
-      to,
-      subject,
-      html,
-      text,
-      reply_to: replyTo,
-      attachments: normalizedAttachments
-    });
-    if (result && result.error) {
-      console.error('❌ Resend support email error:', result.error);
-      return await sendViaHttps();
-    }
-    const id = result && result.data ? result.data.id : undefined;
-    console.log('✅ Resend support email queued. id:', id);
-    return { queued: true, id };
-  } catch (e) {
-    console.error('❌ Resend support email exception:', e);
-    const first = await sendViaHttps();
-    if (first.queued) return first;
-    await new Promise(r => setTimeout(r, 1200));
-    return await sendViaHttps();
-  }
+  return await sendViaBrevo({ from: fromArg, to, subject, html, text, replyTo, attachments });
 }
 
 module.exports = { sendResetEmail, sendSupportTicketEmail };
