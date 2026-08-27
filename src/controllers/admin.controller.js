@@ -1,6 +1,21 @@
 const prisma = require('../../database/prisma')
 
-const bcrypt = require('bcryptjs')
+const { hashSecret, blindIndex, publicUser } = require('../helpers/pii.helper')
+
+const { invalidateUser } = require('../services/userCache.service')
+
+const { listAdminActions } = require('../services/audit.service')
+
+const { listUserEvents } = require('../services/userAudit.service')
+
+const { listFeatures, setFeature } = require('../helpers/featureFlag.helper')
+
+const { DELETED } = require('../helpers/accountStatus.helper')
+
+
+// Closing an account is the account lifecycle's job, not the dashboard's. See
+// account.controller.js for what "erased" means and why the ledger stays.
+const { purgeUser } = require('./account.controller')
 
 
 
@@ -8,7 +23,12 @@ async function getStats(req, res) {
 
   try {
 
-    const totalUsers = await prisma.user.count()
+    // Purged accounts keep their row for the ledger, so every headline count
+    // has to exclude them or the dashboard reports customers who no longer
+    // exist. Balance is summed over everyone on purpose - a purged row's
+    // balance is zero, and money that somehow survived must not vanish from
+    // the total.
+    const totalUsers = await prisma.user.count({ where: { status: { not: DELETED } } })
 
     const activeUsers = await prisma.user.count({ where: { status: 1 } })
 
@@ -30,11 +50,13 @@ async function getStats(req, res) {
 
     const recent = await prisma.user.findMany({
 
+      where: { status: { not: DELETED } },
+
       orderBy: { created_at: 'desc' },
 
       take: 5,
 
-      select: { id: true, firstname: true, lastname: true, username: true, email: true, mobile: true, status: true, created_at: true, image: true, role: true }
+      select: { id: true, firstname_enc: true, lastname_enc: true, username_enc: true, email_enc: true, mobile_enc: true, status: true, created_at: true, image: true, role: true }
 
     })
 
@@ -128,7 +150,9 @@ async function getStats(req, res) {
 
 
 
-    res.json({ remark: 'admin_stats', status: 'success', data: { totalUsers, activeUsers, blockedUsers, totalBalance, recent, dailyLoginToday, weeklyLogins, weeklyLoginDates, weeklyUniqueUsers } })
+    const recentPublic = recent.map(publicUser)
+
+    res.json({ remark: 'admin_stats', status: 'success', data: { totalUsers, activeUsers, blockedUsers, totalBalance, recent: recentPublic, dailyLoginToday, weeklyLogins, weeklyLoginDates, weeklyUniqueUsers } })
 
   } catch (e) {
 
@@ -152,27 +176,23 @@ async function listUsers(req, res) {
 
     const q = String(req.query.q || '').trim()
 
-    const where = q
+    // A purged account keeps its row for the ledger's sake, but it has no name,
+    // email or phone left - it would list as an empty line nobody can act on.
+    const where = { status: { not: DELETED } }
 
-      ? {
+    if (q) {
 
-          OR: [
+      where.OR = [
 
-            { email: { contains: q, mode: 'insensitive' } },
+        { email_idx: blindIndex(q, 'email') },
 
-            { mobile: { contains: q, mode: 'insensitive' } },
+        { mobile_idx: blindIndex(q, 'mobile') },
 
-            { firstname: { contains: q, mode: 'insensitive' } },
+        { username_idx: blindIndex(q, 'username') }
 
-            { lastname: { contains: q, mode: 'insensitive' } },
+      ]
 
-            { username: { contains: q, mode: 'insensitive' } }
-
-          ]
-
-        }
-
-      : {}
+    }
 
     const total = await prisma.user.count({ where })
 
@@ -190,15 +210,15 @@ async function listUsers(req, res) {
 
         id: true,
 
-        firstname: true,
+        firstname_enc: true,
 
-        lastname: true,
+        lastname_enc: true,
 
-        username: true,
+        username_enc: true,
 
-        email: true,
+        email_enc: true,
 
-        mobile: true,
+        mobile_enc: true,
 
         country_code: true,
 
@@ -214,7 +234,9 @@ async function listUsers(req, res) {
 
     })
 
-    res.json({ remark: 'admin_users', status: 'success', data: { items, pagination: { page, perPage, total, totalPages: Math.ceil(total / perPage) } } })
+    const itemsPublic = items.map(publicUser)
+
+    res.json({ remark: 'admin_users', status: 'success', data: { items: itemsPublic, pagination: { page, perPage, total, totalPages: Math.ceil(total / perPage) } } })
 
   } catch (e) {
 
@@ -242,6 +264,9 @@ async function updateUserStatus(req, res) {
 
     const user = await prisma.user.update({ where: { id }, data: { status } })
 
+    // Blocking must take effect on the next request, not after the cache TTL.
+    await invalidateUser(id)
+
     res.json({ remark: 'user_status_updated', status: 'success', data: { id: user.id, status: user.status } })
 
   } catch (e) {
@@ -264,9 +289,11 @@ async function resetUserPin(req, res) {
 
     const rawPin = incoming.trim() || '0000'
 
-    const hashed = await bcrypt.hash(rawPin, 10)
+    const hashed = await hashSecret(rawPin, 'pin')
 
     const user = await prisma.user.update({ where: { id }, data: { pin: hashed } })
+
+    await invalidateUser(id)
 
     res.json({ remark: 'user_pin_reset', status: 'success', data: { id: user.id } })
 
@@ -298,15 +325,15 @@ async function getUser(req, res) {
 
         id: true,
 
-        firstname: true,
+        firstname_enc: true,
 
-        lastname: true,
+        lastname_enc: true,
 
-        username: true,
+        username_enc: true,
 
-        email: true,
+        email_enc: true,
 
-        mobile: true,
+        mobile_enc: true,
 
         country_code: true,
 
@@ -338,6 +365,14 @@ async function getUser(req, res) {
 
         zip: true,
 
+        address_enc: true,
+
+        state_enc: true,
+
+        city_enc: true,
+
+        zip_enc: true,
+
         created_at: true,
 
         updated_at: true
@@ -350,7 +385,7 @@ async function getUser(req, res) {
 
     const country = await prisma.country.findUnique({ where: { code: user.country_code }, select: { name: true, dial_code: true, image_src: true } })
 
-    res.json({ remark: 'admin_user', status: 'success', data: { user, country } })
+    res.json({ remark: 'admin_user', status: 'success', data: { user: publicUser(user), country } })
 
   } catch (e) {
 
@@ -384,6 +419,8 @@ async function updateUserRole(req, res) {
 
     const user = await prisma.user.update({ where: { id }, data: { role } })
 
+    await invalidateUser(id)
+
     res.json({ remark: 'user_role_updated', status: 'success', data: { id: user.id, role: user.role } })
 
   } catch (e) {
@@ -414,7 +451,7 @@ async function deleteUser(req, res) {
 
 
 
-    const existing = await prisma.user.findUnique({ where: { id }, select: { id: true } })
+    const existing = await prisma.user.findUnique({ where: { id }, select: { id: true, status: true, image: true, email: true, email_enc: true } })
 
     if (!existing) {
 
@@ -424,193 +461,31 @@ async function deleteUser(req, res) {
 
 
 
-    const deleteWithClient = async db => {
-
-      const deletedVerificationCodes = await db.verificationCode.deleteMany({ where: { user_id: id } })
-
-      const deletedPasswordResets = await db.passwordReset.deleteMany({ where: { user_id: id } })
-
-      const deletedWalletTransactions = await db.walletTransaction.deleteMany({ where: { user_id: id } })
-
-      const deletedFundingTransactions = await db.fundingTransaction.deleteMany({ where: { user_id: id } })
-
-
-
-      const deletedMonthlyStatements = db.monthlyStatement?.deleteMany
-
-        ? await db.monthlyStatement.deleteMany({ where: { user_id: id } })
-
-        : { count: 0 }
-
-
-
-      const deletedPushNotifications = db.pushNotification?.deleteMany
-
-        ? await db.pushNotification.deleteMany({ where: { user_id: id } })
-
-        : { count: 0 }
-
-
-
-      if (db.appSetting?.findMany && db.appSetting?.update) {
-
-        try {
-
-          const loginRows = await db.appSetting.findMany({
-
-            where: { setting_key: { startsWith: 'daily_login_users:' } },
-
-            select: { id: true, setting_value: true },
-
-          })
-
-
-
-          for (const row of loginRows) {
-
-            try {
-
-              const raw = row.setting_value
-
-              if (!raw) continue
-
-              const parsed = JSON.parse(raw)
-
-              if (!Array.isArray(parsed)) continue
-
-              const filtered = parsed.filter(x => Number(x) !== id)
-
-              if (filtered.length !== parsed.length) {
-
-                await db.appSetting.update({
-
-                  where: { id: row.id },
-
-                  data: { setting_value: JSON.stringify(filtered) },
-
-                })
-
-              }
-
-            } catch (_) {}
-
-          }
-
-        } catch (_) {}
-
-      }
-
-
-
-      if (db.$queryRaw && db.$executeRawUnsafe) {
-
-        try {
-
-          const rows = await db.$queryRaw`
-
-            SELECT conrelid::regclass::text AS table_name,
-
-                   a.attname AS column_name
-
-            FROM pg_constraint c
-
-            JOIN pg_attribute a ON a.attnum = ANY(c.conkey) AND a.attrelid = c.conrelid
-
-            WHERE c.contype = 'f'
-
-              AND c.confrelid = 'users'::regclass
-
-          `
-
-
-
-          const qIdent = s => `"${String(s).replace(/"/g, '""')}"`
-
-          const isSafeIdent = s => /^[a-zA-Z0-9_]+$/.test(String(s))
-
-          const isSafeTable = s => /^[a-zA-Z0-9_\.]+$/.test(String(s))
-
-
-
-          for (const r of rows || []) {
-
-            const tableName = String(r.table_name || '')
-
-            const colName = String(r.column_name || '')
-
-            if (!tableName || !colName) continue
-
-            if (!isSafeTable(tableName) || !isSafeIdent(colName)) continue
-
-
-
-            const parts = tableName.split('.')
-
-            const target = parts.length === 2 && isSafeIdent(parts[0]) && isSafeIdent(parts[1])
-
-              ? `${qIdent(parts[0])}.${qIdent(parts[1])}`
-
-              : (parts.length === 1 && isSafeIdent(parts[0]) ? qIdent(parts[0]) : '')
-
-            if (!target) continue
-
-
-
-            await db.$executeRawUnsafe(`DELETE FROM ${target} WHERE ${qIdent(colName)} = $1`, id)
-
-          }
-
-        } catch (_) {}
-
-      }
-
-
-
-      const deletedUser = await db.user.delete({ where: { id }, select: { id: true } })
-
-      return {
-
-        deletedUser,
-
-        deletedVerificationCodes,
-
-        deletedPasswordResets,
-
-        deletedWalletTransactions,
-
-        deletedFundingTransactions,
-
-        deletedMonthlyStatements,
-
-        deletedPushNotifications,
-
-      }
+    // Anonymise, never drop. This used to walk every foreign key back to
+    // users and DELETE, which took the wallet ledger with it - the record a
+    // chargeback, a CBN report or the user's own dispute is answered from.
+    // Same eraser the 30-day self-service purge uses, so "deleted" means one
+    // thing in this system: the person is gone, the money trail is not.
+    if (Number(existing.status) === DELETED) {
+
+      return res.json({ remark: 'user_deleted', status: 'success', message: ['User is already deleted'], data: { id, already_deleted: true } })
 
     }
 
-
-
-    let result
-
-    try {
-
-      result = await prisma.$transaction(async tx => {
-
-        return await deleteWithClient(tx)
-
-      })
-
-    } catch (e) {
-
-      console.error('admin.deleteUser transaction failed, retrying without transaction', e)
-
-      result = await deleteWithClient(prisma)
-
-    }
+    // The whole stage-one teardown, not just the column wipe: the profile image
+    // at the upload provider, the StaffPay virtual accounts (still live and
+    // still able to take a transfer until they are closed), the cache, and the
+    // notice to the address on file. An account closed by an admin gets the
+    // same treatment as one closed by its owner - there is no second, quieter
+    // kind of deletion.
+    await purgeUser(existing)
 
 
 
-    res.json({ remark: 'user_deleted', status: 'success', data: result })
+    // The DELETE itself is already recorded by adminAudit.middleware, and
+    // purgeUser writes its own account.purged row.
+
+    res.json({ remark: 'user_deleted', status: 'success', message: ['User deleted'], data: { id, anonymised: true } })
 
   } catch (e) {
 
@@ -642,6 +517,8 @@ async function bulkUpdateUserStatus(req, res) {
 
     }
 
+    // No per-id invalidation here: updateMany returns a count, not ids. The
+    // cached rows expire on their own within USER_CACHE_TTL_SECONDS.
     const result = await prisma.user.updateMany({ where: { role: { in: ['customer'] } }, data: { status } })
 
     res.json({ remark: 'bulk_user_status_updated', status: 'success', data: { updated: result.count, status } })
@@ -657,4 +534,140 @@ async function bulkUpdateUserStatus(req, res) {
 
 
 module.exports.bulkUpdateUserStatus = bulkUpdateUserStatus
+
+
+
+// The trail written by adminAudit.middleware. Read-only, and it holds no PII -
+// target_id is a row id, so this needs no publicUser-style mapper.
+async function listAuditLogs(req, res) {
+
+  try {
+
+    // Default view is the human trail. The `security` and `alert` rows share
+    // this table but have their own screen, and they out-number admin actions
+    // by orders of magnitude during an incident - which is exactly when
+    // somebody opens this page looking for who changed what.
+    const data = await listAdminActions({
+      page: req.query.page,
+      perPage: req.query.perPage,
+      targetType: req.query.targetType,
+      targetId: req.query.targetId,
+      action: req.query.action,
+      actor: req.query.actor,
+      from: req.query.from,
+      to: req.query.to,
+      excludeTargetTypes: ['security', 'alert'],
+    })
+
+    res.json({ remark: 'admin_audit_logs', status: 'success', data })
+
+  } catch (e) {
+
+    console.error('admin.listAuditLogs error', e)
+
+    res.status(500).json({ remark: 'error', status: 'error', message: ['Failed to list audit logs'], data: null })
+
+  }
+
+}
+
+
+
+module.exports.listAuditLogs = listAuditLogs
+
+
+
+// One user's own trail: logins, transfers, bill payments, with the IP and
+// device each came from. This is what a dispute is answered with.
+async function listUserActivity(req, res) {
+
+  try {
+
+    const data = await listUserEvents({
+      userId: req.params.id,
+      page: req.query.page,
+      perPage: req.query.perPage,
+      event: req.query.event,
+    })
+
+    res.json({ remark: 'user_activity', status: 'success', data })
+
+  } catch (e) {
+
+    console.error('admin.listUserActivity error', e)
+
+    res.status(500).json({ remark: 'error', status: 'error', message: ['Failed to list user activity'], data: null })
+
+  }
+
+}
+
+
+
+module.exports.listUserActivity = listUserActivity
+
+
+
+// Kill switch. GET renders the toggles, PATCH throws one.
+async function getFeatureFlags(req, res) {
+
+  try {
+
+    const features = await listFeatures()
+
+    res.json({ remark: 'feature_flags', status: 'success', data: { features } })
+
+  } catch (e) {
+
+    console.error('admin.getFeatureFlags error', e)
+
+    res.status(500).json({ remark: 'error', status: 'error', message: ['Failed to load feature flags'], data: null })
+
+  }
+
+}
+
+
+
+async function updateFeatureFlag(req, res) {
+
+  try {
+
+    const slug = String(req.params.slug || '').trim()
+
+    const raw = req.body?.enabled
+
+    if (raw === undefined || raw === null) {
+
+      return res.status(400).json({ remark: 'validation_error', status: 'error', message: ['`enabled` is required'], data: null })
+
+    }
+
+    const enabled = raw === true || raw === 1 || String(raw).toLowerCase() === 'true' || String(raw) === '1'
+
+    const result = await setFeature(slug, enabled)
+
+    res.json({ remark: 'feature_flag_updated', status: 'success', message: [`${slug} is now ${enabled ? 'on' : 'off'}`], data: result })
+
+  } catch (e) {
+
+    if (e?.code === 'UNKNOWN_FEATURE') {
+
+      return res.status(400).json({ remark: 'validation_error', status: 'error', message: [e.message], data: null })
+
+    }
+
+    console.error('admin.updateFeatureFlag error', e)
+
+    res.status(500).json({ remark: 'error', status: 'error', message: ['Failed to update feature flag'], data: null })
+
+  }
+
+}
+
+
+
+module.exports.getFeatureFlags = getFeatureFlags
+
+module.exports.updateFeatureFlag = updateFeatureFlag
 

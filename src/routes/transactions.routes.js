@@ -7,6 +7,6 @@ const userAuth = require('../middlewares/userAuth.middleware');
 
 router.get('/transactions', userAuth, TransactionsController.getTransactions);
 
-router.post('/transactions/clear', userAuth, TransactionsController.clearTransactions);
+router.get('/transactions/export', userAuth, TransactionsController.exportTransactions);
 
 module.exports = router;

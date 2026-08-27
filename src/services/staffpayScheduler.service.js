@@ -1,422 +1,139 @@
+/**
+ * Automatic payroll: the thing that makes payday happen without anybody
+ * pressing a button.
+ *
+ * A tick, once a minute:
+ *   1. every company with auto_pay_enabled, paged by id cursor
+ *   2. whose payout_time has been reached in its own timezone
+ *   3. with no run already in flight
+ *   4. whose staff are due (helpers/staffpayDue.helper.js - paged, no cap)
+ *   5. and which is verified + subscribed; if it is not, the owner is told
+ *      once a day rather than silently skipped
+ * then syncs in-flight runs and retries the ones whose backoff has elapsed.
+ *
+ * Money rules that must not be relaxed:
+ *   - Every item this creates carries a cycle key, so the database refuses a
+ *     second payment for the same staff member on the same payday no matter
+ *     how many instances are running. This is the only safe way to run more
+ *     than one copy of the API.
+ *   - This is a timer in a long-running process. On a serverless host it will
+ *     not fire reliably and payday would pass in silence, so it refuses to
+ *     start there instead of pretending to work.
+ */
+const os = require('os');
 const prisma = require('../../database/prisma');
-const { Prisma } = require('@prisma/client');
 
-const { getBulkTransfer, createBulkTransfer, getTransferFee } = require('../funding/flutterwave.service');
-const { decryptString } = require('../helpers/encryption.helper');
-const { logStaffPayEvent } = require('./staffpayAudit.service');
+const {
+  createPayrollRunForCompany,
+  syncPayrollRunById,
+  retryDueFailedRuns,
+  recoverStrandedRuns,
+} = require('./staffpayPayroll.service');
+const {
+  nextDueAtUtc,
+  companyPayoutTimeReached,
+  listDueStaff,
+  chunk,
+} = require('../helpers/staffpayDue.helper');
+const { withDirectFallback } = require('../helpers/prismaDirect.helper');
+const { getAccessState } = require('../helpers/staffpayAccess.helper');
+const { notifyUser } = require('./notify.service');
+const { captureError } = require('./alerts.service');
 
-function isAccelerateCommError(e) {
-  return Boolean(e && (e.code === 'P6000' || e?.meta?.code === 'P6000'));
+const HEARTBEAT_KEY = 'staffpay_scheduler_heartbeat';
+
+// A `setInterval` needs a process that stays alive between requests. These
+// hosts freeze or discard one after the response, so the timer is a lie there:
+// no tick, no payroll, no error either - which is the failure nobody notices
+// until a business calls to ask where the salaries are.
+const SERVERLESS_ENV_KEYS = [
+  'VERCEL',
+  'AWS_LAMBDA_FUNCTION_NAME',
+  'LAMBDA_TASK_ROOT',
+  'FUNCTIONS_WORKER_RUNTIME',
+  'NETLIFY',
+  'K_SERVICE',
+];
+
+function serverlessHost() {
+  return SERVERLESS_ENV_KEYS.find(key => String(process.env[key] || '').trim()) || null;
 }
 
-async function withDirectFallback(run) {
+function instanceId() {
+  const host = process.env.RENDER_INSTANCE_ID || process.env.FLY_MACHINE_ID || process.env.HOSTNAME || os.hostname();
+  return `${host}:${process.pid}`;
+}
+
+function envFlag(name) {
+  const raw = String(process.env[name] || '').trim().toLowerCase();
+  return raw === 'true' || raw === '1';
+}
+
+/**
+ * Last tick, readable by the admin dashboard.
+ *
+ * In AppSetting rather than memory because the dashboard may well be answered
+ * by a different instance than the one running the timer - and because "the
+ * scheduler stopped an hour ago" has to survive the restart that hid it.
+ */
+async function writeHeartbeat(payload) {
+  const value = JSON.stringify({ at: new Date().toISOString(), instance: instanceId(), ...payload });
   try {
-    return await run(prisma);
-  } catch (e) {
-    if (isAccelerateCommError(e) && prisma.$direct) {
-      return await run(prisma.$direct);
-    }
-    throw e;
-  }
-}
-
-function safeLast4(value) {
-  const s = String(value || '').replace(/\s+/g, '');
-  return s.slice(-4);
-}
-
-function minutesSinceMidnightInTz({ date, timeZone }) {
-  const tz = String(timeZone || 'Africa/Lagos').trim() || 'Africa/Lagos';
-  try {
-    const fmt = new Intl.DateTimeFormat('en-GB', {
-      timeZone: tz,
-      hour: '2-digit',
-      minute: '2-digit',
-      hour12: false,
-    });
-
-    const parts = fmt.formatToParts(date);
-    const hh = Number(parts.find(p => p.type === 'hour')?.value);
-    const mm = Number(parts.find(p => p.type === 'minute')?.value);
-    if (!Number.isFinite(hh) || !Number.isFinite(mm)) return null;
-    return (hh * 60) + mm;
-  } catch (_) {
-    const d = date instanceof Date ? date : new Date(date);
-    return (d.getHours() * 60) + d.getMinutes();
-  }
-}
-
-function companyPayoutTimeReached(company) {
-  const payout = String(company?.payout_time || '').trim();
-  if (!payout) return true;
-  const tz = String(company?.payout_timezone || 'Africa/Lagos').trim() || 'Africa/Lagos';
-  const [hhRaw, mmRaw] = payout.split(':');
-  const hh = Number(hhRaw);
-  const mm = Number(mmRaw);
-  if (!Number.isFinite(hh) || !Number.isFinite(mm)) return true;
-  const target = (hh * 60) + mm;
-  const nowMin = minutesSinceMidnightInTz({ date: new Date(), timeZone: tz });
-  if (nowMin == null) return false;
-  return nowMin >= target;
-}
-
-function addDaysUtc(date, days) {
-  const d = new Date(date);
-  d.setUTCDate(d.getUTCDate() + Number(days || 0));
-  return d;
-}
-
-function staffPayVatRate() {
-  const raw = String(process.env.STAFFPAY_VAT_RATE || '').trim();
-  if (!raw) return 0.075;
-  const n = Number(raw);
-  if (!Number.isFinite(n) || n < 0) return 0.075;
-  return n;
-}
-
-function computeVoltPayHybridFee(amountDecimal) {
-  const pct = 0.01;
-  const min = new Prisma.Decimal('20.00');
-  const cap = new Prisma.Decimal('200.00');
-  let fee;
-  try {
-    fee = new Prisma.Decimal(amountDecimal).mul(new Prisma.Decimal(pct.toFixed(4)));
-  } catch {
-    fee = new Prisma.Decimal('0.00');
-  }
-  try {
-    fee = new Prisma.Decimal(fee.toFixed(2));
-  } catch (_) {}
-  if (fee.lt(min)) return min;
-  if (fee.gt(cap)) return cap;
-  return fee;
-}
-
-function nextDueAtUtc(staff) {
-  const freq = String(staff?.frequency || '').trim().toLowerCase();
-  const start = new Date(staff?.start_date);
-  if (Number.isNaN(start.getTime())) return null;
-
-  const lastPaid = staff?.last_paid_at ? new Date(staff.last_paid_at) : null;
-  if (!lastPaid || Number.isNaN(lastPaid.getTime())) {
-    if (freq === 'monthly') {
-      const day = staff?.payment_day != null && Number.isFinite(Number(staff.payment_day)) ? Math.max(1, Math.min(28, Number(staff.payment_day))) : 1;
-      const y = start.getUTCFullYear();
-      const m = start.getUTCMonth();
-      const candidate = new Date(Date.UTC(y, m, day, 0, 0, 0, 0));
-      if (candidate.getTime() < start.getTime()) {
-        return new Date(Date.UTC(y, m + 1, day, 0, 0, 0, 0));
-      }
-      return candidate;
-    }
-
-    return start;
-  }
-
-  if (freq === 'weekly') {
-    return addDaysUtc(lastPaid, 7);
-  }
-
-  if (freq === 'bi-weekly' || freq === 'biweekly') {
-    return addDaysUtc(lastPaid, 14);
-  }
-
-  const day = staff?.payment_day != null && Number.isFinite(Number(staff.payment_day)) ? Math.max(1, Math.min(28, Number(staff.payment_day))) : 1;
-  const y = lastPaid.getUTCFullYear();
-  const m = lastPaid.getUTCMonth();
-  return new Date(Date.UTC(y, m + 1, day, 0, 0, 0, 0));
-}
-
-async function createPayrollRunForCompany({ company, staffIds, title }) {
-  const db = prisma.$direct || prisma;
-
-  const staff = await db.staffPayStaff.findMany({
-    where: {
-      company_id: Number(company.id),
-      is_active: true,
-      ...(Array.isArray(staffIds) && staffIds.length ? { id: { in: staffIds.map(Number).filter(Boolean) } } : {}),
-    },
-    orderBy: { id: 'asc' },
-  });
-
-  if (!staff.length) return null;
-
-  const totalSalary = staff.reduce((acc, s) => acc.plus(s.salary_amount || new Prisma.Decimal('0.00')), new Prisma.Decimal('0.00'));
-
-  const vatRate = staffPayVatRate();
-  const feeByStaffId = new Map();
-  let flutterwaveFeeTotal = new Prisma.Decimal('0.00');
-  let voltpayFeeTotal = new Prisma.Decimal('0.00');
-  let vatTotal = new Prisma.Decimal('0.00');
-
-  for (const s of staff) {
-    const bankCode = String(s.bank_code || '').trim();
-    const isGhanaBank = /^GH/i.test(bankCode);
-    const currency = isGhanaBank ? 'GHS' : 'NGN';
-    const amt = s.salary_amount || new Prisma.Decimal('0.00');
-
-    let flwFee = new Prisma.Decimal('0.00');
-    try {
-      const { data } = await getTransferFee({ amount: Number(new Prisma.Decimal(amt).toString()), currency });
-      const nFee = data?.fee != null && Number.isFinite(Number(data.fee)) ? Number(data.fee) : 0;
-      flwFee = new Prisma.Decimal(nFee.toFixed(2));
-    } catch (_) {
-      flwFee = new Prisma.Decimal('0.00');
-    }
-
-    const voltFee = currency === 'NGN' ? computeVoltPayHybridFee(amt) : new Prisma.Decimal('0.00');
-    let itemVat = currency === 'NGN' ? (new Prisma.Decimal(vatRate.toString()).mul(flwFee.plus(voltFee))) : new Prisma.Decimal('0.00');
-    try {
-      itemVat = new Prisma.Decimal(itemVat.toFixed(2));
-    } catch (_) {}
-
-    flutterwaveFeeTotal = flutterwaveFeeTotal.plus(flwFee);
-    voltpayFeeTotal = voltpayFeeTotal.plus(voltFee);
-    vatTotal = vatTotal.plus(itemVat);
-    feeByStaffId.set(Number(s.id), { flutterwave_fee: flwFee, voltpay_fee: voltFee, vat: itemVat });
-  }
-
-  const totalDebit = totalSalary.plus(flutterwaveFeeTotal).plus(voltpayFeeTotal).plus(vatTotal);
-
-  const payrollRun = await db.$transaction(async tx => {
-    const reserved = await tx.staffPayWallet.updateMany({
-      where: { company_id: Number(company.id), balance: { gte: totalDebit } },
-      data: { balance: { decrement: totalDebit } },
-    });
-
-    if (!reserved?.count) {
-      const err = new Error('Insufficient StaffPay wallet balance');
-      err.statusCode = 400;
-      throw err;
-    }
-
-    const run = await tx.staffPayPayrollRun.create({
-      data: {
-        company_id: Number(company.id),
-        title,
-        status: 'preparing',
-        total_salary: totalSalary,
-        flutterwave_fee_total: flutterwaveFeeTotal,
-        voltpay_fee_total: voltpayFeeTotal,
-        vat_total: vatTotal,
-        total_debit: totalDebit,
-        items: {
-          createMany: {
-            data: staff.map(s => ({
-              staff_id: s.id,
-              amount: s.salary_amount,
-              flutterwave_fee: feeByStaffId.get(Number(s.id))?.flutterwave_fee || new Prisma.Decimal('0.00'),
-              voltpay_fee: feeByStaffId.get(Number(s.id))?.voltpay_fee || new Prisma.Decimal('0.00'),
-              vat: feeByStaffId.get(Number(s.id))?.vat || new Prisma.Decimal('0.00'),
-              status: 'NEW',
-            })),
-          },
-        },
+    await prisma.appSetting.upsert({
+      where: { setting_key: HEARTBEAT_KEY },
+      update: { setting_value: value },
+      create: {
+        setting_key: HEARTBEAT_KEY,
+        setting_value: value,
+        description: 'Last StaffPay scheduler tick (written by the scheduler, read by admin)',
       },
     });
-
-    return run;
-  }, { timeout: 15000, maxWait: 15000 });
-
-  await logStaffPayEvent({
-    userId: Number(company.owner_user_id),
-    event: 'staffpay_payroll_run_initiated',
-    metadata: { company_id: Number(company.id), payroll_run_id: payrollRun.id, total_salary: Number(totalSalary.toString()), mode: 'auto' },
-  });
-
-  let bulk;
-  try {
-    const bulk_data = staff.map(s => {
-      const acct = decryptString(s.account_number_enc);
-      const bankCode = String(s.bank_code || '').trim();
-      const isGhanaBank = /^GH/i.test(bankCode);
-      const currency = isGhanaBank ? 'GHS' : 'NGN';
-
-      const item = {
-        bank_code: bankCode,
-        account_number: acct,
-        amount: Number(new Prisma.Decimal(s.salary_amount || '0').toString()),
-        currency,
-        narration: 'Salary payment',
-      };
-
-      if (isGhanaBank) {
-        const branch = String(s.bank_branch_code || '').trim();
-        if (branch) {
-          item.destination_branch_code = branch;
-        }
-      }
-
-      return item;
-    });
-
-    bulk = await createBulkTransfer({ title, bulk_data });
   } catch (e) {
-    console.error('StaffPay scheduler: auto payroll bulk transfer error:', {
-      statusCode: e?.statusCode,
-      message: e?.message,
-      flutterwave: e?.flutterwave,
+    // A heartbeat that cannot be written must never stop a payroll.
+    console.error('StaffPay scheduler: heartbeat write failed:', e?.message || e);
+  }
+}
+
+async function readHeartbeat() {
+  try {
+    const row = await prisma.appSetting.findUnique({
+      where: { setting_key: HEARTBEAT_KEY },
+      select: { setting_value: true, updated_at: true },
     });
+    if (!row?.setting_value) return null;
+    return JSON.parse(row.setting_value);
+  } catch (_) {
+    return null;
+  }
+}
 
-    await db.$transaction([
-      db.staffPayPayrollRun.update({ where: { id: payrollRun.id }, data: { status: 'failed' } }),
-      db.staffPayWallet.update({ where: { company_id: Number(company.id) }, data: { balance: { increment: totalDebit } } }),
-      db.staffPayPayrollItem.updateMany({ where: { payroll_run_id: payrollRun.id }, data: { status: 'FAILED', complete_message: e?.message || 'Bulk transfer failed' } }),
-    ]);
+/**
+ * Why a company that had staff due was not paid, in words its owner can act
+ * on. One message per company per reason per day: the tick repeats every
+ * minute, and a push a minute is how a real warning gets muted.
+ */
+const SKIP_NOTICES = {
+  not_verified: count =>
+    `Automatic payroll did not run: your business verification is not approved yet, and ${count} staff member(s) are due to be paid. Complete verification to release the payment.`,
+  subscription_expired: count =>
+    `Automatic payroll did not run: your StaffPay subscription is not active, and ${count} staff member(s) are due to be paid. Renew to release the payment.`,
+};
 
+function startStaffPayScheduler(options = {}) {
+  if (!envFlag('STAFFPAY_SCHEDULER_ENABLED')) return null;
+
+  const host = serverlessHost();
+  if (host) {
+    console.error(
+      `❌ StaffPay scheduler refused to start: this looks like a serverless runtime (${host}). ` +
+      'Automatic payroll needs an always-on Node process (a worker/web service that is not frozen between requests). ' +
+      'Deploy the scheduler on one and leave STAFFPAY_SCHEDULER_ENABLED unset here.',
+    );
+    captureError('staffpay.scheduler_serverless', new Error(`Scheduler blocked on serverless host: ${host}`), { host });
     return null;
   }
 
-  const batchId = bulk?.data?.id;
-  await db.staffPayPayrollRun.update({
-    where: { id: payrollRun.id },
-    data: {
-      status: 'queued',
-      batch_id: batchId != null ? Number(batchId) : null,
-    },
-  });
-
-  return payrollRun;
-}
-
-async function syncPayrollRunById(runId) {
-  const run = await withDirectFallback(p => p.staffPayPayrollRun.findUnique({
-    where: { id: Number(runId) },
-    include: { company: true, items: { include: { staff: true } } },
-  }));
-
-  if (!run || !run.batch_id) return null;
-
-  const { data: transfers } = await getBulkTransfer({ batch_id: String(run.batch_id) });
-  const transferList = Array.isArray(transfers) ? transfers : [];
-
-  const itemsByStaffId = new Map((run.items || []).map(i => [Number(i.staff_id), i]));
-
-  let feeTotal = new Prisma.Decimal('0.00');
-  let vatTotal = new Prisma.Decimal('0.00');
-  let voltpayFeeTotal = new Prisma.Decimal('0.00');
-  const vatRate = staffPayVatRate();
-
-  for (const t of transferList) {
-    const bank_code = String(t?.bank_code || '').trim();
-    const acct = String(t?.account_number || '').trim();
-    const last4 = safeLast4(acct);
-
-    const staff = (run.items || []).map(i => i.staff).find(s => String(s.bank_code) === bank_code && String(s.account_number_last4) === last4);
-    if (!staff) continue;
-
-    const item = itemsByStaffId.get(Number(staff.id));
-    if (!item) continue;
-
-    const fee = t?.fee != null && Number.isFinite(Number(t.fee)) ? new Prisma.Decimal(Number(t.fee).toFixed(2)) : new Prisma.Decimal('0.00');
-    feeTotal = feeTotal.plus(fee);
-
-    const existingVoltFee = item?.voltpay_fee != null ? new Prisma.Decimal(item.voltpay_fee) : new Prisma.Decimal('0.00');
-    voltpayFeeTotal = voltpayFeeTotal.plus(existingVoltFee);
-    const bankCode = String(staff?.bank_code || '').trim();
-    const isGhanaBank = /^GH/i.test(bankCode);
-    const itemVat = isGhanaBank ? new Prisma.Decimal('0.00') : new Prisma.Decimal(vatRate.toString()).mul(fee.plus(existingVoltFee));
-    const itemVat2 = (() => {
-      try {
-        return new Prisma.Decimal(itemVat.toFixed(2));
-      } catch {
-        return itemVat;
-      }
-    })();
-    vatTotal = vatTotal.plus(itemVat2);
-
-    await withDirectFallback(p => p.staffPayPayrollItem.update({
-      where: { id: item.id },
-      data: {
-        flutterwave_transfer_id: t?.id != null ? Number(t.id) : null,
-        reference: t?.reference ? String(t.reference) : null,
-        status: t?.status ? String(t.status) : item.status,
-        complete_message: t?.complete_message ? String(t.complete_message) : (t?.completeMessage ? String(t.completeMessage) : null),
-        flutterwave_fee: fee,
-        vat: itemVat2,
-        raw_payload: t,
-      },
-    }));
-  }
-
-  const oldTotalDebit = run.total_debit != null
-    ? new Prisma.Decimal(run.total_debit)
-    : new Prisma.Decimal(run.total_salary || '0');
-  const totalDebit = new Prisma.Decimal(run.total_salary || '0').plus(feeTotal).plus(voltpayFeeTotal).plus(vatTotal);
-  const delta = totalDebit.minus(oldTotalDebit);
-
-  await withDirectFallback(p => p.$transaction(async tx => {
-    await tx.staffPayPayrollRun.update({
-      where: { id: run.id },
-      data: { flutterwave_fee_total: feeTotal, voltpay_fee_total: voltpayFeeTotal, vat_total: vatTotal, total_debit: totalDebit },
-    });
-
-    if (!delta.isZero()) {
-      if (delta.gt(new Prisma.Decimal('0.00'))) {
-        await tx.staffPayWallet.upsert({
-          where: { company_id: run.company_id },
-          update: { balance: { decrement: delta } },
-          create: { company_id: run.company_id, balance: new Prisma.Decimal('0.00').minus(delta) },
-        });
-      } else {
-        await tx.staffPayWallet.upsert({
-          where: { company_id: run.company_id },
-          update: { balance: { increment: delta.abs() } },
-          create: { company_id: run.company_id, balance: delta.abs() },
-        });
-      }
-    }
-  }, { timeout: 15000, maxWait: 15000 }));
-
-  const refreshed = await withDirectFallback(p => p.staffPayPayrollRun.findUnique({
-    where: { id: run.id },
-    include: { items: true },
-  }));
-
-  const statuses = (refreshed?.items || []).map(i => String(i.status || '').toUpperCase());
-  const hasPending = statuses.some(s => s === 'NEW' || s === 'PENDING');
-  const hasFailed = statuses.some(s => s === 'FAILED');
-  const allSuccessful = statuses.length > 0 && statuses.every(s => s === 'SUCCESSFUL');
-
-  const newStatus = allSuccessful ? 'successful' : (hasPending ? 'processing' : (hasFailed ? 'failed' : 'processing'));
-
-  const updatedRun = await withDirectFallback(p => p.staffPayPayrollRun.update({
-    where: { id: run.id },
-    data: { status: newStatus },
-    include: { company: true },
-  }));
-
-  if (newStatus === 'successful') {
-    try {
-      const staffIds = Array.from(new Set((refreshed?.items || []).map(i => Number(i.staff_id)).filter(Boolean)));
-      if (staffIds.length) {
-        await withDirectFallback(p => p.staffPayStaff.updateMany({
-          where: { id: { in: staffIds } },
-          data: { last_paid_at: new Date() },
-        }));
-      }
-    } catch (_) {}
-  }
-
-  const ownerId = updatedRun?.company?.owner_user_id;
-  if (ownerId) {
-    await logStaffPayEvent({
-      userId: ownerId,
-      event: 'staffpay_payroll_run_synced',
-      metadata: { company_id: updatedRun.company_id, payroll_run_id: updatedRun.id, status: newStatus },
-    });
-  }
-
-  return { payroll_run_id: updatedRun.id, status: newStatus };
-}
-
-function startStaffPayScheduler(options = {}) {
-  const enabledRaw = String(process.env.STAFFPAY_SCHEDULER_ENABLED || '').trim().toLowerCase();
-  const enabled = enabledRaw === 'true' || enabledRaw === '1';
-  if (!enabled) return null;
-
-  const debugRaw = String(process.env.STAFFPAY_SCHEDULER_DEBUG || '').trim().toLowerCase();
-  const debug = debugRaw === 'true' || debugRaw === '1';
+  const debug = envFlag('STAFFPAY_SCHEDULER_DEBUG');
 
   if (!prisma.staffPayPayrollRun || !prisma.staffPayPayrollItem) {
     console.log('ℹ️  StaffPay scheduler enabled but Prisma StaffPay models are unavailable. Run prisma generate + migrate/db push and restart the server.');
@@ -425,97 +142,160 @@ function startStaffPayScheduler(options = {}) {
 
   const intervalMs = Number(options.intervalMs || process.env.STAFFPAY_SYNC_INTERVAL_MS || 60_000);
   const limit = Number(options.limit || process.env.STAFFPAY_SYNC_BATCH_LIMIT || 10);
+  // Staff per run. A run's transfers are submitted one after another, so an
+  // unbounded batch would hold the tick for as long as the whole company takes
+  // to pay. Everyone still gets paid - the remainder is picked up next tick.
+  const batchSize = Math.max(1, Number(options.batchSize || process.env.STAFFPAY_PAYROLL_BATCH_SIZE || 200));
 
-  const autoPayEnabledRaw = String(process.env.STAFFPAY_AUTOPAY_ENABLED || '').trim().toLowerCase();
-  const autoPayEnabled = autoPayEnabledRaw === 'true' || autoPayEnabledRaw === '1';
+  const autoPayEnabled = envFlag('STAFFPAY_AUTOPAY_ENABLED');
   const autoPayIntervalMs = Number(options.autoPayIntervalMs || process.env.STAFFPAY_AUTOPAY_INTERVAL_MS || intervalMs);
   let lastAutoPayAt = 0;
+  let autoPayCursor = 0;
+  // `${company_id}:${reason}` -> yyyy-mm-dd of the last notice. In-process
+  // only, so a restart sends one more - cheaper than a Redis key for a
+  // once-a-day message.
+  const noticeSentOn = new Map();
+
+  async function noticeOnceToday({ companyId, ownerUserId, reason, subject, message }) {
+    const key = `${Number(companyId)}:${reason}`;
+    const today = new Date().toISOString().slice(0, 10);
+    if (noticeSentOn.get(key) === today) return;
+    noticeSentOn.set(key, today);
+    await notifyUser({
+      userId: Number(ownerUserId),
+      subject,
+      message,
+      type: 'staffpay',
+      data: { company_id: Number(companyId), reason },
+    }).catch(() => null);
+  }
 
   console.log('⏱️  StaffPay scheduler started', {
     enabled: true,
     debug,
+    instance: instanceId(),
     tick_interval_ms: intervalMs,
     sync_batch_limit: limit,
+    payroll_batch_size: batchSize,
     autopay_enabled: autoPayEnabled,
     autopay_interval_ms: autoPayIntervalMs,
   });
 
   let running = false;
 
+  /** One company's payday. Returns the number of runs it created. */
+  async function payCompany(company) {
+    if (!companyPayoutTimeReached(company)) {
+      if (debug) console.log('StaffPay scheduler: payout_time not reached', { company_id: company?.id });
+      return 0;
+    }
+
+    const hasActiveRun = await withDirectFallback(p => p.staffPayPayrollRun.findFirst({
+      where: {
+        company_id: Number(company.id),
+        status: { in: ['preparing', 'queued', 'processing'] },
+      },
+      select: { id: true },
+    }));
+    if (hasActiveRun) return 0;
+
+    // Due staff are read before the access gate so a lapsed subscription only
+    // notifies a company that actually had somebody to pay today.
+    const due = await listDueStaff({ companyId: company.id });
+    if (!due.length) return 0;
+
+    // Automatic payroll obeys the same gate as the button: verified business,
+    // live subscription. Silence here was the old behaviour and it left owners
+    // guessing why payday passed.
+    const access = await getAccessState(Number(company.id));
+    if (!access.can_use_staffpay) {
+      const reason = access.verification_status === 'approved' ? 'subscription_expired' : 'not_verified';
+      await noticeOnceToday({
+        companyId: company.id,
+        ownerUserId: company.owner_user_id,
+        reason,
+        subject: 'Automatic payroll was not run',
+        message: SKIP_NOTICES[reason](due.length),
+      });
+      if (debug) console.log('StaffPay scheduler: company not eligible', { company_id: company?.id, reason });
+      return 0;
+    }
+
+    const batches = chunk(due, batchSize);
+    const today = new Date().toISOString().slice(0, 10);
+    let created = 0;
+
+    for (let i = 0; i < batches.length; i += 1) {
+      const batch = batches[i];
+      const title = batches.length > 1
+        ? `Auto staff salary payout (${today}) ${i + 1}/${batches.length}`
+        : `Auto staff salary payout (${today})`;
+
+      try {
+        await createPayrollRunForCompany({
+          company,
+          staffIds: batch.map(d => d.id),
+          cycleKeys: new Map(batch.map(d => [d.id, d.cycle_key])),
+          title,
+          mode: 'auto',
+        });
+        created += 1;
+      } catch (e) {
+        // A shortfall is the business's problem to fix, not an outage - tell
+        // the owner instead of retrying into the same wall, and stop here:
+        // later batches cannot pass a balance check this one just failed.
+        if (e?.remark === 'insufficient_balance') {
+          await noticeOnceToday({
+            companyId: company.id,
+            ownerUserId: company.owner_user_id,
+            reason: 'insufficient_balance',
+            subject: 'Automatic payroll could not run',
+            message: e.message,
+          });
+          break;
+        }
+
+        // Another instance is already paying this cycle. Nothing was debited.
+        if (e?.remark === 'payroll_cycle_already_run') {
+          if (debug) console.log('StaffPay scheduler: cycle already claimed elsewhere', { company_id: company?.id });
+          continue;
+        }
+
+        console.error('StaffPay scheduler: auto payroll batch error:', company?.id, e?.message || e);
+      }
+    }
+
+    return created;
+  }
+
   const tick = async () => {
     if (running) return;
     running = true;
+    let companiesSeen = 0;
+    let runsCreated = 0;
     try {
       const now = Date.now();
       if (autoPayEnabled && now - lastAutoPayAt >= autoPayIntervalMs) {
         lastAutoPayAt = now;
         try {
+          // A flat `take: 50` meant company 51 was never paid and nothing said
+          // so. The cursor rolls across ticks instead: a payday window is hours
+          // wide and a tick is a minute, so every company still gets reached.
           const companies = await withDirectFallback(p => p.staffPayCompany.findMany({
-            where: { auto_pay_enabled: true },
-            select: { id: true, owner_user_id: true, name: true, payout_time: true, payout_timezone: true },
+            where: { auto_pay_enabled: true, id: { gt: autoPayCursor } },
+            select: { id: true, owner_user_id: true, name_enc: true, payout_time: true, payout_timezone: true },
             take: 50,
             orderBy: { id: 'asc' },
           }));
 
-          for (const c of companies || []) {
+          autoPayCursor = companies.length === 50 ? Number(companies[companies.length - 1].id) : 0;
+          companiesSeen = companies.length;
+
+          for (const company of companies || []) {
             try {
-              if (!companyPayoutTimeReached(c)) {
-                if (debug) {
-                  const payout = String(c?.payout_time || '').trim();
-                  const tz = String(c?.payout_timezone || 'Africa/Lagos').trim() || 'Africa/Lagos';
-                  const nowMin = minutesSinceMidnightInTz({ date: new Date(), timeZone: tz });
-                  const [hhRaw, mmRaw] = payout.split(':');
-                  const target = (Number(hhRaw) * 60) + Number(mmRaw);
-                  console.log('StaffPay scheduler: payout_time not reached', {
-                    company_id: c?.id,
-                    payout_time: c?.payout_time,
-                    payout_timezone: c?.payout_timezone,
-                    now_minutes: nowMin,
-                    target_minutes: Number.isFinite(target) ? target : null,
-                  });
-                }
-                continue;
-              }
-
-              const hasActiveRun = await withDirectFallback(p => p.staffPayPayrollRun.findFirst({
-                where: {
-                  company_id: Number(c.id),
-                  status: { in: ['preparing', 'queued', 'processing'] },
-                },
-                select: { id: true },
-              }));
-              if (hasActiveRun) continue;
-
-              const staff = await withDirectFallback(p => p.staffPayStaff.findMany({
-                where: { company_id: Number(c.id), is_active: true },
-                select: { id: true, frequency: true, payment_day: true, start_date: true, last_paid_at: true },
-                take: 300,
-                orderBy: { id: 'asc' },
-              }));
-
-              const dueIds = [];
-              const nowDate = new Date();
-              for (const s of staff || []) {
-                const dueAt = nextDueAtUtc(s);
-                if (!dueAt) continue;
-                if (dueAt.getTime() <= nowDate.getTime()) {
-                  dueIds.push(Number(s.id));
-                }
-              }
-
-              if (!dueIds.length) continue;
-
-              if (debug) {
-                console.log('StaffPay scheduler: due staff detected', {
-                  company_id: c?.id,
-                  due_staff_count: dueIds.length,
-                });
-              }
-
-              const title = `Auto staff salary payout (${new Date().toISOString().slice(0, 10)})`;
-              await createPayrollRunForCompany({ company: c, staffIds: dueIds, title });
+              runsCreated += await payCompany(company);
             } catch (e) {
-              console.error('StaffPay scheduler: auto payroll company tick error:', c?.id, e?.message || e);
+              console.error('StaffPay scheduler: auto payroll company tick error:', company?.id, e?.message || e);
             }
           }
         } catch (e) {
@@ -525,8 +305,7 @@ function startStaffPayScheduler(options = {}) {
 
       const runs = await withDirectFallback(p => p.staffPayPayrollRun.findMany({
         where: {
-          batch_id: { not: null },
-          status: { in: ['queued', 'processing'] },
+          status: { in: ['preparing', 'queued', 'processing'] },
         },
         orderBy: { id: 'asc' },
         take: limit,
@@ -540,10 +319,34 @@ function startStaffPayScheduler(options = {}) {
           console.error('StaffPay scheduler: sync run failed', r?.id, e?.message || e);
         }
       }
+
+      // Failed transfers get their own backoff, so this only picks up runs whose
+      // timer has actually elapsed - most ticks find nothing.
+      try {
+        const retried = await retryDueFailedRuns({ limit });
+        if (debug && retried.attempted) console.log('StaffPay scheduler: auto-retried runs', retried);
+      } catch (e) {
+        console.error('StaffPay scheduler: auto-retry tick error:', e?.message || e);
+      }
+
+      // A run whose process died keeps its company's money reserved and blocks
+      // the next payday, so every instance sweeps for abandoned runs.
+      try {
+        const rescued = await recoverStrandedRuns({ limit });
+        if (rescued.recovered) console.warn('StaffPay scheduler: recovered stranded runs', rescued);
+      } catch (e) {
+        console.error('StaffPay scheduler: stranded-run sweep error:', e?.message || e);
+      }
     } catch (e) {
       console.error('StaffPay scheduler tick error:', e?.message || e);
     } finally {
       running = false;
+      await writeHeartbeat({
+        autopay_enabled: autoPayEnabled,
+        companies_scanned: companiesSeen,
+        runs_created: runsCreated,
+        tick_interval_ms: intervalMs,
+      });
     }
   };
 
@@ -559,4 +362,10 @@ function startStaffPayScheduler(options = {}) {
 module.exports = {
   startStaffPayScheduler,
   syncPayrollRunById,
+  // Re-exported: the dashboard controller and the payday tests have always
+  // imported it from here.
+  nextDueAtUtc,
+  serverlessHost,
+  readHeartbeat,
+  HEARTBEAT_KEY,
 };

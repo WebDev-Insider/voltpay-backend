@@ -113,6 +113,33 @@ The server will start on `http://localhost:3000`
 - `DB_PASSWORD` - Database password
 - `API_PREFIX` - API route prefix (default: /api)
 
+## Redis (Upstash)
+
+Set `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN` to turn on caching,
+shared rate-limit/lockout counters and the pending-confirmation store. Leave
+them unset and everything falls back to Postgres or in-process memory - the API
+works either way. `GET /health` reports `redis: connected | unreachable |
+disabled`.
+
+**Put Upstash in the same region as the API host.** A cache only helps if the
+round trip to Redis is shorter than the query it replaces. Measured from a
+developer laptop in Nigeria against `us-east-*`, Upstash and Neon were the same
+distance away - median 252 ms to Redis vs 224 ms for `SELECT 1` - so the user
+cache would have *cost* time there. On a server sitting next to the Upstash
+region, the same lookup is single-digit milliseconds. Measure before trusting
+it:
+
+```bash
+node -e "require('dotenv').config({path:'.env'});const r=require('./src/services/redis.service');(async()=>{for(let i=0;i<8;i++){const t=Date.now();await r.ping();console.log(Date.now()-t)}})()"
+```
+
+If Redis turns out to be the slower hop, set `USER_CACHE_TTL_SECONDS=0` to
+disable the per-request user cache while keeping the counters and the pending
+store, which are about correctness across instances rather than speed.
+
+Tuning knobs: `USER_CACHE_TTL_SECONDS` (default 15),
+`REFERENCE_CACHE_TTL_SECONDS` (default 600), `REDIS_TIMEOUT_MS` (default 1200).
+
 ## Development
 
 ### Adding New Countries:

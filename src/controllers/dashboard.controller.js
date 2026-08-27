@@ -1,5 +1,7 @@
 const { getCountryByCode } = require('../helpers/country.helper');
 const prisma = require('../../database/prisma');
+const { revealUserFields } = require('../helpers/pii.helper');
+const cache = require('../services/cache.service');
 
 function formatAmount(value) {
   const n = Number.parseFloat(String(value ?? 0));
@@ -23,38 +25,54 @@ async function getDashboard(req, res) {
 
     const countryDetails = getCountryByCode(currentUser.country_code);
 
-    const fundingRows = await prisma.fundingTransaction.findMany({
-      where: { user_id: Number(currentUser.id) },
-      orderBy: { id: 'desc' },
-      take: 5,
-    });
+    // The home screen is the most-polled authenticated endpoint in the app -
+    // every foreground, every pull-to-refresh, every balance ping. The user row
+    // behind req.user is already cached; this was the one query left, and it
+    // ran on every single one of those.
+    //
+    // Cached under tx:recent:{userId} and dropped by balance.helper the instant
+    // money moves, so a funded wallet still shows its new credit immediately.
+    // The TTL only covers changes that move no money, such as a funding row
+    // settling from Pending to Successful.
+    const recentTransactions = await cache.remember(
+      cache.keys.txRecent(currentUser.id),
+      cache.TTL.txRecent,
+      async () => {
+        const fundingRows = await prisma.fundingTransaction.findMany({
+          where: { user_id: Number(currentUser.id) },
+          orderBy: { id: 'desc' },
+          take: 5,
+        });
 
-    const recentTransactions = fundingRows.map(r => {
-      const amountStr = formatAmount(r.amount);
-      const status = String(r.status || '').toLowerCase();
-      const statusLabel = status === 'successful' || status === 'success' ? 'Successful' : status ? status : 'Pending';
+        return fundingRows.map(r => {
+          const amountStr = formatAmount(r.amount);
+          const status = String(r.status || '').toLowerCase();
+          const statusLabel = status === 'successful' || status === 'success' ? 'Successful' : status ? status : 'Pending';
 
-      return {
-        id: r.id,
-        trx: String(r.tx_ref),
-        trx_type: '+',
-        amount: amountStr,
-        charge: '0.00',
-        total_amount: amountStr,
-        remark: 'fund_account',
-        other_data: {
-          title: 'Transfer to Wallet',
-          subtitle: 'Wallet Funding',
-          feedback: statusLabel,
-          note: '',
-          image_src: '',
-        },
-        details: 'Wallet funding',
-        created_at: r.created_at instanceof Date ? r.created_at.toISOString() : new Date(r.created_at).toISOString(),
-        created_at_diff: '',
-      };
-    });
+          return {
+            id: r.id,
+            trx: String(r.tx_ref),
+            trx_type: '+',
+            amount: amountStr,
+            charge: '0.00',
+            total_amount: amountStr,
+            remark: 'fund_account',
+            other_data: {
+              title: 'Transfer to Wallet',
+              subtitle: 'Wallet Funding',
+              feedback: statusLabel,
+              note: '',
+              image_src: '',
+            },
+            details: 'Wallet funding',
+            created_at: r.created_at instanceof Date ? r.created_at.toISOString() : new Date(r.created_at).toISOString(),
+            created_at_diff: '',
+          };
+        });
+      }
+    );
 
+    const currentUserPii = revealUserFields(currentUser);
     const response = {
       remark: 'dashboard',
       status: 'success',
@@ -62,11 +80,11 @@ async function getDashboard(req, res) {
       data: {
         user: {
           id: currentUser.id,
-          firstname: currentUser.firstname,
-          lastname: currentUser.lastname,
-          username: currentUser.username,
-          email: currentUser.email,
-          mobile: currentUser.mobile,
+          firstname: currentUserPii.firstname,
+          lastname: currentUserPii.lastname,
+          username: currentUserPii.username,
+          email: currentUserPii.email,
+          mobile: currentUserPii.mobile,
           country_code: currentUser.country_code,
           country_name: countryDetails.name,
           country_flag: countryDetails.image_src,

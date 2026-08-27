@@ -1,4 +1,5 @@
 const prisma = require('../../database/prisma');
+const { revealText } = require('../helpers/pii.helper');
 
 function isAccelerateCommError(e) {
   return Boolean(e && (e.code === 'P6000' || e?.meta?.code === 'P6000'));
@@ -33,8 +34,10 @@ function toItem(row) {
     sender: 'admin',
     sent_from: 'admin',
     sent_to: 'user',
-    subject: row.subject,
-    message: row.message,
+    // Event notifications name a counterparty, so notify.service encrypts
+    // both. revealText() returns plain rows (campaigns) untouched.
+    subject: revealText(row.subject),
+    message: revealText(row.message),
     notification_type: row.notification_type,
     image: row.image || null,
     user_read: row.user_read ? '1' : '0',
@@ -204,104 +207,6 @@ async function ingest(req, res) {
   }
 }
 
-async function getSettings(req, res) {
-  try {
-    const user = req.user;
-    if (!user) {
-      return res.status(401).json({ remark: 'unauthorized', status: 'error', message: ['Please login first'], data: null });
-    }
-
-    const key = `notification_settings:user:${Number(user.id)}`;
-    const row = await withDirectFallback(p => p.appSetting.findUnique({ where: { setting_key: key } }));
-
-    let settings = { en: '1', pn: '1', sn: '1', is_allow_promotional_notify: '1' };
-    if (row?.setting_value) {
-      try {
-        const parsed = JSON.parse(String(row.setting_value));
-        if (parsed && typeof parsed === 'object') {
-          settings = {
-            en: parsed.en != null ? String(parsed.en) : settings.en,
-            pn: parsed.pn != null ? String(parsed.pn) : settings.pn,
-            sn: parsed.sn != null ? String(parsed.sn) : settings.sn,
-            is_allow_promotional_notify: parsed.is_allow_promotional_notify != null ? String(parsed.is_allow_promotional_notify) : settings.is_allow_promotional_notify,
-          };
-        }
-      } catch (_) {}
-    }
-
-    return res.json({
-      remark: 'notification_settings',
-      status: 'success',
-      message: ['Notification settings fetched'],
-      data: {
-        user: {
-          id: user.id,
-          en: settings.en === '1' ? '1' : '0',
-          pn: settings.pn === '1' ? '1' : '0',
-          sn: settings.sn === '1' ? '1' : '0',
-          is_allow_promotional_notify: settings.is_allow_promotional_notify === '1' ? '1' : '0',
-        },
-      },
-    });
-  } catch (e) {
-    console.error('Notification settings get error:', e);
-    return res.status(500).json({ remark: 'error', status: 'error', message: ['Failed to fetch notification settings'], data: null });
-  }
-}
-
-function as01(v, defaultValue = '1') {
-  if (v == null) return defaultValue;
-  const s = String(v).trim();
-  if (s === '1' || s.toLowerCase() === 'true') return '1';
-  if (s === '0' || s.toLowerCase() === 'false') return '0';
-  return defaultValue;
-}
-
-async function setSettings(req, res) {
-  try {
-    const user = req.user;
-    if (!user) {
-      return res.status(401).json({ remark: 'unauthorized', status: 'error', message: ['Please login first'], data: null });
-    }
-
-    const incoming = req.body || {};
-    const promo = incoming.is_allow_promotional_notify != null ? incoming.is_allow_promotional_notify : (incoming.pmn != null ? incoming.pmn : null);
-    const settings = {
-      en: as01(incoming.en, '1'),
-      pn: as01(incoming.pn, '1'),
-      sn: as01(incoming.sn, '1'),
-      is_allow_promotional_notify: as01(promo, '1'),
-    };
-
-    const key = `notification_settings:user:${Number(user.id)}`;
-    const value = JSON.stringify(settings);
-
-    await withDirectFallback(p => p.appSetting.upsert({
-      where: { setting_key: key },
-      update: { setting_value: value, description: 'User notification settings' },
-      create: { setting_key: key, setting_value: value, description: 'User notification settings' },
-    }));
-
-    return res.json({
-      remark: 'notification_settings_updated',
-      status: 'success',
-      message: ['Notification settings updated'],
-      data: {
-        user: {
-          id: user.id,
-          en: settings.en,
-          pn: settings.pn,
-          sn: settings.sn,
-          is_allow_promotional_notify: settings.is_allow_promotional_notify,
-        },
-      },
-    });
-  } catch (e) {
-    console.error('Notification settings set error:', e);
-    return res.status(500).json({ remark: 'error', status: 'error', message: ['Failed to update notification settings'], data: null });
-  }
-}
-
 async function unreadCount(req, res) {
   try {
     const user = req.user;
@@ -431,4 +336,4 @@ async function clearAll(req, res) {
   }
 }
 
-module.exports = { list, ingest, getSettings, setSettings, unreadCount, markRead, markAllRead, clearAll };
+module.exports = { list, ingest, unreadCount, markRead, markAllRead, clearAll };

@@ -1,5 +1,6 @@
-const prisma = require('../../database/prisma');
 const jwt = require('jsonwebtoken');
+const { getUserById } = require('../services/userCache.service');
+const { isActive, sendInactive } = require('../helpers/accountStatus.helper');
 
 module.exports = async function userAuth(req, res, next) {
   try {
@@ -63,7 +64,10 @@ module.exports = async function userAuth(req, res, next) {
       });
     }
 
-    const user = await prisma.user.findUnique({ where: { id: Number(userId) } });
+    // Cached for a few seconds; session id, device id and status are all
+    // checked below against this row, and all three invalidate it when they
+    // change. See userCache.service.js.
+    const user = await getUserById(userId);
     if (!user) {
       return res.status(401).json({
         remark: 'unauthorized',
@@ -100,14 +104,11 @@ module.exports = async function userAuth(req, res, next) {
       });
     }
 
-    // Blocked users should not access protected routes
-    if (Number(user.status) !== 1) {
-      return res.status(403).json({
-        remark: 'blocked',
-        status: 'error',
-        message: ['Your account is blocked. Please contact support.'],
-        data: null
-      });
+    // Blocked and deactivated users should not access protected routes. The
+    // client tells the two apart by the remark - one leads to support, the
+    // other to the reactivation flow.
+    if (!isActive(user)) {
+      return sendInactive(res, user);
     }
 
     // Bind to request

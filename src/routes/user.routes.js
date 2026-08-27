@@ -10,6 +10,6 @@ router.post('/user/exist', userAuth, UserController.userExist);
 router.post('/profile-setting', userAuth, uploadSingleImage, UserController.profileSetting);
 router.post('/user-data-submit', uploadSingleImage, UserController.userDataSubmit);
 router.post('/change-password', userAuth, UserController.changePassword);
-router.post('/delete-account', userAuth, UserController.deleteAccount);
+// Account lifecycle (deactivate / reactivate / delete) lives in account.routes.js
 
 module.exports = router;

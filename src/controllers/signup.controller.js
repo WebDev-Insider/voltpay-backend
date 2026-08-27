@@ -1,5 +1,5 @@
 const prisma = require('../../database/prisma');
-const bcrypt = require('bcryptjs');
+const { hashSecret, blindIndex, protectUserFields, revealUserFields, pinFlag } = require('../helpers/pii.helper');
 const jwt = require('jsonwebtoken');
 const { randomUUID } = require('crypto');
 
@@ -7,6 +7,18 @@ const { generateNumericCode } = require('../helpers/code.helper');
 const PasswordResetModel = require('../models/passwordReset.model');
 const { sendResetEmail } = require('../services/email.service');
 const { getCountryByCode } = require('../helpers/country.helper');
+const { canonicalNigerianState, isNigerianState } = require('../helpers/nigeriaStates.helper');
+const { generateRecoveryPhrase, hashRecoveryPhrase } = require('../helpers/recovery.helper');
+
+// Field limits. The client enforces the same caps with input formatters, but a
+// client is not a trust boundary - every one of these is re-checked here.
+const NAME_MAX = 30;
+const USERNAME_MIN = 3;
+const USERNAME_MAX = 20;
+const ADDRESS_MAX = 100;
+const ZIP_MAX = 10;
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[a-zA-Z]{2,}$/;
 
 function validatePasswordComplexity(password) {
   const p = String(password || '');
@@ -15,6 +27,67 @@ function validatePasswordComplexity(password) {
   if (!/[0-9]/.test(p)) return 'Password must include at least one number';
   if (!/[^A-Za-z0-9]/.test(p)) return 'Password must include at least one symbol';
   return '';
+}
+
+function validateName(value, label) {
+  const v = String(value || '').trim();
+  if (!v) return `${label} is required`;
+  if (v.length > NAME_MAX) return `${label} must be at most ${NAME_MAX} characters`;
+  if (!/^[A-Za-z][A-Za-z '-]*$/.test(v)) return `${label} can only contain letters, spaces, hyphens and apostrophes`;
+  return '';
+}
+
+function validateUsername(value) {
+  const v = String(value || '').trim();
+  if (!v) return 'Username is required';
+  if (v.length < USERNAME_MIN) return `Username must be at least ${USERNAME_MIN} characters`;
+  if (v.length > USERNAME_MAX) return `Username must be at most ${USERNAME_MAX} characters`;
+  if (!/^[A-Za-z0-9._]+$/.test(v)) return 'Username can only contain letters, numbers, dots and underscores';
+  return '';
+}
+
+function validateEmailFormat(value) {
+  const v = String(value || '').trim();
+  if (!v) return 'Email is required';
+  if (v.length > 254 || !EMAIL_RE.test(v)) return 'Enter a valid email address';
+  return '';
+}
+
+// Digits only. The client strips everything else as you type; this catches the
+// request that skipped the client.
+function validateMobileDigits(value) {
+  const v = String(value || '').trim();
+  if (!v) return 'Mobile number is required';
+  if (!/^[0-9]+$/.test(v)) return 'Mobile number can only contain digits';
+  if (v.length < 7 || v.length > 15) return 'Enter a valid mobile number';
+  return '';
+}
+
+function validateAddressFields({ address, state, zip, country }) {
+  const addressValue = String(address || '').trim();
+  if (!addressValue) return 'Address is required';
+  if (addressValue.length > ADDRESS_MAX) return `Address must be at most ${ADDRESS_MAX} characters`;
+
+  const stateValue = String(state || '').trim();
+  if (!stateValue) return 'State is required';
+  if (String(country) === 'NG' && !isNigerianState(stateValue)) return 'Select a valid Nigerian state';
+
+  // Zip is optional; when present it is digits only.
+  const zipValue = String(zip || '').trim();
+  if (zipValue) {
+    if (!/^[0-9]+$/.test(zipValue)) return 'Zip code can only contain numbers';
+    if (zipValue.length > ZIP_MAX) return `Zip code must be at most ${ZIP_MAX} digits`;
+  }
+  return '';
+}
+
+function validationError(res, message, remark = 'validation_error') {
+  return res.status(200).json({
+    remark,
+    status: 'error',
+    message: [message],
+    data: null,
+  });
 }
 
 function getJwtSecret() {
@@ -58,29 +131,145 @@ function normalizeNigeriaMobileVariants(mobileNumberRaw) {
 function buildMobileWhereForCountry({ mobile_number, country }) {
   const cc = String(country || '').trim();
   const mobile = String(mobile_number || '').trim();
-  if (cc === 'NG') {
-    const vars = normalizeNigeriaMobileVariants(mobile);
-    if (vars.length) return { OR: vars.map(v => ({ mobile: String(v) })) };
+  // Lookup is by blind index only - the plain column is gone. Every Nigerian
+  // spelling of the same number indexes separately, so match on any of them.
+  const variants = cc === 'NG' ? normalizeNigeriaMobileVariants(mobile) : [mobile];
+  const indexes = variants.map(v => blindIndex(v, 'mobile')).filter(Boolean);
+  if (!indexes.length) return { mobile_idx: null };
+  return { OR: indexes.map(idx => ({ mobile_idx: idx })) };
+}
+
+/**
+ * GET /signup/availability?username=&email=
+ *
+ * Powers the as-you-type checks on the personal information step. Both lookups
+ * go through the blind index - the plain columns are gone, and username
+ * normalisation lowercases, so uniqueness is case-insensitive.
+ *
+ * This is an account-enumeration oracle by nature (any live availability check
+ * is), which is why the route is rate limited in signup.routes.js.
+ */
+async function checkAvailability(req, res) {
+  try {
+    const username = typeof req.query.username === 'string' ? req.query.username.trim() : '';
+    const email = typeof req.query.email === 'string' ? req.query.email.trim() : '';
+
+    if (!username && !email) {
+      return validationError(res, 'Provide a username or an email to check');
+    }
+
+    const data = {};
+
+    if (username) {
+      const formatError = validateUsername(username);
+      if (formatError) {
+        data.username = { value: username, available: false, valid: false, message: formatError };
+      } else {
+        const taken = await prisma.user.findFirst({
+          where: { username_idx: blindIndex(username, 'username') },
+          select: { id: true },
+        });
+        data.username = {
+          value: username,
+          valid: true,
+          available: !taken,
+          message: taken ? 'This username is already taken' : 'Username is available',
+        };
+      }
+    }
+
+    if (email) {
+      const formatError = validateEmailFormat(email);
+      if (formatError) {
+        data.email = { value: email, available: false, valid: false, message: formatError };
+      } else {
+        const taken = await prisma.user.findFirst({
+          where: { email_idx: blindIndex(email, 'email') },
+          select: { id: true },
+        });
+        data.email = {
+          value: email,
+          valid: true,
+          available: !taken,
+          message: taken ? 'An account with this email already exists' : 'Email is available',
+        };
+      }
+    }
+
+    return res.json({
+      remark: 'availability',
+      status: 'success',
+      message: ['Availability checked'],
+      data,
+    });
+  } catch (e) {
+    console.error('checkAvailability error:', e);
+    return res.status(500).json({
+      remark: 'error',
+      status: 'error',
+      message: ['Failed to check availability'],
+      data: null,
+    });
   }
-  return { mobile: String(mobile) };
+}
+
+/**
+ * POST /signup/verify-email
+ *
+ * Checks the signup OTP without consuming it. The wizard verifies the email on
+ * step one but the account is only created two steps later, and it is
+ * registerWithEmailOtp that marks the row used - burn it here and registration
+ * would fail with "invalid or expired code".
+ */
+async function verifySignupEmailOtp(req, res) {
+  try {
+    const email = typeof req.body?.email === 'string' ? req.body.email.trim() : '';
+    const code = req.body?.code;
+
+    if (!email || !code) {
+      return validationError(res, 'Email and code are required');
+    }
+
+    const normalizedCode = String(code).trim().padStart(6, '0');
+    const tokenRow = await PasswordResetModel.findLatestByEmailAndToken(email, normalizedCode, 'signup');
+    if (!tokenRow) {
+      return res.status(200).json({
+        remark: 'invalid_or_expired_code',
+        status: 'error',
+        message: ['Invalid or expired verification code'],
+        data: null,
+      });
+    }
+
+    return res.json({
+      remark: 'email_verified',
+      status: 'success',
+      message: ['Email verified'],
+      data: { verified: true, expires_at: tokenRow.expires_at },
+    });
+  } catch (e) {
+    console.error('verifySignupEmailOtp error:', e);
+    return res.status(500).json({
+      remark: 'error',
+      status: 'error',
+      message: ['Failed to verify code'],
+      data: null,
+    });
+  }
 }
 
 async function requestEmailOtp(req, res) {
   try {
     const email = typeof req.body?.email === 'string' ? req.body.email.trim() : '';
 
-    if (!email) {
-      return res.status(200).json({
-        remark: 'validation_error',
-        status: 'error',
-        message: ['Email is required'],
-        data: null,
-      });
+    const emailError = validateEmailFormat(email);
+    if (emailError) {
+      return validationError(res, emailError);
     }
 
     // If email already has an account, block signup OTP to avoid leaking reset route.
     const existingByEmail = await prisma.user.findFirst({
-      where: { email: { equals: email, mode: 'insensitive' } },
+      where: { email_idx: blindIndex(email, 'email') },
       select: { id: true },
     });
     if (existingByEmail) {
@@ -94,7 +283,7 @@ async function requestEmailOtp(req, res) {
 
     const code = generateNumericCode(6);
     const inserted = await PasswordResetModel.insertToken(null, email, code, 'signup');
-    console.log('🔐 Signup OTP created', { id: inserted.id, email: inserted.email, expires_at: inserted.expires_at });
+    console.log('🔐 Signup OTP created', { id: inserted.id, expires_at: inserted.expires_at });
 
     const sendResult = await sendResetEmail(email, code, process.env.RESEND_FROM, { type: 'email_verification' });
     if (!sendResult || !sendResult.queued) {
@@ -136,7 +325,6 @@ async function registerWithEmailOtp(req, res) {
       username,
       address,
       state,
-      city,
       zip,
       password,
       password_confirmation,
@@ -149,30 +337,27 @@ async function registerWithEmailOtp(req, res) {
     const cleanedUsername = typeof username === 'string' ? username.trim() : '';
 
     if (!cleanedEmail || !code) {
-      return res.status(200).json({
-        remark: 'validation_error',
-        status: 'error',
-        message: ['Email and code are required'],
-        data: null,
-      });
+      return validationError(res, 'Email and code are required');
     }
 
-    if (!mobile_number || !country) {
-      return res.status(200).json({
-        remark: 'validation_error',
-        status: 'error',
-        message: ['Mobile number and country are required'],
-        data: null,
-      });
+    if (!country) {
+      return validationError(res, 'Country is required');
     }
 
-    if (!firstname || !lastname || !password || !password_confirmation) {
-      return res.status(200).json({
-        remark: 'validation_error',
-        status: 'error',
-        message: ['Firstname, lastname, email, password and confirmation are required'],
-        data: null,
-      });
+    if (!password || !password_confirmation) {
+      return validationError(res, 'Password and confirmation are required');
+    }
+
+    // Same order as the wizard: personal information, then address, then password.
+    const fieldError =
+      validateName(firstname, 'First name') ||
+      validateName(lastname, 'Last name') ||
+      validateUsername(username) ||
+      validateEmailFormat(cleanedEmail) ||
+      validateMobileDigits(mobile_number) ||
+      validateAddressFields({ address, state, zip, country });
+    if (fieldError) {
+      return validationError(res, fieldError);
     }
 
     if (String(password) !== String(password_confirmation)) {
@@ -207,7 +392,7 @@ async function registerWithEmailOtp(req, res) {
 
     // Uniqueness checks
     const existingByEmail = await prisma.user.findFirst({
-      where: { email: { equals: cleanedEmail, mode: 'insensitive' } },
+      where: { email_idx: blindIndex(cleanedEmail, 'email') },
       select: { id: true },
     });
     if (existingByEmail) {
@@ -221,7 +406,7 @@ async function registerWithEmailOtp(req, res) {
 
     if (cleanedUsername) {
       const existingByUsername = await prisma.user.findFirst({
-        where: { username: { equals: cleanedUsername, mode: 'insensitive' } },
+        where: { username_idx: blindIndex(cleanedUsername, 'username') },
         select: { id: true },
       });
       if (existingByUsername) {
@@ -250,16 +435,36 @@ async function registerWithEmailOtp(req, res) {
       });
     }
 
-    const hashedPassword = await bcrypt.hash(String(password), 10);
+    const hashedPassword = await hashSecret(String(password), 'password');
+
+    // Generated here, not on the client: the server must not accept a phrase it
+    // did not mint, or an attacker could register an account whose "recovery
+    // phrase" they chose to be guessable. Returned once in this response and
+    // never again - only the hash is stored.
+    const recoveryPhrase = generateRecoveryPhrase();
+    const recoveryHash = await hashRecoveryPhrase(recoveryPhrase);
+
+    const canonicalState = String(country) === 'NG'
+      ? canonicalNigerianState(state)
+      : String(state || '').trim();
 
     const created = await prisma.$transaction(async (tx) => {
       const user = await tx.user.create({
         data: {
-          firstname: String(firstname),
-          lastname: String(lastname),
-          username: cleanedUsername || null,
-          email: cleanedEmail,
-          mobile: String(mobile_number),
+          ...protectUserFields({
+            firstname: String(firstname).trim(),
+            lastname: String(lastname).trim(),
+            username: cleanedUsername,
+            email: cleanedEmail,
+            mobile: String(mobile_number).trim(),
+            address: address ? String(address).trim() : '',
+            state: canonicalState,
+            // City was removed from the signup form - the state picker covers it.
+            city: '',
+            zip: zip ? String(zip).trim() : '',
+          }),
+          recovery_hash: recoveryHash,
+          recovery_set_at: new Date(),
           country_code: String(country),
           balance: '0.00',
           currency_symbol: '₦',
@@ -270,10 +475,6 @@ async function registerWithEmailOtp(req, res) {
           tv: '1',
           kv: '0',
           image: null,
-          address: address ? String(address) : null,
-          state: state ? String(state) : null,
-          city: city ? String(city) : null,
-          zip: zip ? String(zip) : null,
           pin: null,
           password: hashedPassword,
         },
@@ -311,6 +512,7 @@ async function registerWithEmailOtp(req, res) {
     }
 
     const countryDetails = getCountryByCode(created.country_code);
+    const createdPii = revealUserFields(created);
 
     return res.json({
       remark: 'registration_success',
@@ -319,13 +521,17 @@ async function registerWithEmailOtp(req, res) {
       data: {
         access_token: accessToken,
         token_type: 'Bearer',
+        // The only time this leaves the server. There is no endpoint that can
+        // read it back - the column holds a scrypt hash, not the words.
+        recovery_phrase: recoveryPhrase,
+        recovery_word_count: recoveryPhrase.split(' ').length,
         user: {
           id: created.id,
-          firstname: created.firstname,
-          lastname: created.lastname,
-          username: created.username,
-          email: created.email,
-          mobile: created.mobile,
+          firstname: createdPii.firstname,
+          lastname: createdPii.lastname,
+          username: createdPii.username,
+          email: createdPii.email,
+          mobile: createdPii.mobile,
           country_code: created.country_code,
           country_name: countryDetails.name,
           country_flag: countryDetails.image_src,
@@ -338,7 +544,7 @@ async function registerWithEmailOtp(req, res) {
           sv: created.sv,
           tv: created.tv,
           kv: created.kv,
-          pn: created.pin ? '1' : '0',
+          pn: pinFlag(created),
           image: created.image,
           created_at: created.created_at,
           updated_at: created.updated_at,
@@ -383,6 +589,26 @@ async function registerWithEmailOtp(req, res) {
 }
 
 module.exports = {
+  checkAvailability,
   requestEmailOtp,
+  verifySignupEmailOtp,
   registerWithEmailOtp,
+  // The field rules this form is validated against, exported so the admin
+  // profile editor (adminUserProfile.controller) holds a support edit to the
+  // same standard. Two copies of "what is a valid name" is how a support fix
+  // ends up storing something the app itself would have refused, and then
+  // failing on the user's next save.
+  validators: {
+    validateName,
+    validateUsername,
+    validateEmailFormat,
+    validateMobileDigits,
+    validateAddressFields,
+    normalizeNigeriaMobileVariants,
+    NAME_MAX,
+    USERNAME_MIN,
+    USERNAME_MAX,
+    ADDRESS_MAX,
+    ZIP_MAX,
+  },
 };

@@ -1,9 +1,11 @@
 const prisma = require('../../database/prisma');
-const cloudinary = require('cloudinary').v2;
+const { uploadFile, deleteFileByUrl } = require('../helpers/upload.helper');
 const { getCountryByCode } = require('../helpers/country.helper');
-const bcrypt = require('bcryptjs');
+const { hashSecret, verifySecret, blindIndex, protectUserFields, revealUserFields, publicUser, pinFlag } = require('../helpers/pii.helper');
 const jwt = require('jsonwebtoken');
 const { randomUUID } = require('crypto');
+const { invalidateUser } = require('../services/userCache.service');
+const { revokeBiometric } = require('../helpers/biometric.helper');
 
 function signAccessToken(userId, sessionId) {
   const secret = process.env.JWT_SECRET;
@@ -21,6 +23,8 @@ async function rotateUserSession(userId, deviceId) {
       active_device_id: deviceId ? String(deviceId) : null,
     },
   });
+  // The new session id has to be visible to userAuth on the very next request.
+  await invalidateUser(userId);
   return sid;
 }
 
@@ -71,8 +75,8 @@ async function userExist(req, res) {
     const found = await prisma.user.findFirst({
       where: {
         OR: [
-          ...(lookup.username ? [{ username: lookup.username }] : []),
-          ...(mobileVariants.length ? mobileVariants.map(m => ({ mobile: m })) : []),
+          ...(lookup.username ? [{ username_idx: blindIndex(lookup.username, 'username') }] : []),
+          ...mobileVariants.map(m => ({ mobile_idx: blindIndex(m, 'mobile') })),
         ],
       },
     });
@@ -86,6 +90,7 @@ async function userExist(req, res) {
     }
 
     const countryDetails = getCountryByCode(found.country_code);
+    const foundPii = revealUserFields(found);
 
     return res.json({
       remark: 'user_exist',
@@ -96,11 +101,11 @@ async function userExist(req, res) {
         next_step: null,
         user: {
           id: found.id,
-          firstname: found.firstname,
-          lastname: found.lastname,
-          username: found.username,
-          email: found.email,
-          mobile: found.mobile,
+          firstname: foundPii.firstname,
+          lastname: foundPii.lastname,
+          username: foundPii.username,
+          email: foundPii.email,
+          mobile: foundPii.mobile,
           dial_code: countryDetails.dial_code,
           country_code: found.country_code,
           country_name: countryDetails.name,
@@ -138,11 +143,14 @@ async function userInfo(req, res) {
       message: ['User information fetched successfully'],
       data: {
         user: {
-          ...currentUser,
+          ...publicUser(currentUser),
           country_name: countryDetails.name,
           country_flag: countryDetails.image_src,
           dial_code: countryDetails.dial_code,
-          pn: currentUser.pin ? '1' : '0'
+          // `req.user` has been through userCache.service, which nulls `pin`.
+          // See pinFlag: reading `.pin` here is what made every PIN gate in the
+          // app demand "set a PIN in Security" for accounts that had one.
+          pn: pinFlag(currentUser)
         }
       }
     });
@@ -169,8 +177,10 @@ async function profileSetting(req, res) {
       });
     }
 
-    const { firstname, lastname, email, username, address, state, city, zip } = req.body;
-    console.log('📥 Profile setting request (controller):', req.body);
+    // firstname / lastname are deliberately not read from the body. The legal
+    // name is what KYC and every CBN report is filed against, so it is fixed at
+    // registration and only support can change it.
+    const { email, username, address, state, city, zip } = req.body;
     console.log('📥 Image file:', req.file ? 'Present' : 'Not provided');
 
     const currentUserId = Number(currentUser.id);
@@ -180,24 +190,11 @@ async function profileSetting(req, res) {
     let profileImageUrl = null;
     if (req.file) {
       try {
-        const uploadResult = await new Promise((resolve, reject) => {
-          cloudinary.uploader.upload_stream(
-            {
-              resource_type: 'image',
-              folder: 'ovopay/profiles',
-              transformation: [
-                { width: 400, height: 400, crop: 'fill' },
-                { quality: 'auto' }
-              ]
-            },
-            (error, result) => {
-              if (error) reject(error);
-              else resolve(result);
-            }
-          ).end(req.file.buffer);
-        });
-        profileImageUrl = uploadResult.secure_url;
-        console.log('📸 Profile image uploaded:', profileImageUrl);
+        const uploaded = await uploadFile(req.file, { prefix: 'profile' });
+        profileImageUrl = uploaded.url;
+        console.log('📸 Profile image uploaded for user', currentUserId);
+        // The old picture is now unreachable - do not keep paying to store it.
+        await deleteFileByUrl(currentUser.image);
       } catch (uploadError) {
         console.error('Error uploading profile image:', uploadError);
       }
@@ -207,7 +204,7 @@ async function profileSetting(req, res) {
       if (cleanedEmail) {
         const emailUser = await prisma.user.findFirst({
           where: {
-            email: { equals: cleanedEmail, mode: 'insensitive' },
+            email_idx: blindIndex(cleanedEmail, 'email'),
             id: { not: currentUserId },
           },
           select: { id: true },
@@ -225,7 +222,7 @@ async function profileSetting(req, res) {
       if (cleanedUsername) {
         const usernameUser = await prisma.user.findFirst({
           where: {
-            username: { equals: cleanedUsername, mode: 'insensitive' },
+            username_idx: blindIndex(cleanedUsername, 'username'),
             id: { not: currentUserId },
           },
           select: { id: true },
@@ -243,17 +240,16 @@ async function profileSetting(req, res) {
       const updated = await prisma.user.update({
         where: { id: currentUserId },
         data: {
-          firstname: firstname ?? undefined,
-          lastname: lastname ?? undefined,
-          username: cleanedUsername || undefined,
-          email: cleanedEmail || undefined,
-          address: address ?? undefined,
-          state: state ?? undefined,
-          city: city ?? undefined,
-          zip: zip ?? undefined,
+          // protectUserFields only touches keys that are present, so an absent
+          // field stays untouched rather than being blanked.
+          ...protectUserFields(Object.fromEntries(Object.entries({
+            username: cleanedUsername, email: cleanedEmail,
+            address, state, city, zip,
+          }).filter(([, v]) => v !== undefined && v !== null && String(v) !== ''))),
           image: profileImageUrl ?? undefined,
         },
       });
+      await invalidateUser(currentUserId);
       const countryDetails = getCountryByCode(updated.country_code);
       return res.json({
         remark: 'profile_updated',
@@ -261,11 +257,11 @@ async function profileSetting(req, res) {
         message: ['Profile updated successfully'],
         data: {
           user: {
-            ...updated,
+            ...publicUser(updated),
             country_name: countryDetails.name,
             country_flag: countryDetails.image_src,
             dial_code: countryDetails.dial_code,
-            pn: updated.pin ? '1' : '0'
+            pn: pinFlag(updated)
           }
         }
       });
@@ -316,8 +312,6 @@ async function profileSetting(req, res) {
   }
 }
 
-module.exports = { userInfo, profileSetting };
-
 async function userDataSubmit(req, res) {
   try {
     const {
@@ -331,7 +325,6 @@ async function userDataSubmit(req, res) {
       password_confirmation,
     } = req.body;
     const effectiveDeviceId = req.body?.device_id || req.headers['x-device-id'];
-    console.log('📥 User data submit request (controller):', req.body);
     console.log('📥 Image file:', req.file ? 'Present' : 'Not provided');
 
     const cleanedEmail = typeof email === 'string' ? email.trim() : '';
@@ -380,24 +373,9 @@ async function userDataSubmit(req, res) {
     let profileImageUrl = null;
     if (req.file) {
       try {
-        const uploadResult = await new Promise((resolve, reject) => {
-          cloudinary.uploader.upload_stream(
-            {
-              resource_type: 'image',
-              folder: 'ovopay/profiles',
-              transformation: [
-                { width: 400, height: 400, crop: 'fill' },
-                { quality: 'auto' }
-              ]
-            },
-            (error, result) => {
-              if (error) reject(error);
-              else resolve(result);
-            }
-          ).end(req.file.buffer);
-        });
-        profileImageUrl = uploadResult.secure_url;
-        console.log('📸 Profile image uploaded (submit):', profileImageUrl);
+        const uploaded = await uploadFile(req.file, { prefix: 'profile' });
+        profileImageUrl = uploaded.url;
+        console.log('📸 Profile image uploaded (submit)');
       } catch (uploadError) {
         console.error('Error uploading profile image (submit):', uploadError);
       }
@@ -406,7 +384,7 @@ async function userDataSubmit(req, res) {
     let user = null;
     try {
       const existingUser = await prisma.user.findFirst({
-        where: { mobile: String(mobile_number), country_code: String(country_code) },
+        where: { mobile_idx: blindIndex(mobile_number, 'mobile'), country_code: String(country_code) },
       });
 
       if (existingUser) {
@@ -424,7 +402,7 @@ async function userDataSubmit(req, res) {
       if (cleanedEmail) {
         const emailUser = await prisma.user.findFirst({
           where: {
-            email: { equals: cleanedEmail, mode: 'insensitive' },
+            email_idx: blindIndex(cleanedEmail, 'email'),
             ...(user ? { id: { not: Number(user.id) } } : {}),
           },
           select: { id: true },
@@ -442,7 +420,7 @@ async function userDataSubmit(req, res) {
       if (cleanedUsername) {
         const usernameUser = await prisma.user.findFirst({
           where: {
-            username: { equals: cleanedUsername, mode: 'insensitive' },
+            username_idx: blindIndex(cleanedUsername, 'username'),
             ...(user ? { id: { not: Number(user.id) } } : {}),
           },
           select: { id: true },
@@ -458,28 +436,31 @@ async function userDataSubmit(req, res) {
       }
 
       if (user) {
+        const existingPii = revealUserFields(user);
         const updateData = {
-          firstname,
-          lastname,
-          username: cleanedUsername || user.username,
-          email: cleanedEmail || user.email,
+          ...protectUserFields({
+            firstname,
+            lastname,
+            username: cleanedUsername || existingPii.username,
+            email: cleanedEmail || existingPii.email,
+            address: req.body.address || existingPii.address,
+            state: req.body.state || existingPii.state,
+            city: req.body.city || existingPii.city,
+            zip: req.body.zip || existingPii.zip,
+          }),
           profile_complete: '1',
           ev: '1',
           sv: '1',
           kv: '1',
           image: profileImageUrl || user.image,
-          address: req.body.address || user.address,
-          state: req.body.state || user.state,
-          city: req.body.city || user.city,
-          zip: req.body.zip || user.zip,
         };
 
         if (pin) {
-          updateData.pin = await bcrypt.hash(String(pin), 10);
+          updateData.pin = await hashSecret(String(pin), 'pin');
         }
 
         if (wantsPasswordSetup) {
-          updateData.password = await bcrypt.hash(String(password), 10);
+          updateData.password = await hashSecret(String(password), 'password');
         }
 
         user = await prisma.user.update({
@@ -488,18 +469,25 @@ async function userDataSubmit(req, res) {
             ...updateData,
           },
         });
-        console.log(`✅ User profile updated in database: ${user.firstname} ${user.lastname}`);
+        await invalidateUser(user.id);
+        console.log(`✅ User profile updated in database: id=${user.id}`);
       } else {
-        console.log(`👤 Creating new user with mobile: ${mobile_number}`);
-        const hashedPin = pin ? await bcrypt.hash(String(pin), 10) : null;
-        const hashedPassword = wantsPasswordSetup ? await bcrypt.hash(String(password), 10) : null;
+        console.log('👤 Creating new user');
+        const hashedPin = pin ? await hashSecret(String(pin), 'pin') : null;
+        const hashedPassword = wantsPasswordSetup ? await hashSecret(String(password), 'password') : null;
         user = await prisma.user.create({
           data: {
-            firstname,
-            lastname,
-            username: cleanedUsername || null,
-            email: cleanedEmail || null,
-            mobile: String(mobile_number || ''),
+            ...protectUserFields({
+              firstname,
+              lastname,
+              username: cleanedUsername || '',
+              email: cleanedEmail || '',
+              mobile: String(mobile_number || ''),
+              address: req.body.address || '',
+              state: req.body.state || '',
+              city: req.body.city || '',
+              zip: req.body.zip || '',
+            }),
             country_code: String(country_code || ''),
             balance: '0',
             currency_symbol: '₦',
@@ -510,15 +498,11 @@ async function userDataSubmit(req, res) {
             tv: '1',
             kv: '1',
             image: profileImageUrl || 'sample.jpg',
-            address: req.body.address || '',
-            state: req.body.state || '',
-            city: req.body.city || '',
-            zip: req.body.zip || '',
             ...(hashedPin ? { pin: hashedPin } : {}),
             ...(hashedPassword ? { password: hashedPassword } : {}),
           },
         });
-        console.log(`✅ User saved to database: ${user.firstname} ${user.lastname}`);
+        console.log(`✅ User saved to database: id=${user.id}`);
       }
     } catch (dbError) {
       console.error('❌ Error with database operation (submit):', dbError);
@@ -584,6 +568,7 @@ async function userDataSubmit(req, res) {
         data: null
       });
     }
+    const userPii = revealUserFields(user);
     return res.json({
       remark: 'profile_complete',
       status: 'success',
@@ -593,11 +578,11 @@ async function userDataSubmit(req, res) {
         token_type: 'Bearer',
         user: {
           id: user.id,
-          firstname: user.firstname,
-          lastname: user.lastname,
-          username: user.username,
-          email: user.email,
-          mobile: user.mobile,
+          firstname: userPii.firstname,
+          lastname: userPii.lastname,
+          username: userPii.username,
+          email: userPii.email,
+          mobile: userPii.mobile,
           country_code: user.country_code,
           balance: user.balance,
           currency_symbol: user.currency_symbol,
@@ -607,7 +592,7 @@ async function userDataSubmit(req, res) {
           sv: user.sv,
           tv: user.tv,
           kv: user.kv,
-          pn: user.pin ? '1' : '0',
+          pn: pinFlag(user),
           image: user.image,
           created_at: user.created_at,
           updated_at: user.updated_at
@@ -703,8 +688,7 @@ async function changePassword(req, res) {
             });
           }
           const storedPassword = String(dbUser.password || '');
-          const looksHashed = storedPassword.startsWith('$2a$') || storedPassword.startsWith('$2b$') || storedPassword.startsWith('$2y$');
-          const valid = looksHashed ? (await bcrypt.compare(String(current_password), storedPassword)) : storedPassword === String(current_password);
+          const valid = (await verifySecret(String(current_password), storedPassword, 'password')).ok;
           if (!valid) {
             return res.status(200).json({
               remark: 'invalid_current_password',
@@ -725,14 +709,18 @@ async function changePassword(req, res) {
 
         const updated = await prisma.user.update({
           where: { id: Number(currentUser.id) },
-          data: { password: await bcrypt.hash(String(password), 10) },
+          data: { password: await hashSecret(String(password), 'password') },
         });
+        // The biometric token was issued against the old password. Drop it so
+        // the phone has to re-enrol with the new one.
+        await revokeBiometric(currentUser.id);
+        await invalidateUser(currentUser.id);
 
         return res.json({
           remark: 'password_changed',
           status: 'success',
           message: ['Password changed successfully'],
-          data: { user: updated }
+          data: { user: publicUser(updated) }
         });
       } catch (err) {
         console.error('❌ Error changing password:', err);
@@ -812,8 +800,7 @@ async function changePassword(req, res) {
           });
         }
 
-        const looksHashed = storedPin.startsWith('$2a$') || storedPin.startsWith('$2b$') || storedPin.startsWith('$2y$');
-        const valid = looksHashed ? (await bcrypt.compare(String(current_pin), storedPin)) : storedPin === String(current_pin);
+        const valid = (await verifySecret(String(current_pin), storedPin, 'pin')).ok;
         if (!valid) {
           return res.status(200).json({
             remark: 'invalid_current_pin',
@@ -826,14 +813,15 @@ async function changePassword(req, res) {
 
       const updated = await prisma.user.update({
         where: { id: Number(currentUser.id) },
-        data: { pin: await bcrypt.hash(normalizedPin, 10) },
+        data: { pin: await hashSecret(normalizedPin, 'pin') },
       });
+      await invalidateUser(currentUser.id);
 
       return res.json({
         remark: hasExistingPin ? 'pin_changed' : 'pin_set',
         status: 'success',
         message: [hasExistingPin ? 'Pin change successfully' : 'Pin set successfully'],
-        data: { user: updated }
+        data: { user: publicUser(updated) }
       });
     } catch (err) {
       console.error('❌ Error changing PIN:', err);
@@ -855,87 +843,4 @@ async function changePassword(req, res) {
   }
 }
 
-async function deleteAccount(req, res) {
-  try {
-    const currentUser = req.user;
-    if (!currentUser) {
-      return res.status(401).json({
-        remark: 'unauthorized',
-        status: 'error',
-        message: ['Please login first'],
-        data: null
-      });
-    }
-
-    const { password } = req.body || {};
-    if (!password) {
-      return res.status(200).json({
-        remark: 'validation_error',
-        status: 'error',
-        message: ['Password is required to delete account'],
-        data: null
-      });
-    }
-
-    try {
-      const dbUser = await prisma.user.findUnique({ where: { id: Number(currentUser.id) }, select: { id: true, password: true } });
-      if (!dbUser) {
-        return res.status(404).json({
-          remark: 'user_not_found',
-          status: 'error',
-          message: ['User not found'],
-          data: null
-        });
-      }
-
-      const storedPassword = String(dbUser.password || '');
-      if (!storedPassword.trim()) {
-        return res.status(200).json({
-          remark: 'password_required',
-          status: 'error',
-          message: ['Password is required to delete account'],
-          data: null
-        });
-      }
-
-      const looksHashed = storedPassword.startsWith('$2a$') || storedPassword.startsWith('$2b$') || storedPassword.startsWith('$2y$');
-      const valid = looksHashed ? (await bcrypt.compare(String(password), storedPassword)) : storedPassword === String(password);
-      if (!valid) {
-        return res.status(200).json({
-          remark: 'invalid_password',
-          status: 'error',
-          message: ['Password is incorrect'],
-          data: null
-        });
-      }
-
-      // Hard delete the user account
-      await prisma.user.delete({ where: { id: Number(currentUser.id) } });
-
-      return res.json({
-        remark: 'account_deleted',
-        status: 'success',
-        message: ['Your account has been deleted successfully'],
-        data: null
-      });
-    } catch (err) {
-      console.error('❌ Error deleting account:', err);
-      return res.status(500).json({
-        remark: 'database_error',
-        status: 'error',
-        message: ['Failed to delete account. Please try again later.'],
-        data: null
-      });
-    }
-  } catch (error) {
-    console.error('Error in delete account (controller):', error);
-    return res.status(500).json({
-      remark: 'error',
-      status: 'error',
-      message: ['Failed to process request'],
-      data: null
-    });
-  }
-}
-
-module.exports = { userInfo, profileSetting, userExist, userDataSubmit, changePassword, deleteAccount };
+module.exports = { userInfo, profileSetting, userExist, userDataSubmit, changePassword };

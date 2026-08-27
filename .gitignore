@@ -64,3 +64,14 @@ pubspec.lock
 backend/.env
 backend/.env.*
 !backend/.env.example
+
+# Rendered email previews (`npm run email:preview`). Build output, regenerated
+# on demand - committing them means reviewing 13 HTML diffs on every template
+# tweak.
+email-preview/
+
+# Local API response dumps. user_data.json held a real user's name, email,
+# mobile, address and wallet balance in plain text, which is exactly what the
+# PII rules in CLAUDE.md exist to prevent. Never commit one again.
+user_data.json
+*.dump.json

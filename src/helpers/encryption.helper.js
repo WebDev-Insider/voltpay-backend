@@ -58,4 +58,5 @@ function decryptString(payload) {
 module.exports = {
   encryptString,
   decryptString,
+  keyFromString,
 };

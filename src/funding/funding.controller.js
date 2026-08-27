@@ -2,6 +2,11 @@ const prisma = require('../../database/prisma');
 const { Prisma } = require('@prisma/client');
 
 const { createVirtualAccount, verifyWebhookSignature } = require('./paymentpoint.service');
+const { applyBalanceDelta } = require('../helpers/balance.helper');
+const { revealUserFields } = require('../helpers/pii.helper');
+const { notifyUser } = require('../services/notify.service');
+const { securityEvent } = require('../services/alerts.service');
+const cache = require('../services/cache.service');
 
 const reconcileLocks = new Map();
 
@@ -33,13 +38,21 @@ function computeFundingFee(amountNaira) {
   return 0;
 }
 
+// One user, one account. Only the first configured bank code is used - asking
+// PaymentPoint for more than one code returns one virtual account per bank.
 function parsePaymentPointBankCodes() {
   const raw = (process.env.PAYMENTPOINT_BANK_CODES || '').trim();
-  if (!raw) return ['20946', '20897'];
+  if (!raw) return ['20946'];
   return raw
     .split(',')
     .map(s => s.trim())
-    .filter(Boolean);
+    .filter(Boolean)
+    .slice(0, 1);
+}
+
+/** Older rows can hold two accounts. The user is only ever shown one. */
+function onlyOneAccount(bankAccounts) {
+  return Array.isArray(bankAccounts) ? bankAccounts.slice(0, 1) : [];
 }
 
 function getPaymentPointBusinessId() {
@@ -49,8 +62,9 @@ function getPaymentPointBusinessId() {
 }
 
 function buildCustomerName(user) {
-  const first = String(user?.firstname || '').trim();
-  const last = String(user?.lastname || '').trim();
+  const pii = revealUserFields(user);
+  const first = String(pii.firstname || '').trim();
+  const last = String(pii.lastname || '').trim();
   const full = `${first} ${last}`.trim();
   return full || `User ${user?.id || ''}`.trim();
 }
@@ -72,6 +86,37 @@ function normalizeAmountToDecimal(amount) {
   const n = Number(cleaned);
   if (!Number.isFinite(n) || n <= 0) return null;
   return new Prisma.Decimal(n.toFixed(2));
+}
+
+/**
+ * Who sent the money. PaymentPoint has moved this field around between
+ * payload versions, so try the shapes we have actually seen before falling
+ * back to something that still reads like a sentence.
+ */
+function extractSenderName(payload) {
+  const candidates = [
+    payload?.sender?.name,
+    payload?.sender?.account_name,
+    payload?.sender_name,
+    payload?.senderName,
+    payload?.payer_name,
+    payload?.payerName,
+    payload?.originator_name,
+    payload?.account_name,
+    payload?.transaction?.sender?.name,
+  ];
+  for (const c of candidates) {
+    const v = String(c ?? '').trim();
+    if (v) return v.replace(/\s+/g, ' ').slice(0, 80);
+  }
+  return 'Someone';
+}
+
+/** ₦5,000.00 - what the banner shows. */
+function formatNaira(amount) {
+  const n = Number(String(amount ?? '0'));
+  if (!Number.isFinite(n)) return '₦0.00';
+  return `₦${n.toLocaleString('en-NG', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
 function isSuccessfulPaymentPointPayload(payload) {
@@ -144,7 +189,22 @@ async function virtualAccount(req, res) {
         data: {
           provider: 'paymentpoint',
           customer: existing.raw_payload.customer || null,
-          bankAccounts: existing.raw_payload.bankAccounts || [],
+          bankAccounts: onlyOneAccount(existing.raw_payload.bankAccounts),
+        },
+      });
+    }
+
+    // GET only reads. The account is created when the user asks for it (POST),
+    // so opening the fund page never provisions an account on its own.
+    if (String(req.method || '').toUpperCase() !== 'POST') {
+      return res.json({
+        remark: 'virtual_account',
+        status: 'success',
+        message: ['No virtual account yet'],
+        data: {
+          provider: 'paymentpoint',
+          customer: null,
+          bankAccounts: [],
         },
       });
     }
@@ -152,9 +212,10 @@ async function virtualAccount(req, res) {
     const bankCodes = parsePaymentPointBankCodes();
     const businessId = getPaymentPointBusinessId();
 
-    const email = (user.email || '').toString().trim() || `user${user.id}@voltpay.local`;
+    const userPii = revealUserFields(user);
+    const email = (userPii.email || '').toString().trim() || `user${user.id}@voltpay.local`;
     const name = buildCustomerName(user);
-    const phoneNumber = normalizePaymentPointPhoneNumber(user.mobile);
+    const phoneNumber = normalizePaymentPointPhoneNumber(userPii.mobile);
     if (!phoneNumber) {
       return res.status(400).json({
         remark: 'validation_error',
@@ -229,13 +290,21 @@ async function virtualAccount(req, res) {
             data: {
               provider: 'paymentpoint',
               customer: byRef.raw_payload.customer || null,
-              bankAccounts: byRef.raw_payload.bankAccounts || [],
+              bankAccounts: onlyOneAccount(byRef.raw_payload.bankAccounts),
             },
           });
         }
       }
       throw e;
     }
+
+    // The one ledger-visible write that does not move money, so it is the one
+    // that balance.helper's choke point never sees. Neither the dashboard nor
+    // the transaction list filters on status, so this ₦0.00 row does show up in
+    // both - and without this drop it would be missing from a cached list for
+    // up to the TTL, on the screen the user is staring at right after asking
+    // for the account.
+    cache.dropUserActivity(user.id);
 
     return res.json({
       remark: 'virtual_account',
@@ -244,7 +313,7 @@ async function virtualAccount(req, res) {
       data: {
         provider: 'paymentpoint',
         customer: raw?.customer || null,
-        bankAccounts: raw?.bankAccounts || [],
+        bankAccounts: onlyOneAccount(raw?.bankAccounts),
       },
     });
   } catch (e) {
@@ -285,7 +354,7 @@ async function verify(req, res) {
         data: {
           provider: 'paymentpoint',
           customer: funding.raw_payload?.customer || null,
-          bankAccounts: funding.raw_payload?.bankAccounts || [],
+          bankAccounts: onlyOneAccount(funding.raw_payload?.bankAccounts),
         },
       });
     }
@@ -350,6 +419,12 @@ async function webhook(req, res) {
         hasRawBody: Boolean(rawBody),
         hasSignature: Boolean(signature),
         headerKeys: Object.keys(req.headers || {}),
+      });
+      // Either the provider rotated a secret or somebody is posting fake credit
+      // events at us. Both need a human, neither can be told apart from here.
+      securityEvent('webhook.bad_signature', 'PaymentPoint webhook rejected: signature did not verify', {
+        has_signature: Boolean(signature),
+        has_raw_body: Boolean(rawBody),
       });
       return res.status(401).send('Unauthorized');
     }
@@ -431,7 +506,7 @@ async function webhook(req, res) {
     const feeAmount = settlementFeeDec || new Prisma.Decimal('0.00');
     const fee = Number(feeAmount.toString());
 
-    await prisma.$transaction(
+    const credited = await prisma.$transaction(
       async tx => {
         try {
           await tx.fundingTransaction.create({
@@ -463,11 +538,13 @@ async function webhook(req, res) {
           },
         });
 
-        if (!claimed?.count) return;
+        // Zero means another delivery of this same webhook already credited it.
+        if (!claimed?.count) return false;
 
+        await applyBalanceDelta(tx, 'user', vaRecord.user_id, creditAmount);
         await tx.user.update({
           where: { id: Number(vaRecord.user_id) },
-          data: { balance: { increment: creditAmount }, currency_symbol: '₦' },
+          data: { currency_symbol: '₦' },
         });
 
         if (tx.walletTransaction) {
@@ -503,6 +580,8 @@ async function webhook(req, res) {
             if (e?.code !== 'P2002') throw e;
           }
         }
+
+        return true;
       },
       {
         maxWait: 10_000,
@@ -514,7 +593,31 @@ async function webhook(req, res) {
       tx_ref: `pp_${String(transactionId)}`,
       user_id: Number(vaRecord.user_id),
       amount: Number(creditAmount.toString()),
+      credited: Boolean(credited),
     });
+
+    // Outside the transaction on purpose: a slow FCM round trip must not hold
+    // a money transaction open, and a failed push must not roll a credit back.
+    // Only on a fresh credit - a redelivered webhook must not re-alert.
+    if (credited) {
+      const senderName = extractSenderName(payload);
+      await notifyUser({
+        userId: Number(vaRecord.user_id),
+        subject: 'Money Received',
+        message: `${senderName} sent you ${formatNaira(creditAmount.toString())}`,
+        type: 'credit_alert',
+        // Persisted: no counterparty name here, same rule as ledger meta.
+        data: { type: 'credit_alert', trx: tx_ref, amount: Number(creditAmount.toString()) },
+        // Transient, device-only: the name is what makes the banner useful.
+        pushData: {
+          type: 'credit_alert',
+          trx: tx_ref,
+          amount: Number(creditAmount.toString()).toFixed(2),
+          sender: senderName,
+        },
+        clientMessageId: `credit:${tx_ref}`,
+      });
+    }
 
     return res.status(200).json({ received: true });
   } catch (e) {
@@ -557,4 +660,7 @@ module.exports = {
   reconcile,
   webhook,
   callback,
+  // exported for test/creditAlert.test.js
+  extractSenderName,
+  formatNaira,
 };

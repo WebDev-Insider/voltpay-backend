@@ -1,5 +1,7 @@
 const crypto = require('crypto');
 
+const { withRetry } = require('../helpers/retry.helper');
+
 const PAYMENTPOINT_BASE_URL = 'https://api.paymentpoint.co';
 
 const fetchFn =
@@ -31,7 +33,16 @@ function getWebhookSecretKey() {
   return getPaymentPointSecretKey();
 }
 
-async function paymentpointRequest(path, { method = 'GET', body } = {}) {
+// Reads retry with backoff. createVirtualAccount does not: a repeat of an
+// accepted request would hand the same user a second permanent account number.
+async function paymentpointRequest(path, { method = 'GET', body, retry } = {}) {
+  const once = () => paymentpointRequestOnce(path, { method, body });
+  const shouldRetry = retry != null ? Boolean(retry) : String(method).toUpperCase() === 'GET';
+  if (!shouldRetry) return once();
+  return withRetry(once, { label: `paymentpoint ${path}` });
+}
+
+async function paymentpointRequestOnce(path, { method = 'GET', body } = {}) {
   if (!fetchFn) {
     throw new Error('Fetch API is not available in this Node.js runtime');
   }

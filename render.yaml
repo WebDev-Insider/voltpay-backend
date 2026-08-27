@@ -1,0 +1,247 @@
+# Render Blueprint — VoltPay API + StaffPay automatic payroll
+#
+# WHY ONE SERVICE AND NOT A WEB + WORKER PAIR
+# -------------------------------------------
+# server.js starts the StaffPay scheduler alongside four other timers: the
+# request-money reminder sweep, the Payvessel betting refund sweep, support
+# ticket auto-close, and spending-insight emails. A second Render service
+# running the same entrypoint would run all of those twice. StaffPay itself is
+# safe against that (the unique index on staffpay_payroll_items(staff_id,
+# cycle_key) makes a duplicate payday physically impossible), but a betting
+# refund sweep and a batch of insight emails are not obviously idempotent.
+# One service, one instance, is the configuration that is correct today.
+#
+# THE TWO SETTINGS THAT DECIDE WHETHER SALARIES GET PAID
+# -------------------------------------------------------
+#   plan: starter      A `free` web service sleeps after ~15 minutes of no
+#                      HTTP traffic. A sleeping process has no timer, so
+#                      payday passes in total silence - no payment, no error.
+#                      This is the same failure as leaving the scheduler on a
+#                      laptop. Do not downgrade this to `free`.
+#
+#   numInstances: 1    See above. StaffPay would tolerate more; the other
+#                      sweeps would not.
+#
+# Region is `ohio` because the Neon database is in us-east-2. Moving the
+# service away from the database adds a round trip to every query inside the
+# payroll transaction.
+
+services:
+  - type: web
+    name: voltpay-api
+    runtime: node
+    plan: starter          # NOT free - see note above. Free sleeps, payday dies.
+    region: ohio           # matches Neon us-east-2
+    numInstances: 1
+
+    # THERE IS DELIBERATELY NO `rootDir` HERE.
+    # This Blueprint lives in the voltpay-backend repository, where server.js
+    # and package.json are at the root, so the service root already is the
+    # backend. `rootDir: backend` was correct while this file sat at the root
+    # of the monorepo working tree; in this repo it points at a directory that
+    # does not exist and the build fails at `npm ci`. Re-add it only if this
+    # file is ever moved back into a repo that nests the backend a level down.
+    buildCommand: npm ci   # postinstall runs `prisma generate`
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeploy: false      # a surprise deploy at 11:29 on payday is not a plan
+
+    envVars:
+      # ---- runtime -------------------------------------------------------
+      - key: NODE_ENV
+        value: production
+
+      # package.json only says `>=18`, which lets Render's default drift to a
+      # different major between one deploy and the next. Pinned to the version
+      # this backend is developed and tested on.
+      - key: NODE_VERSION
+        value: "24"
+
+      # Render's own local time is UTC. The development machine this was built
+      # and tested on runs WAT, and the Intl fallback inside
+      # minutesSinceMidnightInTz() drops to local time if Intl ever throws.
+      # Pinning WAT keeps production identical to what was tested and makes
+      # every log line read in the timezone the business actually pays in.
+      # Payday correctness does not depend on this - payout_timezone is
+      # applied explicitly - but consistency is worth having.
+      - key: TZ
+        value: Africa/Lagos
+
+      # PORT is injected by Render. Do not set it here.
+
+      - key: API_PREFIX
+        value: /api
+      - key: HTTP_LOGGING
+        value: "0"          # request logs are noisy and can carry identifiers
+
+      # ---- StaffPay automatic payroll: the whole point of this file -------
+      # Both flags are required. STAFFPAY_SCHEDULER_ENABLED starts the timer;
+      # STAFFPAY_AUTOPAY_ENABLED is what lets that timer actually initiate a
+      # payday. Setting only the first gives a scheduler that syncs and
+      # retries but never pays anybody - a very quiet way to miss salaries.
+      - key: STAFFPAY_SCHEDULER_ENABLED
+        value: "true"
+      - key: STAFFPAY_AUTOPAY_ENABLED
+        value: "true"
+
+      # Leave off in normal operation. Turn on temporarily to see per-company
+      # "payout_time not reached" / "company not eligible" lines while
+      # diagnosing a payday that did not happen.
+      - key: STAFFPAY_SCHEDULER_DEBUG
+        value: "false"
+
+      - key: STAFFPAY_SYNC_INTERVAL_MS
+        value: "60000"      # one tick a minute
+
+      # Deliberately BELOW the tick interval, and this is not cosmetic.
+      # staffpayScheduler.service.js:151 defaults autoPayIntervalMs to
+      # intervalMs, and line 278 gates autopay on
+      # `now - lastAutoPayAt >= autoPayIntervalMs`. When the two numbers are
+      # equal, a setInterval that fires a few milliseconds early - which it
+      # routinely does - lands at 59,998ms and skips the autopay branch for
+      # that whole tick, so autopay effectively runs every other minute and
+      # the heartbeat reports companies_scanned: 0 on the skipped ticks.
+      # Payday is a window hours wide so nobody went unpaid, but the
+      # diagnostics lie. 30s makes every tick eligible.
+      - key: STAFFPAY_AUTOPAY_INTERVAL_MS
+        value: "30000"
+
+      - key: STAFFPAY_PAYROLL_BATCH_SIZE
+        value: "200"        # staff per run; the remainder is paid next tick
+      - key: STAFFPAY_SYNC_BATCH_LIMIT
+        value: "10"         # in-flight runs reconciled per tick
+      - key: STAFFPAY_DEFAULT_PAYOUT_TIME
+        value: "09:00"      # only used when a company has not set its own
+      - key: STAFFPAY_MAX_AUTO_RETRIES
+        value: "3"
+      - key: STAFFPAY_RETRY_BASE_MS
+        value: "300000"     # 5 min, then 20, then 80
+      - key: STAFFPAY_RETRY_MAX_MS
+        value: "21600000"   # 6h ceiling
+      - key: STAFFPAY_STRANDED_AFTER_MS
+        value: "600000"     # a run untouched for 10 min is treated as abandoned
+      - key: STAFFPAY_VIRTUAL_ACCOUNT_MIN_AMOUNT
+        value: "100"
+      - key: STAFFPAY_VIRTUAL_ACCOUNT_IS_PERMANENT
+        value: "1"
+      - key: STAFFPAY_WEBHOOK_DEBUG
+        value: "0"
+
+      # ---- other schedulers already living in server.js -------------------
+      - key: BETTING_SWEEP_INTERVAL_MS
+        value: "300000"
+      - key: SPENDING_INSIGHTS_ENABLED
+        value: "true"
+      - key: SPENDING_INSIGHTS_HOUR_WAT
+        value: "9"
+
+      # ---- non-secret integration config ---------------------------------
+      - key: PAYSTACK_CHANNELS
+        value: card,bank_transfer
+      - key: PAYSTACK_TIMEOUT_MS
+        value: "5000"
+      - key: PG_CONN_TIMEOUT_MS
+        value: "15000"
+      - key: SMTP_HOST
+        value: smtp-relay.brevo.com
+      - key: SMTP_PORT
+        value: "587"
+      - key: SMTP_SECURE
+        value: "false"
+      - key: EMAIL_BRAND_NAME
+        value: VoltPay
+      # The blue in the logo's "Volt" (my_color.dart statusColor), so the accent
+      # rail on an email matches the wordmark above it. This used to be #0000FF,
+      # which is pure blue and matches nothing in the product.
+      - key: EMAIL_BRAND_COLOR
+        value: "#2B5BEE"
+
+      # The email logo is served by this API at
+      # /assets/brand/voltpay-logo.png, and the URL is built from
+      # PUBLIC_BASE_URL below. Set EMAIL_LOGO_URL only to override that - for
+      # example to put the file behind a CDN. If PUBLIC_BASE_URL is not https,
+      # emails fall back to a text wordmark rather than a broken image.
+
+      # ---- set these in the Render dashboard, never in this file ----------
+      # `sync: false` means Render prompts for the value and stores it
+      # encrypted. Nothing below is ever committed to git.
+      #
+      # PUBLIC_BASE_URL must become the live Render URL
+      # (https://voltpay-api.onrender.com) - Paystack callbacks and virtual
+      # account webhooks are built from it, and it currently points at an
+      # ngrok tunnel that will not exist in production.
+      - key: PUBLIC_BASE_URL
+        sync: false
+      - key: CORS_ALLOWED_ORIGINS
+        sync: false
+
+      # Database
+      - key: DATABASE_URL          # Neon pooled
+        sync: false
+      - key: DIRECT_URL            # Neon direct - Prisma needs both
+        sync: false
+
+      # Crypto. PII_HASH_KEY and PII_ENC_KEY must be 32 bytes each and must be
+      # distinct from JWT_SECRET. Changing PII_HASH_KEY after go-live requires
+      # `node scripts/backfill-pii.js --reindex` or every lookup returns
+      # "user not found".
+      - key: JWT_SECRET
+        sync: false
+      - key: PII_HASH_KEY
+        sync: false
+      - key: PII_ENC_KEY
+        sync: false
+      - key: ADMIN_JWT_SECRET
+        sync: false
+      - key: ADMIN_API_SECRET
+        sync: false
+      - key: ADMIN_API_KEYS
+        sync: false
+
+      # Payments
+      - key: PAYSTACK_SECRET_KEY
+        sync: false
+      - key: BUDPAY_SECRET_KEY
+        sync: false
+      - key: BUDPAY_PUBLIC_KEY
+        sync: false
+      - key: PAYMENTPOINT_API_KEY
+        sync: false
+      - key: PAYMENTPOINT_SECRET_KEY
+        sync: false
+      - key: PAYMENTPOINT_BUSINESS_ID
+        sync: false
+      - key: PAYVESSEL_API_KEY
+        sync: false
+      - key: PAYVESSEL_API_SECRET
+        sync: false
+      - key: FLUTTERWAVE_SECRET_KEY
+        sync: false
+      - key: FLUTTERWAVE_WEBHOOK_HASH
+        sync: false
+
+      # Email
+      - key: BREVO_API_KEY
+        sync: false
+      - key: BREVO_FROM
+        sync: false
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASS
+        sync: false
+      - key: SMTP_FROM
+        sync: false
+
+      # Uploads, cache, push, alerts
+      - key: UPLOADTHING_TOKEN
+        sync: false
+      - key: UPSTASH_REDIS_REST_URL
+        sync: false
+      - key: UPSTASH_REDIS_REST_TOKEN
+        sync: false
+      - key: FIREBASE_PROJECT_ID
+        sync: false
+      - key: FIREBASE_SERVICE_ACCOUNT_JSON
+        sync: false
+      - key: ALERT_WEBHOOK_URL
+        sync: false

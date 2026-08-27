@@ -1,27 +1,16 @@
-function getProfileImage(req, res) {
-  let { filename } = req.params;
-  console.log('📥 Image request for:', filename);
+const path = require('path');
 
-  if (!filename || filename === '' || filename === '/') {
-    filename = 'sample.jpg';
-  }
+const BRAND_DIR = path.join(__dirname, '..', '..', 'public', 'brand');
 
-  if (filename.startsWith('https://res.cloudinary.com/')) {
-    console.log('📸 Redirecting to Cloudinary URL:', filename);
-    return res.redirect(filename);
-  }
-
-  if (filename === 'sample.jpg') {
-    return res.redirect('https://res.cloudinary.com/demo/image/upload/v1640995392/sample.jpg');
-  }
-
-  if (filename.includes('ovopay') || filename.includes('cloudinary')) {
-    const cloudinaryUrl = `https://res.cloudinary.com/demo/image/upload/v1640995392/${filename}`;
-    return res.redirect(cloudinaryUrl);
-  }
-
-  return res.redirect('https://res.cloudinary.com/demo/image/upload/v1640995392/sample.jpg');
-}
+/**
+ * The brand files an email can link to. An allowlist rather than a directory
+ * listing: `filename` comes off the URL, and mapping it through a fixed object
+ * means no amount of `../` in the path can reach anything else on disk.
+ */
+const BRAND_FILES = {
+  'voltpay-logo.png': 'voltpay-logo.png',
+  'voltpay-logo-white.png': 'voltpay-logo-white.png',
+};
 
 function getCountryFlag(req, res) {
   const { filename } = req.params;
@@ -45,33 +34,40 @@ function getCountryFlag(req, res) {
   return res.redirect(flagUrl);
 }
 
-function getDoubleSlashProfileImage(req, res) {
-  const { filename } = req.params;
-  console.log('📥 Double slash image request for:', filename);
-  return res.redirect(`/assets/images/user/profile/${filename || 'sample.jpg'}`);
-}
+/**
+ * The logo in the header of every VoltPay email.
+ *
+ * It has to be a hosted URL: Gmail, Outlook.com and Yahoo all strip `data:`
+ * image sources, so a base64 logo is invisible in the three clients that
+ * matter most here. Public and unauthenticated by design - the recipient's
+ * mail client fetches it with no session, and it is a logo, not user data.
+ *
+ * Two headers earn their place:
+ *
+ *   Cross-Origin-Resource-Policy   helmet() sets this to `same-origin` for the
+ *     whole app, which makes a browser refuse the image when a webmail client
+ *     renders the message on its own domain. Relaxed to `cross-origin` for
+ *     this route only.
+ *
+ *   Cache-Control                  Gmail caches through its own image proxy,
+ *     but Apple Mail and Outlook fetch every open. A year of immutable cache
+ *     means one download per recipient rather than one per read. The filename
+ *     is the cache key, so a new logo ships as a new filename.
+ */
+function getBrandAsset(req, res) {
+  const file = BRAND_FILES[String(req.params.filename || '')];
+  if (!file) return res.status(404).end();
 
-function getUrlEncodedProfileImage(req, res) {
-  let fullPath = req.path.replace('/assets/images/user/profile/', '');
-  let cloudinaryUrl = fullPath;
-  if (cloudinaryUrl.startsWith('https:////')) {
-    cloudinaryUrl = cloudinaryUrl.replace('https:////', 'https://');
-  } else if (cloudinaryUrl.startsWith('https:///')) {
-    cloudinaryUrl = cloudinaryUrl.replace('https:///', 'https://');
-  } else if (cloudinaryUrl.startsWith('https://')) {
-    // ok
-  } else if (cloudinaryUrl.startsWith('https:')) {
-    cloudinaryUrl = cloudinaryUrl.replace('https:', 'https://');
-  }
-  console.log('📥 URL-encoded Cloudinary request');
-  console.log('📥 Original path:', req.path);
-  console.log('📥 Redirecting to:', cloudinaryUrl);
-  return res.redirect(cloudinaryUrl);
+  res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+  res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+  res.setHeader('Content-Type', 'image/png');
+
+  return res.sendFile(path.join(BRAND_DIR, file), err => {
+    if (err && !res.headersSent) res.status(404).end();
+  });
 }
 
 module.exports = {
-  getProfileImage,
   getCountryFlag,
-  getDoubleSlashProfileImage,
-  getUrlEncodedProfileImage,
+  getBrandAsset,
 };

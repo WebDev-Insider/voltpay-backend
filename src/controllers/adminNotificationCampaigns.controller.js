@@ -1,5 +1,7 @@
 const prisma = require('../../database/prisma')
 const { broadcastToUserIds } = require('../services/notificationWs.service')
+const { sendToTokens, sendToTopic, messagingAvailable } = require('../services/fcm.service')
+const { reveal } = require('../helpers/pii.helper')
 
 function isAccelerateCommError(e) {
   return Boolean(e && (e.code === 'P6000' || e?.meta?.code === 'P6000'))
@@ -18,6 +20,66 @@ async function withDirectFallback(run) {
 
 function asString(v) {
   return typeof v === 'string' ? v.trim() : (v == null ? '' : String(v).trim())
+}
+
+/**
+ * Who a campaign goes to.
+ *
+ *   all    - every active user, one push_notification row each
+ *   users  - an explicit id list, same rows
+ *   topic  - an FCM topic: one request, no rows, no read stats (FCM owns the
+ *            subscriber list, so we cannot enumerate it)
+ *
+ * Returns null when the selection cannot be honoured, so send/create can 400
+ * instead of quietly falling back to "everyone" - the expensive mistake here is
+ * mailing 50k people by accident.
+ */
+function parseAudience(body) {
+  const audience = (asString(body?.audience) || 'all').toLowerCase()
+
+  if (audience === 'all') return { audience: 'all', audience_value: null }
+
+  if (audience === 'topic') {
+    const topic = asString(body?.topic) || asString(body?.audience_value)
+    if (!/^[a-zA-Z0-9-_.~%]{1,900}$/.test(topic)) return null
+    return { audience: 'topic', audience_value: { topic } }
+  }
+
+  if (audience === 'users') {
+    const raw = Array.isArray(body?.user_ids)
+      ? body.user_ids
+      : String(body?.user_ids || body?.audience_value || '').split(',')
+    const ids = [...new Set(raw.map(v => parseInt(v, 10)).filter(v => Number.isInteger(v) && v > 0))]
+    if (!ids.length) return null
+    return { audience: 'users', audience_value: { user_ids: ids } }
+  }
+
+  return null
+}
+
+/** The Prisma filter for a stored audience. `topic` never reaches here. */
+function recipientsWhereFor(campaign) {
+  const base = { status: 1 }
+  if (campaign.audience === 'users') {
+    const ids = (campaign.audience_value?.user_ids || []).map(Number).filter(Boolean)
+    return { ...base, id: { in: ids.length ? ids : [0] } }
+  }
+  return base
+}
+
+/** Decrypt a batch of device tokens, dropping the rows that have none. */
+function tokensFrom(users) {
+  const out = []
+  for (const u of users) {
+    if (!u.fcm_token_enc) continue
+    try {
+      const token = reveal(u.fcm_token_enc)
+      if (token) out.push({ userId: Number(u.id), token })
+    } catch (e) {
+      console.error('campaign token decrypt failed', { user_id: Number(u.id), error: e?.message || e })
+    }
+  }
+  return out
 }
 
 async function listCampaigns(req, res) {
@@ -74,7 +136,10 @@ async function listCampaigns(req, res) {
         notification_type: r.notification_type,
         image: r.image || null,
         status: r.status,
+        audience: r.audience || 'all',
+        audience_value: r.audience_value || null,
         recipient_count: recipients,
+        push_sent_count: Number(r.push_sent_count || 0),
         delivered_count: deliveredCount,
         read_count: readCount,
         unread_count: Math.max(0, recipients - readCount),
@@ -120,6 +185,11 @@ async function createCampaign(req, res) {
       return res.status(400).json({ remark: 'validation_error', status: 'error', message: ['title and message are required'], data: null })
     }
 
+    const audience = parseAudience(req.body)
+    if (!audience) {
+      return res.status(400).json({ remark: 'validation_error', status: 'error', message: ['audience must be "all", "topic" with a valid topic, or "users" with at least one user id'], data: null })
+    }
+
     const created = await withDirectFallback(p => p.notificationCampaign.create({
       data: {
         title,
@@ -128,6 +198,7 @@ async function createCampaign(req, res) {
         image,
         data,
         status: 'draft',
+        ...audience,
       }
     }))
 
@@ -184,7 +255,11 @@ async function getCampaign(req, res) {
           notification_type: campaign.notification_type,
           image: campaign.image || null,
           status: campaign.status,
+          audience: campaign.audience || 'all',
+          audience_value: campaign.audience_value || null,
           recipient_count: recipients,
+          push_sent_count: Number(campaign.push_sent_count || 0),
+          push_enabled: messagingAvailable(),
           delivered_count: deliveredCount,
           read_count: readCount,
           unread_count: Math.max(0, recipients - readCount),
@@ -226,29 +301,62 @@ async function sendCampaign(req, res) {
       return res.json({ remark: 'notification_campaign_sent', status: 'success', data: { id: campaign.id, status: 'sent', recipient_count: campaign.recipient_count || 0 } })
     }
 
-    const recipientsWhere = { status: 1 }
-    const totalRecipients = await withDirectFallback(p => p.user.count({ where: recipientsWhere }))
-
     const now = new Date()
+    const push = {
+      title: String(campaign.title),
+      body: String(campaign.message),
+      image: campaign.image || null,
+      // Ids and a type only. `data` lands on the device but is also the column
+      // we persist, so the ledger meta rule applies: never a name or an email.
+      data: { type: String(campaign.notification_type || 'general'), campaign_id: String(id) },
+    }
+
+    // Topic: FCM owns the subscriber list, so there is nobody to write rows for
+    // and nothing to count. One request, then done.
+    if (campaign.audience === 'topic') {
+      const topic = campaign.audience_value?.topic
+      const ok = await sendToTopic(topic, push)
+
+      await withDirectFallback(p => p.notificationCampaign.update({
+        where: { id },
+        data: { status: ok ? 'sent' : 'failed', sent_at: now, recipient_count: 0, push_sent_count: 0 },
+      }))
+
+      if (!ok) {
+        return res.status(502).json({ remark: 'error', status: 'error', message: ['FCM rejected the topic broadcast'], data: null })
+      }
+      return res.json({ remark: 'notification_campaign_sent', status: 'success', data: { id, status: 'sent', audience: 'topic', topic } })
+    }
+
+    // Everything below writes a row per recipient, so tell the device not to
+    // post the payload back. Only the topic branch above leaves that to the
+    // handset (see ingestCampaignNotification in push_notification_service_mobile).
+    push.data.stored = '1'
+
+    const recipientsWhere = recipientsWhereFor(campaign)
+    const totalRecipients = await withDirectFallback(p => p.user.count({ where: recipientsWhere }))
 
     await withDirectFallback(p => p.notificationCampaign.update({
       where: { id },
       data: {
         status: 'sending',
         recipient_count: totalRecipients,
+        push_sent_count: 0,
         sent_at: now,
       }
     }))
 
     const batchSize = 500
     let lastId = 0
+    let pushSent = 0
+    let pushFailed = 0
 
     while (true) {
       const users = await withDirectFallback(p => p.user.findMany({
         where: { ...recipientsWhere, id: { gt: lastId } },
         orderBy: { id: 'asc' },
         take: batchSize,
-        select: { id: true },
+        select: { id: true, fcm_token_enc: true },
       }))
 
       if (!users || users.length === 0) break
@@ -282,14 +390,40 @@ async function sendCampaign(req, res) {
            }
          )
        } catch (_) {}
+
+      // The banner. The rows above are the in-app list, the WS frame is the
+      // live badge; neither wakes a backgrounded phone. Fails open - a rejected
+      // batch must not abort a campaign that is already half written.
+      try {
+        const result = await sendToTokens(tokensFrom(users), push)
+        pushSent += result.sent
+        pushFailed += result.failed
+      } catch (e) {
+        console.error('campaign push batch failed', { campaign_id: id, error: e?.message || e })
+      }
     }
 
     await withDirectFallback(p => p.notificationCampaign.update({
       where: { id },
-      data: { status: 'sent' },
+      data: { status: 'sent', push_sent_count: pushSent },
     }))
 
-    return res.json({ remark: 'notification_campaign_sent', status: 'success', data: { id, status: 'sent', recipient_count: totalRecipients } })
+    return res.json({
+      remark: 'notification_campaign_sent',
+      status: 'success',
+      data: {
+        id,
+        status: 'sent',
+        audience: campaign.audience || 'all',
+        recipient_count: totalRecipients,
+        push_sent_count: pushSent,
+        push_failed_count: pushFailed,
+        // A campaign still "sends" with FCM unconfigured - the in-app list is
+        // written either way - so say so rather than reporting 0 pushes as if
+        // every device had refused.
+        push_enabled: messagingAvailable(),
+      }
+    })
   } catch (e) {
     console.error('admin.sendNotificationCampaign error', e)
     return res.status(500).json({ remark: 'error', status: 'error', message: ['Failed to send campaign'], data: null })
@@ -339,4 +473,13 @@ async function deleteCampaign(req, res) {
   }
 }
 
-module.exports = { listCampaigns, createCampaign, getCampaign, sendCampaign, deleteCampaign }
+module.exports = {
+  listCampaigns,
+  createCampaign,
+  getCampaign,
+  sendCampaign,
+  deleteCampaign,
+  // exported for test/notificationCampaign.test.js
+  parseAudience,
+  recipientsWhereFor,
+}

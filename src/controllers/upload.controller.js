@@ -1,4 +1,4 @@
-const cloudinary = require('cloudinary').v2;
+const { uploadFile } = require('../helpers/upload.helper');
 
 async function uploadImage(req, res) {
   try {
@@ -13,32 +13,17 @@ async function uploadImage(req, res) {
       });
     }
 
-    const uploadResult = await new Promise((resolve, reject) => {
-      cloudinary.uploader.upload_stream(
-        {
-          resource_type: 'image',
-          folder: 'ovopay/profiles',
-          transformation: [
-            { width: 400, height: 400, crop: 'fill' },
-            { quality: 'auto' }
-          ]
-        },
-        (error, result) => {
-          if (error) reject(error);
-          else resolve(result);
-        }
-      ).end(req.file.buffer);
-    });
+    const uploaded = await uploadFile(req.file, { prefix: 'profile' });
 
     return res.json({
       remark: 'image_uploaded',
       status: 'success',
       message: ['Image uploaded successfully'],
       data: {
-        image_url: uploadResult.secure_url,
-        public_id: uploadResult.public_id,
-        width: uploadResult.width,
-        height: uploadResult.height
+        image_url: uploaded.url,
+        file_key: uploaded.key,
+        name: uploaded.name,
+        size: uploaded.size
       }
     });
   } catch (error) {

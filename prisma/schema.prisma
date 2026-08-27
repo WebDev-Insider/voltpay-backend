@@ -8,57 +8,315 @@ datasource db {
 }
 
 model User {
-  id               Int       @id @default(autoincrement())
-  firstname        String
-  lastname         String
-  username         String?   @unique
-  email            String?   @unique
-  mobile           String
-  country_code     String
-  balance          Decimal    @default(0) @db.Decimal(15, 2)
-  currency_symbol  String    @default("₦")
-  profile_complete String    @default("0")
-  status           Int       @default(1)
-  role             String    @default("customer")
-  ev               String    @default("0")
-  sv               String    @default("0")
-  tv               String    @default("0")
-  kv               String    @default("0")
-  image            String?
-  address          String?
-  state            String?
-  city             String?
-  zip              String?
-  pin              String?
-  password         String?
-  active_session_id String?
-  active_device_id  String?
-  pin_login_used   Boolean   @default(false)
-  created_at       DateTime  @default(now())
-  updated_at       DateTime  @updatedAt
+  id                    Int       @id @default(autoincrement())
+  // Plain-text PII columns. Nullable during migration only; drop once
+  // scripts/backfill-pii.js has run everywhere. See src/helpers/pii.helper.js.
+  firstname             String?
+  lastname              String?
+  username              String?   @unique
+  email                 String?   @unique
+  mobile                String?
+  // Protected PII: *_enc = AES-256-GCM ciphertext, *_idx = keyed blind index
+  // for lookup/uniqueness. Never store the plain value alongside these.
+  firstname_enc         String?
+  lastname_enc          String?
+  username_enc          String?
+  username_idx          String?   @unique
+  email_enc             String?
+  email_idx             String?   @unique
+  mobile_enc            String?
+  mobile_idx            String?
+  country_code          String
+  balance               Decimal   @default(0) @db.Decimal(15, 2)
+  // Tamper-evidence for the balance column, which must stay numeric for
+  // atomic SQL arithmetic. Written by every money path.
+  balance_mac           String?
+  currency_symbol       String    @default("₦")
+  profile_complete      String    @default("0")
+  status                Int       @default(1)
+  role                  String    @default("customer")
+  ev                    String    @default("0")
+  sv                    String    @default("0")
+  tv                    String    @default("0")
+  kv                    String    @default("0")
+  image                 String?
+  address               String?
+  state                 String?
+  city                  String?
+  zip                   String?
+  address_enc           String?
+  state_enc             String?
+  city_enc              String?
+  zip_enc               String?
+  // One-way: pepper + per-record salt + scrypt. Never recoverable.
+  pin                   String?
+  password              String?
+  // BIP39 12-word recovery phrase. Hash only - the plain phrase is shown once
+  // at signup and never persisted. See src/helpers/recovery.helper.js.
+  recovery_hash         String?
+  recovery_set_at       DateTime?
+  active_session_id     String?
+  active_device_id      String?
+  // Device-bound biometric login. The token is random, issued once, and only
+  // ever compared - so hash only, same treatment as the PIN. Bound to the
+  // device that enrolled it: a stolen hash is useless on another handset.
+  biometric_hash        String?
+  biometric_device_id   String?
+  biometric_set_at      DateTime?
+  // FCM registration token for background push. Encrypted, not hashed: the
+  // server has to read it back to address a message. Bound to the device that
+  // reported it, so a rotated token from another handset overwrites cleanly.
+  fcm_token_enc         String?
+  fcm_device_id         String?
+  fcm_platform          String?
+  fcm_token_updated_at  DateTime?
+  pin_login_used        Boolean   @default(false)
+  // Deletion lifecycle. The owner asks, the row is deactivated immediately, and
+  // the worker anonymises it once scheduled_at passes; reactivating clears both
+  // timestamps. deleted_at is stamped by the worker and is what makes the state
+  // final - status goes to 3 (DELETED) and the login identifiers are gone, so
+  // there is nothing left to sign in with. See
+  // src/controllers/account.controller.js.
+  deletion_requested_at DateTime?
+  deletion_scheduled_at DateTime?
+  // The user's own words for why. Free text they authored, so it is written
+  // through protectText() like walletTransaction.details - people put names and
+  // phone numbers in boxes like this.
+  deletion_reason       String?
+  deleted_at            DateTime?
+  created_at            DateTime  @default(now())
+  updated_at            DateTime  @updatedAt
 
-  password_resets  PasswordReset[]
-  verification_codes VerificationCode[]
-  activities       UserActivity[]
-  bill_hero_claims BillHeroClaim[]
-  staffpay_companies StaffPayCompany[]
+  password_resets               PasswordReset[]
+  verification_codes            VerificationCode[]
+  activities                    UserActivity[]
+  bill_hero_claims              BillHeroClaim[]
+  money_requests_sent           MoneyRequest[]               @relation("MoneyRequestSender")
+  money_requests_received       MoneyRequest[]               @relation("MoneyRequestReceiver")
+  support_tickets               SupportTicket[]
+  staffpay_companies            StaffPayCompany[]
   staffpay_funding_transactions StaffPayFundingTransaction[]
+  staffpay_subscriptions        StaffPaySubscription[]
+  kyc_verification              KycVerification?
 
   @@map("users")
 }
 
+/// Individual KYC, run through Payvessel. Two documents are stored, but only
+/// ONE is required: a verified BVN or a verified NIN, whichever the user holds.
+/// The BVN proves the person exists on the NIBSS banking register; the NIN
+/// proves NIMC holds them on the national register. Either identifies the human
+/// behind the wallet, and a NIN is reachable by people who have no bank account
+/// at all. The live predicate is `kycGate.rowIsVerified` - read it there, not
+/// from the column layout, which still carries two retired rules' worth of
+/// columns.
+///
+/// One row per user, holding both documents' state side by side. A re-attempt
+/// overwrites its own half of the row, so nobody accumulates competing
+/// applications. There is no `pending`: Payvessel answers inline.
+///
+/// Everything here is regulated identity data, so nothing is stored plain:
+/// AES-GCM ciphertext for every field we may have to produce for a CBN/NDPR
+/// request, plus a blind index on the BVN and on the NIN so neither can verify
+/// two accounts without the column ever holding the number.
+model KycVerification {
+  id      Int  @id @default(autoincrement())
+  user    User @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  user_id Int  @unique
+
+  // Nullable: a user who verified with their NIN has no BVN on file at all, and
+  // is never asked for one.
+  bvn_enc String?
+  // Nullable: only a verified BVN claims the unique index, so a failed attempt
+  // cannot lock the number out of the account that really owns it.
+  bvn_idx String? @unique
+
+  // Who the row says this person is.
+  //
+  // ALL NULLABLE, and they became so when the BVN moved from a match api to a
+  // lookup api on 2026-08-25. They used to be NOT NULL because the customer
+  // typed every one of them into a form that refused to submit half-filled. A
+  // BVN check no longer has a form: ArewaSmart returns the register's own record
+  // and these columns hold WHAT THE REGISTER SAID. The register does not always
+  // carry a date of birth, a gender or a phone, and a lookup the customer has
+  // already paid ₦60 for must not fail to write because one field was absent.
+  //
+  // So read a null here as "we were not told", never as "not checked". A row can
+  // be fully verified with an empty dob_enc. Anything that needs a complete set
+  // asks the user for it - see identityFromRow() in kyc.controller, which is
+  // what the NIN-slip route uses to decide whether to prefill or to ask.
+  first_name_enc  String?
+  middle_name_enc String?
+  last_name_enc   String?
+  phone_enc       String?
+  dob_enc         String?
+  // Not identifying on its own, and the admin queue filters on it.
+  gender          String?
+
+  // Our own audit id for the attempt.
+  reference      String  @unique
+  // Retired with the BudPay callback. The BVN provider answers inline, so no
+  // token is minted and nothing authenticates a callback that no longer exists.
+  // Kept only so old rows are readable; new submissions write null.
+  callback_token String? @unique
+  // none | verified | failed | revoked. There is no `pending`: the BVN lookup is
+  // synchronous, so a submission is decided before the request returns. Rows
+  // left `pending` by the BudPay era are rolled to `failed` in
+  // scripts/apply-kyc-ddl.js. `revoked` is written by an admin taking
+  // verification back off a live account.
+  status         String  @default("none")
+  decline_reason String?
+  // AUDIT ONLY, AND VALUE-FREE BY CONSTRUCTION.
+  //
+  // Under Payvessel this held the provider's field-by-field match labels, which
+  // were safe to store because they described the comparison rather than the
+  // person. ArewaSmart is a lookup api and hands back the person, so nothing
+  // from its response goes in here: the column now holds a provider name, the
+  // provider's transaction reference, booleans, token COUNTS and the fee. Never
+  // a name and never a fragment of one - `matchName().missing` in particular is
+  // pieces of a real name and must not be stored or logged.
+  bvn_match      Json?
+
+  // THE BANK ACCOUNT - the second half of verification, and required of
+  // everybody whichever identity route they took. Paystack resolves the number
+  // to the name the bank holds, and that name must match the profile;
+  // `account_status = 'verified'` is what records that it did.
+  //
+  // It was retired for a while and is back, so read kycGate.rowIsVerified rather
+  // than assuming either way. The rule there is an AND: an identity document
+  // (a matched BVN or an approved NIN slip) AND this. Note the direction - a
+  // resolved account is never a route in on its own, because /bank/resolve
+  // answers for ANY Nigerian account number and so proves who owns the account,
+  // never that the person asking is that owner. Second factor, never first.
+  // KYC_BANK_REQUIRED=0 switches the requirement off for a deployment that has
+  // verified users predating it; see bankRequired() before touching it.
+  account_number_enc     String?
+  account_number_idx     String?   @unique
+  account_name_enc       String?
+  // Not identifying on its own, and the admin queue reads them for support.
+  bank_code              String?
+  bank_name              String?
+  account_status         String    @default("none") // none | verified | failed
+  account_decline_reason String?
+  account_verified_at    DateTime?
+
+  // Set once, at the cutover to BVN-plus-account, on every row that held a
+  // verified BVN *or* a verified NIN. IGNORED - the gate does not read it.
+  //
+  // It was briefly merely redundant, back when the rule was BVN-or-NIN and this
+  // column marked exactly that set. It is not any more: now that only a verified
+  // BVN passes, this marks a strictly BROADER set than the gate does, and a
+  // grandfathered NIN-only row does NOT unlock a wallet. That set was empty when
+  // the rule changed (no row had ever been verified by NIN), so nothing was
+  // frozen - but do not resurrect this column as a shortcut on the assumption it
+  // still lines up with the gate. It does not.
+  //
+  // Kept as the historical record of who was marked, and deliberately left out
+  // of the decision: a boolean column that opens a money gate is a column worth
+  // not having.
+  grandfathered Boolean @default(false)
+
+  // NIN, WITHDRAWN. It was offered as an alternative to the BVN for a time;
+  // nothing writes these any more and `nin_status` is not part of the gate - see
+  // kycGate.rowIsVerified. A row holding a verified NIN and no verified BVN does
+  // not unlock a wallet.
+  //
+  // The columns stay for the same reason the account ones do: they hold identity
+  // records still inside their retention period and are the evidence of what was
+  // checked, and when. The unique index on nin_idx stays with them, so a NIN
+  // recorded under the old rule still cannot be claimed by a second account.
+  nin_enc            String?
+  nin_idx            String? @unique
+  nin_status         String  @default("none") // none | verified | failed
+  nin_decline_reason String?
+  nin_match          Json?
+
+  // NIN SLIP - the manual path, and NOT the withdrawn columns above.
+  //
+  // Those held the automated Payvessel NIN *number* check: synchronous, scored
+  // by a provider, and withdrawn. These hold a photograph of a NIN slip that a
+  // human being looks at. Two different trust models that happen to share the
+  // word NIN, so they get two different sets of columns - folding them together
+  // would make `nin_status = 'verified'`, which is documented above as NOT
+  // verifying anybody, indistinguishable from an approval that does.
+  //
+  // This one DOES open the gate: see kycGate.rowIsVerified. It exists for the
+  // customer who has no BVN at all and would otherwise be permanently stuck.
+  nin_slip_url_enc        String?
+  // The number read off the slip, for one-account-one-NIN. Unique and nullable
+  // for the same reason bvn_idx is: only an APPROVED slip claims the index, so a
+  // declined attempt cannot lock the number out of the person who really owns it.
+  nin_slip_number_enc     String?
+  nin_slip_number_idx     String?   @unique
+  // none | pending | approved | declined | revoked. `pending` is real here -
+  // unlike the BVN path, this one genuinely waits on a person. `revoked` is
+  // written by an admin taking an approval back; see the revocation columns
+  // below and adminKyc.revokeKyc.
+  nin_slip_status         String    @default("none")
+  nin_slip_decline_reason String?
+  nin_slip_reviewed_by    String?
+  nin_slip_reviewed_at    DateTime?
+  nin_slip_submitted_at   DateTime?
+  // The REVIEWER's register check, run against ArewaSmart /nin/verify while
+  // the slip is open. Not `nin_match` above: that one is the fossil of the
+  // withdrawn automated NIN-number check, and writing this into it would make a
+  // live verdict indistinguishable from a dead one on every screen that reads it.
+  //
+  // VERDICT ONLY - LABELS, NEVER THE REGISTER'S DATA. `{ checked_at, checked_by,
+  // provider, reference, found, name_ok, name_matched, name_expected, dob_ok,
+  // gender_ok, phone_ok, nin_last4 }`. The lookup returns a real person's name,
+  // date of birth and PHOTOGRAPH; none of that is written here. The reviewer sees
+  // it once, live, on an audited request, and it is gone when the request ends.
+  //
+  // It is kept for two reasons, both of which need it in the database and not in
+  // a browser: a second reviewer must not spend another ₦50 re-asking a question
+  // already answered, and reviewNinSlip refuses an APPROVAL that has no completed
+  // check behind it - a gate that only existed in the dashboard would not be one.
+  nin_slip_check          Json?
+
+  // REVOCATION - an admin taking verification back off an already-verified user.
+  //
+  // Verification is not permanent. A slip can turn out to be forged, a BVN can
+  // turn out to belong to someone whose profile has since changed hands, a
+  // fraud report can land a week later. The admin who can approve must also be
+  // able to withdraw, or the only remedy is blocking the whole account.
+  //
+  // A revoke writes the STATUS column back to 'revoked', so `rowIsVerified`
+  // needs no special case - there stays exactly one predicate for "can this
+  // wallet spend", and a revoked row simply fails it. These three columns are
+  // only the audit trail. They are deliberately not `decline_reason`: a decline
+  // is "we never let you in", a revoke is "we are taking it back", and writing
+  // the second over the first destroys the record of the first.
+  revoked_at    DateTime?
+  revoked_by    String?
+  revoke_reason String?
+
+  submitted_at    DateTime  @default(now())
+  verified_at     DateTime?
+  nin_verified_at DateTime?
+  created_at      DateTime  @default(now())
+  updated_at      DateTime  @updatedAt
+
+  @@index([status])
+  @@index([nin_status])
+  @@index([account_status])
+  // The admin review queue reads exactly this: pending slips, oldest first.
+  @@index([nin_slip_status, nin_slip_submitted_at])
+  @@map("kyc_verifications")
+}
+
 model FundingTransaction {
-  id                 Int      @id @default(autoincrement())
-  user_id            Int
-  tx_ref             String   @unique
-  flutterwave_tx_id  String?  @unique
-  amount             Decimal  @db.Decimal(15, 2)
-  currency           String   @default("NGN")
-  status             String   @default("pending")
-  raw_payload        Json?
-  credited_at        DateTime?
-  created_at         DateTime @default(now())
-  updated_at         DateTime @updatedAt
+  id                Int       @id @default(autoincrement())
+  user_id           Int
+  tx_ref            String    @unique
+  flutterwave_tx_id String?   @unique
+  amount            Decimal   @db.Decimal(15, 2)
+  currency          String    @default("NGN")
+  status            String    @default("pending")
+  raw_payload       Json?
+  credited_at       DateTime?
+  created_at        DateTime  @default(now())
+  updated_at        DateTime  @updatedAt
 
   @@map("funding_transactions")
 }
@@ -79,6 +337,16 @@ model WalletTransaction {
   updated_at   DateTime @updatedAt
 
   @@index([user_id, created_at])
+  // Platform-wide bill aggregates (adminBillChampions) filter on remark and
+  // trx_type with no user_id, so the index above cannot be opened for them.
+  // Built by scripts/apply-bill-champions-index-ddl.js - declared here so
+  // `prisma db push` does not drop an index it cannot see.
+  @@index([remark, trx_type, created_at])
+  // The AML scan (adminRisk.getAmlReport) filters on created_at alone. Neither
+  // index above leads with it, so an unconstrained leading column meant the
+  // report was a sequential scan of the largest table plus a sort - on every
+  // load of the compliance screen. Built by scripts/apply-aml-index-ddl.js.
+  @@index([created_at])
   @@map("wallet_transactions")
 }
 
@@ -120,24 +388,29 @@ model PushNotification {
 
   campaign NotificationCampaign? @relation(fields: [campaign_id], references: [id], onDelete: SetNull)
 
+  @@unique([user_id, client_message_id])
   @@index([user_id, created_at])
   @@index([campaign_id, created_at])
-  @@unique([user_id, client_message_id])
   @@map("push_notifications")
 }
 
 model NotificationCampaign {
-  id                Int      @id @default(autoincrement())
+  id                Int       @id @default(autoincrement())
   title             String
   message           String
-  notification_type String   @default("general")
+  notification_type String    @default("general")
   image             String?
   data              Json?
-  status            String   @default("draft")
-  recipient_count   Int      @default(0)
+  status            String    @default("draft")
+  // "all" | "topic" | "users". audience_value holds the topic name or the
+  // user id list; ids only, never a name or an email (ledger `meta` rule).
+  audience          String    @default("all")
+  audience_value    Json?
+  recipient_count   Int       @default(0)
+  push_sent_count   Int       @default(0)
   sent_at           DateTime?
-  created_at        DateTime @default(now())
-  updated_at        DateTime @updatedAt
+  created_at        DateTime  @default(now())
+  updated_at        DateTime  @updatedAt
 
   notifications PushNotification[]
 
@@ -188,12 +461,12 @@ model LanguageTranslation {
 }
 
 model AppSetting {
-  id           Int      @id @default(autoincrement())
-  setting_key  String   @unique
+  id            Int      @id @default(autoincrement())
+  setting_key   String   @unique
   setting_value String?
-  description  String?
-  created_at   DateTime @default(now())
-  updated_at   DateTime @updatedAt
+  description   String?
+  created_at    DateTime @default(now())
+  updated_at    DateTime @updatedAt
 
   @@map("app_settings")
 }
@@ -202,6 +475,11 @@ model PasswordReset {
   id         Int      @id @default(autoincrement())
   user_id    Int?
   email      String?
+  // Reset rows are looked up, never read back, so a blind index is enough -
+  // no ciphertext column needed. token_idx does the same for the OTP so a
+  // database read cannot hand out a live reset code.
+  email_idx  String?
+  token_idx  String?
   type       String   @default("pin")
   token      String
   expires_at DateTime
@@ -230,14 +508,14 @@ model VerificationCode {
 }
 
 model UserActivity {
-  id          Int      @id @default(autoincrement())
-  user_id     Int
-  event       String   @default("login")
-  ip          String?
-  device_id   String?
-  user_agent  String?
-  metadata    Json?
-  created_at  DateTime @default(now())
+  id         Int      @id @default(autoincrement())
+  user_id    Int
+  event      String   @default("login")
+  ip         String?
+  device_id  String?
+  user_agent String?
+  metadata   Json?
+  created_at DateTime @default(now())
 
   user User @relation(fields: [user_id], references: [id], onDelete: Cascade)
 
@@ -245,67 +523,296 @@ model UserActivity {
   @@map("user_activity")
 }
 
-model BillHeroClaim {
-  id          Int      @id @default(autoincrement())
-  user_id     Int
-  week_key    String
-  reward_type String
-  phone       String
-  network     String
-  status      String   @default("claimed")
-  provider    String   @default("clubkonnect")
-  provider_ref String?
-  provider_payload Json?
-  claimed_at  DateTime @default(now())
-  created_at  DateTime @default(now())
-  updated_at  DateTime @updatedAt
+/// One weekly Bill Hero challenge, authored by an admin.
+///
+/// `action_type` is what the user has to do, `reward_type` what they get - the
+/// two are separate columns so "buy airtime 10 times, get 1GB of data" is a
+/// challenge somebody can write without a code change.
+///
+/// `reward_value` is naira when `reward_type` is airtime and megabytes when it
+/// is data. One integer rather than two nullable ones: a reward is always
+/// exactly one of the two, and a nullable pair invites a row that is neither.
+model BillHeroChallenge {
+  id           Int       @id @default(autoincrement())
+  title        String
+  description  String?
+  /// airtime | data - the purchase that counts towards the target.
+  action_type  String
+  /// How many qualifying purchases in the week.
+  target       Int
+  /// airtime | data - the rail the reward is delivered on.
+  reward_type  String
+  /// Naira for an airtime reward, megabytes for a data one.
+  reward_value Int
+  active       Boolean   @default(true)
+  /// Optional run window. Null on either side means "no bound that way" - a
+  /// challenge with neither runs until somebody deactivates it.
+  starts_at    DateTime?
+  ends_at      DateTime?
+  sort_order   Int       @default(0)
+  created_at   DateTime  @default(now())
+  updated_at   DateTime  @updatedAt
 
-  user User @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  claims BillHeroClaim[]
 
-  @@unique([user_id, week_key, reward_type])
-  @@index([week_key, reward_type])
-  @@index([user_id, claimed_at])
-  @@map("bill_hero_claims")
+  @@index([active, sort_order])
+  @@map("bill_hero_challenges")
 }
 
-model StaffPayCompany {
+model BillHeroClaim {
   id               Int      @id @default(autoincrement())
-  owner_user_id    Int
-  name             String
-  address          String
-  cac_number       String?
-  phone            String
-  email            String
-  auto_pay_enabled Boolean  @default(true)
-  payout_time       String?
-  payout_timezone   String   @default("Africa/Lagos")
-  virtual_account_tx_ref     String?  @unique
-  virtual_account_number     String?
-  virtual_account_bank_name  String?
-  virtual_account_order_ref  String?
-  virtual_account_flw_ref    String?
-  virtual_account_expires_at DateTime?
-  low_balance_alert_enabled Boolean @default(true)
-  low_balance_threshold     Decimal @default(10000) @db.Decimal(15, 2)
+  user_id          Int
+  challenge_id     Int
+  week_key         String
+  reward_type      String
+  /// What this claim was actually worth, snapshotted at delivery. Read off the
+  /// row rather than off the challenge: an admin editing a reward must not
+  /// silently rewrite the value of everything already paid out.
+  reward_value     Int
+  /// The delivery number, AES-GCM ciphertext. Never looked up by, so there is
+  /// no blind index to go with it.
+  phone_enc        String
+  network          String
+  status           String   @default("claimed")
+  provider         String   @default("pairgate")
+  provider_ref     String?
+  provider_payload Json?
+  claimed_at       DateTime @default(now())
   created_at       DateTime @default(now())
   updated_at       DateTime @updatedAt
 
-  owner       User              @relation(fields: [owner_user_id], references: [id], onDelete: Cascade)
-  wallet      StaffPayWallet?
-  staff       StaffPayStaff[]
-  funding     StaffPayFundingTransaction[]
-  payrollRuns StaffPayPayrollRun[]
+  user      User              @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  challenge BillHeroChallenge @relation(fields: [challenge_id], references: [id], onDelete: Restrict)
+
+  @@unique([user_id, week_key, challenge_id])
+  @@index([week_key, reward_type])
+  @@index([user_id, claimed_at])
+  @@index([challenge_id, status])
+  @@map("bill_hero_claims")
+}
+
+/// "Pay me ₦X" from one VoltPay user to another. Nothing moves until the
+/// receiver confirms with their PIN, so this table is a request queue, never a
+/// ledger - the money itself is recorded in WalletTransaction at settlement.
+model MoneyRequest {
+  id             Int       @id @default(autoincrement())
+  /// The user asking to be paid.
+  sender_id      Int
+  /// The user being asked to pay.
+  receiver_id    Int
+  amount         Decimal   @db.Decimal(15, 2)
+  charge         Decimal   @default(0) @db.Decimal(15, 2)
+  /// Free text from the requester, so it goes through protectText() like
+  /// walletTransaction.details - it routinely names a person or an invoice.
+  note           String?
+  /// pending | paid | declined | expired | cancelled
+  status         String    @default("pending")
+  /// Optional reason supplied when declining. Same protectText() treatment.
+  decline_reason String?
+  /// A pending request stops being payable at this instant. Default is 24h
+  /// after creation; see REQUEST_TTL_HOURS.
+  expires_at     DateTime
+  /// Stamped when a reminder push has been sent, so the reminder job can never
+  /// nag the same person twice for one request.
+  reminded_at    DateTime?
+  paid_at        DateTime?
+  /// The transfer_ref shared by the two WalletTransaction rows that settled it.
+  trx            String?
+  created_at     DateTime  @default(now())
+  updated_at     DateTime  @updatedAt
+
+  sender   User @relation("MoneyRequestSender", fields: [sender_id], references: [id], onDelete: Cascade)
+  receiver User @relation("MoneyRequestReceiver", fields: [receiver_id], references: [id], onDelete: Cascade)
+
+  @@index([sender_id, created_at])
+  @@index([receiver_id, created_at])
+  @@index([status, expires_at])
+  @@map("money_requests")
+}
+
+/// One support conversation. The submission form asks for a name, an email and
+/// a phone number, so those get the same treatment as on User: AES-GCM
+/// ciphertext plus a keyed blind index, which is what admin search matches
+/// against. Subject and every message body are free text that routinely names a
+/// person or an account number, so they go through protectText() like
+/// walletTransaction.details.
+model SupportTicket {
+  id             Int       @id @default(autoincrement())
+  /// The reference shown to the user and quoted back in email: VP-SUP-YYYYMMDD-NNN.
+  ticket         String    @unique
+  /// Null only if the account is later deleted - the ticket outlives it.
+  user_id        Int?
+  name_enc       String?
+  name_idx       String?
+  email_enc      String?
+  email_idx      String?
+  phone_enc      String?
+  phone_idx      String?
+  subject        String
+  /// 1 low | 2 medium | 3 high
+  priority       Int       @default(1)
+  /// 0 open | 1 in progress | 2 resolved | 3 closed
+  status         Int       @default(0)
+  /// Bumped by every message. The list sorts on it and the auto-close job
+  /// measures inactivity from it.
+  last_reply     DateTime  @default(now())
+  resolved_at    DateTime?
+  closed_at      DateTime?
+  /// 1-5, left by the user once the ticket is resolved.
+  rating         Int?
+  rating_comment String?
+  created_at     DateTime  @default(now())
+  updated_at     DateTime  @updatedAt
+
+  user     User?                  @relation(fields: [user_id], references: [id], onDelete: SetNull)
+  messages SupportTicketMessage[]
+
+  @@index([status, last_reply])
+  @@index([user_id, created_at])
+  @@index([email_idx])
+  @@index([phone_idx])
+  @@index([name_idx])
+  @@map("support_tickets")
+}
+
+model SupportTicketMessage {
+  id          Int      @id @default(autoincrement())
+  ticket_id   Int
+  /// An admin reply carries a label, not an id: the dashboard authenticates
+  /// with a shared secret rather than a row in users.
+  is_admin    Boolean  @default(false)
+  admin_name  String?
+  /// Admin-only note. Never serialized for the app - see serializeMessage().
+  is_internal Boolean  @default(false)
+  message     String
+  /// UploadThing results, `[{ url, name, size }]`. The files live at
+  /// UploadThing; the row only remembers where.
+  attachments Json?
+  created_at  DateTime @default(now())
+
+  ticket SupportTicket @relation(fields: [ticket_id], references: [id], onDelete: Cascade)
+
+  @@index([ticket_id, created_at])
+  @@map("support_ticket_messages")
+}
+
+model StaffPayCompany {
+  id                         Int       @id @default(autoincrement())
+  owner_user_id              Int
+  // Business contact PII. Ciphertext + blind index, read back through
+  // helpers/staffpayPii.helper.js - never a plain column.
+  name_enc                   String
+  name_idx                   String?
+  address_enc                String
+  phone_enc                  String
+  phone_idx                  String?
+  email_enc                  String
+  email_idx                  String?
+  cac_number                 String?
+  auto_pay_enabled           Boolean   @default(true)
+  payout_time                String?
+  payout_timezone            String    @default("Africa/Lagos")
+  virtual_account_tx_ref     String?   @unique
+  virtual_account_number     String?
+  virtual_account_bank_name  String?
+  paystack_customer_code     String?
+  paystack_dva_id            String?
+  virtual_account_expires_at DateTime?
+  low_balance_alert_enabled  Boolean   @default(true)
+  low_balance_threshold      Decimal   @default(10000) @db.Decimal(15, 2)
+  created_at                 DateTime  @default(now())
+  updated_at                 DateTime  @updatedAt
+
+  owner         User                         @relation(fields: [owner_user_id], references: [id], onDelete: Cascade)
+  wallet        StaffPayWallet?
+  staff         StaffPayStaff[]
+  funding       StaffPayFundingTransaction[]
+  payrollRuns   StaffPayPayrollRun[]
+  verification  StaffPayVerification?
+  subscriptions StaffPaySubscription[]
 
   @@index([owner_user_id, created_at])
   @@map("staffpay_companies")
 }
 
+// KYB application. A business cannot run payroll until this is `approved` and
+// a subscription is active - see helpers/staffpayAccess.helper.js.
+//
+// Everything here is either the company's own contact PII or a link to a
+// government ID / CAC document, so nothing is stored plain. Contact fields use
+// the *_enc / *_idx pair (readable back for email + admin display, indexed
+// where we need lookup); document URLs go through protectText(), because an
+// UploadThing URL is a bearer token in practice - anyone holding the string can
+// fetch someone's NIN slip.
+model StaffPayVerification {
+  id                        Int       @id @default(autoincrement())
+  company_id                Int       @unique
+  trading_name_enc          String
+  trading_name_idx          String?
+  description               String
+  support_email_enc         String
+  support_email_idx         String?
+  support_phone_enc         String
+  support_phone_idx         String?
+  office_address_enc        String?
+  website_url               String?
+  industry                  String
+  business_category         String
+  staff_size                Int
+  gov_id_type               String
+  gov_id_url_enc            String
+  proof_of_address_url_enc  String?
+  cac_certificate_url_enc   String
+  cac_status_report_url_enc String?
+  status                    String    @default("pending")
+  admin_notes               String?
+  decline_reason            String?
+  reviewed_by               String?
+  reviewed_at               DateTime?
+  submitted_at              DateTime  @default(now())
+  created_at                DateTime  @default(now())
+  updated_at                DateTime  @updatedAt
+
+  company StaffPayCompany @relation(fields: [company_id], references: [id], onDelete: Cascade)
+
+  @@index([status, submitted_at])
+  @@map("staffpay_verifications")
+}
+
+// Yearly StaffPay access fee, collected through Paystack. Price is not stored
+// here as a constant - it is read from AppSetting `staffpay_subscription_price`
+// at initiate time so admin can change it, and the amount actually charged is
+// frozen onto the row.
+model StaffPaySubscription {
+  id          Int       @id @default(autoincrement())
+  company_id  Int
+  user_id     Int
+  reference   String    @unique
+  amount      Decimal   @db.Decimal(15, 2)
+  status      String    @default("pending")
+  starts_at   DateTime?
+  expires_at  DateTime?
+  paid_at     DateTime?
+  raw_payload Json?
+  created_at  DateTime  @default(now())
+  updated_at  DateTime  @updatedAt
+
+  company StaffPayCompany @relation(fields: [company_id], references: [id], onDelete: Cascade)
+  user    User            @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@index([company_id, status])
+  @@index([expires_at])
+  @@map("staffpay_subscriptions")
+}
+
 model StaffPayWallet {
-  id         Int      @id @default(autoincrement())
-  company_id Int      @unique
-  balance    Decimal  @default(0) @db.Decimal(15, 2)
-  created_at DateTime @default(now())
-  updated_at DateTime @updatedAt
+  id          Int      @id @default(autoincrement())
+  company_id  Int      @unique
+  balance     Decimal  @default(0) @db.Decimal(15, 2)
+  // Tamper evidence, same rationale as User.balance_mac. Keyed on company_id.
+  balance_mac String?
+  created_at  DateTime @default(now())
+  updated_at  DateTime @updatedAt
 
   company StaffPayCompany @relation(fields: [company_id], references: [id], onDelete: Cascade)
 
@@ -313,27 +820,37 @@ model StaffPayWallet {
 }
 
 model StaffPayStaff {
-  id                  Int      @id @default(autoincrement())
-  company_id           Int
-  full_name            String
-  phone                String
-  bank_code            String
-  bank_name            String?
-  bank_branch_code     String?
-  bank_branch_name     String?
-  account_number_enc   String
-  account_number_last4 String
-  account_name         String?
-  salary_amount        Decimal  @db.Decimal(15, 2)
-  frequency            String
-  payment_day          Int?
-  start_date           DateTime
-  last_paid_at         DateTime?
-  is_active            Boolean  @default(true)
-  created_at           DateTime @default(now())
-  updated_at           DateTime @updatedAt
+  id                      Int       @id @default(autoincrement())
+  company_id              Int
+  // Staff PII: name, phone and the resolved account name. The account number
+  // was already encrypted; these are the columns that sat beside it in clear.
+  full_name_enc           String
+  // Phone is no longer collected - the app asks for the staff member's role
+  // instead. Kept nullable so rows captured before the change keep theirs.
+  phone_enc               String?
+  phone_idx               String?
+  // Job title, e.g. "Class Teacher". Not identifying on its own, so it is a
+  // plain column - it is only ever shown next to the name in the staff list.
+  role                    String?
+  bank_code               String
+  bank_name               String?
+  bank_branch_code        String?
+  bank_branch_name        String?
+  account_number_enc      String
+  account_number_last4    String
+  account_name_enc        String?
+  // Paystack transfer recipient. Re-created whenever bank details change.
+  paystack_recipient_code String?
+  salary_amount           Decimal   @db.Decimal(15, 2)
+  frequency               String
+  payment_day             Int?
+  start_date              DateTime
+  last_paid_at            DateTime?
+  is_active               Boolean   @default(true)
+  created_at              DateTime  @default(now())
+  updated_at              DateTime  @updatedAt
 
-  company      StaffPayCompany     @relation(fields: [company_id], references: [id], onDelete: Cascade)
+  company      StaffPayCompany       @relation(fields: [company_id], references: [id], onDelete: Cascade)
   payrollItems StaffPayPayrollItem[]
 
   @@index([company_id, is_active])
@@ -341,67 +858,191 @@ model StaffPayStaff {
 }
 
 model StaffPayFundingTransaction {
-  id                Int      @id @default(autoincrement())
-  company_id         Int
-  user_id            Int
-  tx_ref             String   @unique
-  flutterwave_tx_id  String?  @unique
-  amount             Decimal  @db.Decimal(15, 2)
-  currency           String   @default("NGN")
-  status             String   @default("pending")
-  raw_payload        Json?
-  credited_at        DateTime?
-  created_at         DateTime @default(now())
-  updated_at         DateTime @updatedAt
+  id             Int       @id @default(autoincrement())
+  company_id     Int
+  user_id        Int
+  tx_ref         String    @unique
+  provider_tx_id String?   @unique
+  amount         Decimal   @db.Decimal(15, 2)
+  currency       String    @default("NGN")
+  status         String    @default("pending")
+  raw_payload    Json?
+  credited_at    DateTime?
+  created_at     DateTime  @default(now())
+  updated_at     DateTime  @updatedAt
 
   company StaffPayCompany @relation(fields: [company_id], references: [id], onDelete: Cascade)
   user    User            @relation(fields: [user_id], references: [id], onDelete: Cascade)
 
   @@index([company_id, created_at])
+  // Serves the AML scan: credited fundings inside a window, no company filter.
+  // Mirrors StaffPayPayrollItem's @@index([status, paid_at]) on the outbound
+  // side. Built by scripts/apply-aml-index-ddl.js.
+  @@index([status, credited_at])
   @@map("staffpay_funding_transactions")
 }
 
 model StaffPayPayrollRun {
-  id                   Int      @id @default(autoincrement())
-  company_id            Int
+  id                   Int       @id @default(autoincrement())
+  company_id           Int
   title                String
-  batch_id             Int?
-  status               String   @default("queued")
-  total_salary         Decimal  @db.Decimal(15, 2)
-  flutterwave_fee_total Decimal @default(0) @db.Decimal(15, 2)
-  voltpay_fee_total     Decimal @default(0) @db.Decimal(15, 2)
-  vat_total             Decimal @default(0) @db.Decimal(15, 2)
-  total_debit          Decimal  @db.Decimal(15, 2)
-  created_at           DateTime @default(now())
-  updated_at           DateTime @updatedAt
+  status               String    @default("queued")
+  // Who started it: "auto" is the scheduler at the company's payout time,
+  // "manual" is a person. Admin filters on this, and support needs to know
+  // whether a payout was a button press or a payday before they answer for it.
+  mode                 String    @default("manual")
+  triggered_by_user_id Int?
+  total_salary         Decimal   @db.Decimal(15, 2)
+  provider_fee_total   Decimal   @default(0) @db.Decimal(15, 2)
+  voltpay_fee_total    Decimal   @default(0) @db.Decimal(15, 2)
+  vat_total            Decimal   @default(0) @db.Decimal(15, 2)
+  total_debit          Decimal   @db.Decimal(15, 2)
+  // Automatic retry of failed transfers: how many unattended attempts this run
+  // has had, and when the next one is due. Both cleared once it settles.
+  auto_retry_count     Int       @default(0)
+  next_retry_at        DateTime?
+  created_at           DateTime  @default(now())
+  updated_at           DateTime  @updatedAt
 
-  company StaffPayCompany      @relation(fields: [company_id], references: [id], onDelete: Cascade)
+  company StaffPayCompany       @relation(fields: [company_id], references: [id], onDelete: Cascade)
   items   StaffPayPayrollItem[]
 
   @@index([company_id, created_at])
+  @@index([mode, created_at])
   @@map("staffpay_payroll_runs")
 }
 
 model StaffPayPayrollItem {
-  id                   Int      @id @default(autoincrement())
-  payroll_run_id        Int
+  id                   Int       @id @default(autoincrement())
+  payroll_run_id       Int
   staff_id             Int
-  amount               Decimal  @db.Decimal(15, 2)
-  flutterwave_fee      Decimal  @default(0) @db.Decimal(15, 2)
-  voltpay_fee           Decimal  @default(0) @db.Decimal(15, 2)
-  vat                  Decimal  @default(0) @db.Decimal(15, 2)
-  status               String   @default("NEW")
-  flutterwave_transfer_id Int?
-  reference            String?
+  amount               Decimal   @db.Decimal(15, 2)
+  provider_fee         Decimal   @default(0) @db.Decimal(15, 2)
+  voltpay_fee          Decimal   @default(0) @db.Decimal(15, 2)
+  vat                  Decimal   @default(0) @db.Decimal(15, 2)
+  status               String    @default("NEW")
+  // Paystack transfer_code (TRF_...). The reference is ours, generated per
+  // item so a webhook or a retry can find exactly one row.
+  provider_transfer_id String?
+  reference            String?   @unique
   complete_message     String?
+  // Set when a failed item's money is credited back. Guards double refunds when
+  // the webhook and the poller both see the same failure.
+  refunded_at          DateTime?
+  // When the salary actually landed. Stamped once, on the transition into
+  // SUCCESSFUL, and cleared if a retry puts the item back to NEW.
+  //
+  // Reporting must read this and never `updated_at`: `updated_at` is
+  // `@updatedAt`, so it moves every time the webhook, the sync poll or a
+  // stranded sweep touches the row. Bucketing a "staff paid per day" chart on
+  // it both files a payment under the wrong day and drags months-old payments
+  // into a recent window, because the window filter matches the touch and not
+  // the payment.
+  paid_at              DateTime?
+  // The salary cycle this item pays, as `due:YYYY-MM-DD` off the staff
+  // member's own due date. Unique per staff, so a second server instance - or
+  // a second press of Run Payroll Now - cannot insert a second item for the
+  // same payday: the insert loses on the unique index and the whole
+  // transaction, wallet reserve included, rolls back. Null for an off-cycle
+  // manual run (Pay All Staff), and Postgres treats those NULLs as distinct.
+  cycle_key            String?
   raw_payload          Json?
-  created_at           DateTime @default(now())
-  updated_at           DateTime @updatedAt
+  created_at           DateTime  @default(now())
+  updated_at           DateTime  @updatedAt
 
   payroll_run StaffPayPayrollRun @relation(fields: [payroll_run_id], references: [id], onDelete: Cascade)
   staff       StaffPayStaff      @relation(fields: [staff_id], references: [id], onDelete: Cascade)
 
+  @@unique([staff_id, cycle_key])
   @@index([payroll_run_id, status])
   @@index([staff_id, created_at])
+  // Serves the dashboard trend: successful items inside a date window.
+  @@index([status, paid_at])
   @@map("staffpay_payroll_items")
+}
+
+// One row per payment attempt the app stamped with X-Idempotency-Key.
+//
+// The unique index on key_idx is the guard: a retry after a timeout claims the
+// same row, loses, and is answered from response_body instead of charging
+// again. key_idx is a keyed digest of (user, endpoint, client key) - the raw
+// key is never stored. See src/middlewares/idempotency.middleware.js.
+model IdempotencyKey {
+  id              Int      @id @default(autoincrement())
+  key_idx         String   @unique
+  user_id         Int
+  endpoint        String
+  fingerprint     String
+  status          String   @default("in_flight")
+  response_status Int?
+  response_body   Json?
+  created_at      DateTime @default(now())
+  updated_at      DateTime @default(now()) @updatedAt
+
+  @@index([created_at])
+  @@index([user_id, created_at])
+  @@map("idempotency_keys")
+}
+
+// Admin actions, for disputes and investigations.
+//
+// Deliberately without a relation to User: an admin deleting a user must not
+// delete the record of having done it. The subject is a plain target_id, and
+// nothing here is ever a name, email or phone - see src/services/audit.service.js.
+model AdminAuditLog {
+  id          Int      @id @default(autoincrement())
+  actor       String   @default("admin")
+  action      String
+  method      String?
+  path        String?
+  target_type String?
+  target_id   String?
+  status_code Int?
+  ip          String?
+  user_agent  String?
+  metadata    Json?
+  created_at  DateTime @default(now())
+
+  @@index([created_at])
+  @@index([target_type, target_id])
+  @@map("admin_audit_log")
+}
+
+// Real admin accounts, replacing the ADMIN_API_KEYS env stopgap.
+//
+// Separate table from User on purpose: an admin is not a wallet holder, and a
+// shared table would mean one compromised customer row is one flag away from
+// being an admin. Nothing here relates to User either - an admin acting on an
+// account must not be deletable by deleting that account.
+//
+// `name` is a short handle (the audit trail's `actor`), not a legal name. The
+// identity is the email, and that is encrypted + blind-indexed like every other
+// address in this schema. `password` and `recovery_codes` are one-way hashes;
+// `totp_secret_enc` is encrypted because the next code cannot be checked
+// against a hash.
+model AdminUser {
+  id                   Int       @id @default(autoincrement())
+  name                 String
+  email_enc            String?
+  email_idx            String?   @unique
+  password             String
+  role                 String    @default("support")
+  status               Int       @default(1)
+  totp_secret_enc      String?
+  totp_enabled         Boolean   @default(false)
+  // Hashed single-use codes for a lost authenticator. Consumed on use.
+  recovery_codes       Json?
+  // Rotated on login and on logout, so one row revokes every issued token.
+  active_session_id    String?
+  // Forces a password change on first login after a superadmin creates or
+  // resets the account.
+  must_change_password Boolean   @default(false)
+  last_login_at        DateTime?
+  last_login_ip        String?
+  created_by           Int?
+  created_at           DateTime  @default(now())
+  updated_at           DateTime  @updatedAt
+
+  @@index([role, status])
+  @@map("admin_users")
 }

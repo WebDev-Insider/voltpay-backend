@@ -1,29 +1,117 @@
 const prisma = require('../../database/prisma');
 const { Prisma } = require('@prisma/client');
-const crypto = require('crypto');
-const bcrypt = require('bcryptjs');
+const { applyBalanceDelta, upsertBalanceDelta, restampBalance } = require('../helpers/balance.helper');
+const { revealUserFields, verifySecret } = require('../helpers/pii.helper');
 
 const {
-  listBanksCached,
-  listBankBranches,
+  listBanks,
   resolveAccount,
-  createPaymentLink,
-  createVirtualAccountNumber,
+  createTransferRecipient,
+  initializeTransaction,
   verifyTransaction,
+  verifyWebhookSignature,
+  createCustomer,
+  createDedicatedAccount,
   listTransactions,
-  createBulkTransfer,
-  getBulkTransfer,
-  getTransferFee,
-} = require('../funding/flutterwave.service');
+  getCustomerId,
+} = require('../funding/paystack.service');
+
+const {
+  createPayrollRunForCompany,
+  retryFailedItems,
+  syncPayrollRunById,
+  handleTransferEvent,
+  quotePayroll,
+  payoutTimeOrDefault,
+} = require('../services/staffpayPayroll.service');
 
 const { encryptString, decryptString } = require('../helpers/encryption.helper');
+const {
+  protectCompanyFields,
+  revealCompanyFields,
+  protectStaffFields,
+  revealStaffFields,
+  publicCompany,
+  publicStaff,
+  publicPayrollRun,
+} = require('../helpers/staffpayPii.helper');
 const { logStaffPayEvent } = require('../services/staffpayAudit.service');
+const { getAccessState } = require('../helpers/staffpayAccess.helper');
+const { nextDueAtUtc, listDueStaff } = require('../helpers/staffpayDue.helper');
 
 function normalizeAmountToDecimal(amount) {
   const cleaned = String(amount ?? '').replace(/,/g, '').trim();
   const n = Number(cleaned);
   if (!Number.isFinite(n) || n <= 0) return null;
   return new Prisma.Decimal(n.toFixed(2));
+}
+
+// Payday window from the spec: salaries land between the 25th and the 29th.
+const MIN_PAYMENT_DAY = 25;
+const MAX_PAYMENT_DAY = 29;
+const DEFAULT_PAYMENT_DAY = 25;
+
+function validatePaymentDay(day) {
+  if (day == null) return null;
+  if (!Number.isInteger(day) || day < MIN_PAYMENT_DAY || day > MAX_PAYMENT_DAY) {
+    return `payment_day must be between ${MIN_PAYMENT_DAY} and ${MAX_PAYMENT_DAY}`;
+  }
+  return null;
+}
+
+// Total monthly payroll (salaries + fees) against the wallet, as strings so the
+// app can render them without losing precision through JSON.
+async function payrollCoverage(companyId) {
+  const quote = await quotePayroll({ companyId });
+  return {
+    monthly_total: quote.totals.total.toFixed(2),
+    salary_total: quote.totals.salary.toFixed(2),
+    fee_total: quote.totals.provider.plus(quote.totals.volt).plus(quote.totals.vat).toFixed(2),
+    wallet_balance: quote.balance.toFixed(2),
+    shortfall: quote.shortfall.toFixed(2),
+    is_sufficient: quote.is_sufficient,
+    staff_count: quote.staff.length,
+  };
+}
+
+/**
+ * History is filtered by calendar month, and a Nigerian calendar month starts
+ * at 00:00 WAT (UTC+1, no DST). Building the bounds from plain UTC would put
+ * the first hour of the month in the previous one.
+ *
+ * `year` alone is allowed and means the whole year.
+ */
+function monthYearRange(month, year) {
+  const y = Number(year);
+  if (!Number.isInteger(y) || y < 2000 || y > 2100) return null;
+
+  const m = month === undefined || month === null || String(month).trim() === '' ? null : Number(month);
+  if (m !== null && (!Number.isInteger(m) || m < 1 || m > 12)) return null;
+
+  const startMonth = m === null ? 1 : m;
+  const start = new Date(`${y}-${String(startMonth).padStart(2, '0')}-01T00:00:00.000+01:00`);
+
+  const end = m === null
+    ? new Date(`${y + 1}-01-01T00:00:00.000+01:00`)
+    : new Date(m === 12
+      ? `${y + 1}-01-01T00:00:00.000+01:00`
+      : `${y}-${String(m + 1).padStart(2, '0')}-01T00:00:00.000+01:00`);
+
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return null;
+  return { gte: start, lt: end };
+}
+
+/** Wall-clock WAT for a human reading the export, not the UTC the row is stored in. */
+function watStamp(date) {
+  const d = date instanceof Date ? date : new Date(date);
+  if (Number.isNaN(d.getTime())) return '';
+  return new Date(d.getTime() + 60 * 60 * 1000).toISOString().replace('T', ' ').slice(0, 19);
+}
+
+/** RFC 4180 quoting. A staff name with a comma must not shift the columns. */
+function csvCell(value) {
+  const s = value == null ? '' : String(value);
+  return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
 
 function formatDateYmd(date) {
@@ -33,6 +121,78 @@ function formatDateYmd(date) {
   const m = String(d.getUTCMonth() + 1).padStart(2, '0');
   const day = String(d.getUTCDate()).padStart(2, '0');
   return `${y}-${m}-${day}`;
+}
+
+// The business timezone. StaffPay already reasons in it everywhere that matters
+// (payout_timezone, companyPayoutTimeReached), and the dashboard trend has to
+// agree or a chart bar disagrees with the payday it is describing.
+const TREND_TZ = 'Africa/Lagos';
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+// Length of the dashboard trend window, in days. The app labels this card
+// "Last N days" off the number of points it receives, so widening the window
+// here is the only change needed.
+const TREND_DAYS = 7;
+
+/**
+ * The calendar day a timestamp falls on *in Lagos*, as `YYYY-MM-DD`.
+ *
+ * A UTC bucket puts anything between 00:00 and 01:00 WAT on the previous day,
+ * so a wallet funded at half past midnight showed up on yesterday's bar. Uses
+ * `en-CA` because it formats as YYYY-MM-DD natively; falls back to the UTC day
+ * if Intl is unavailable, which is the old behaviour rather than a crash.
+ */
+function formatDateYmdInTz(date, timeZone = TREND_TZ) {
+  const d = date instanceof Date ? date : new Date(date);
+  if (Number.isNaN(d.getTime())) return null;
+  try {
+    return new Intl.DateTimeFormat('en-CA', {
+      timeZone,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).format(d);
+  } catch (_) {
+    return formatDateYmd(d);
+  }
+}
+
+/** How many minutes `timeZone` is ahead of UTC at this instant. +60 for WAT. */
+function tzOffsetMinutes(date, timeZone = TREND_TZ) {
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone,
+      hour12: false,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+    }).formatToParts(date).reduce((acc, p) => { acc[p.type] = p.value; return acc; }, {});
+    const asUtc = Date.UTC(
+      Number(parts.year),
+      Number(parts.month) - 1,
+      Number(parts.day),
+      Number(parts.hour) % 24,
+      Number(parts.minute),
+      Number(parts.second),
+    );
+    return Math.round((asUtc - date.getTime()) / 60000);
+  } catch (_) {
+    return 0;
+  }
+}
+
+/**
+ * The UTC instant of midnight in `timeZone` on the day containing `date`.
+ * Nigeria has no DST, so stepping whole days off this stays exact.
+ */
+function tzStartOfDayUtc(date, timeZone = TREND_TZ) {
+  const ymd = formatDateYmdInTz(date, timeZone);
+  if (!ymd) return null;
+  const [y, m, d] = ymd.split('-').map(Number);
+  return new Date(Date.UTC(y, m - 1, d) - (tzOffsetMinutes(date, timeZone) * 60000));
 }
 
 function staffPayVatRate() {
@@ -61,6 +221,79 @@ function computeVoltPayHybridFee(amountDecimal) {
   return fee;
 }
 
+/**
+ * Safety net for wallet funding: a webhook Paystack never delivered, or one we
+ * dropped. Walks recent successful charges for the company's Paystack customer
+ * and credits any that have no funding row yet.
+ *
+ * Credit is claimed by creating the row first - `provider_tx_id` is unique, so
+ * a duplicate throws P2002 and the balance is left alone. That is what makes
+ * this safe to run alongside the webhook.
+ */
+async function creditMissingCharges({ company, lookbackDays = 7, maxVerify = 30 }) {
+  const customerCode = String(company.paystack_customer_code || '').trim();
+  if (!customerCode) return { credited: 0, reason: 'no_dedicated_account' };
+
+  // `to` is tomorrow, not today: Paystack reads a bare date as midnight, so
+  // `to=<today>` excludes every payment made today - the exact window a user
+  // pulls to refresh in.
+  const to = formatDateYmd(new Date(Date.now() + 24 * 60 * 60 * 1000));
+  const from = formatDateYmd(new Date(Date.now() - lookbackDays * 24 * 60 * 60 * 1000));
+
+  let rows = [];
+  try {
+    const customerId = await getCustomerId(customerCode);
+    if (!customerId) return { credited: 0, reason: 'provider_unavailable' };
+    ({ data: rows } = await listTransactions({ status: 'success', from, to, customer: customerId, perPage: maxVerify }));
+  } catch (e) {
+    console.error('staffpay reconcile list error:', e?.message || e);
+    return { credited: 0, reason: 'provider_unavailable' };
+  }
+
+  let credited = 0;
+
+  for (const t of rows.slice(0, maxVerify)) {
+    const providerTxId = t?.id != null ? String(t.id) : '';
+    const amount = koboToDecimal(t?.amount);
+    if (!providerTxId || !amount) continue;
+    if (String(t?.currency || 'NGN').toUpperCase() !== 'NGN') continue;
+    // The provider-side filter is the only thing tying this charge to the
+    // company, so re-check it here rather than trust the query string.
+    if (String(t?.customer?.customer_code || '') !== customerCode) continue;
+    // Subscription fees ride the same customer. They are not wallet funding.
+    if (String(t?.reference || '').startsWith('SPSUB-')) continue;
+
+    const already = await withDirectFallback(db => db.staffPayFundingTransaction.findFirst({ where: { provider_tx_id: providerTxId } }));
+    if (already) continue;
+
+    try {
+      await withDirectFallback(db => db.$transaction(async tx => {
+        await tx.staffPayFundingTransaction.create({
+          data: {
+            company_id: Number(company.id),
+            user_id: Number(company.owner_user_id),
+            tx_ref: `spva_${company.id}_${providerTxId}`,
+            provider_tx_id: providerTxId,
+            amount,
+            currency: 'NGN',
+            status: 'successful',
+            raw_payload: t,
+            credited_at: new Date(),
+          },
+        });
+
+        await upsertBalanceDelta(tx, 'staffPayWallet', company.id, amount);
+      }, { timeout: 15000 }));
+
+      credited += 1;
+    } catch (e) {
+      if (e?.code !== 'P2002') console.error('staffpay reconcile credit error:', e?.message || e);
+    }
+  }
+
+  return { credited };
+}
+
 async function autoReconcileWalletFunding(req, res) {
   try {
     const ok = await requireModels(res);
@@ -70,158 +303,30 @@ async function autoReconcileWalletFunding(req, res) {
     if (!user) return res.status(401).json({ remark: 'unauthorized', status: 'error', message: ['Please login first'], data: null });
 
     const company_id = Number(req.body?.company_id || req.query?.company_id);
-    const lookbackDays = Math.max(1, Math.min(30, Number(req.body?.lookback_days || process.env.STAFFPAY_RECONCILE_LOOKBACK_DAYS || 14)));
+    const lookbackDays = Math.max(1, Math.min(30, Number(req.body?.days || req.query?.days || 7)));
 
     let company;
     if (company_id) {
       company = await getOwnedCompanyOrFail({ userId: user.id, companyId: company_id, res });
       if (!company) return;
     } else {
-      const companies = await withDirectFallback(db => db.staffPayCompany.findMany({
+      company = await prisma.staffPayCompany.findFirst({
         where: { owner_user_id: Number(user.id) },
-        include: { wallet: true },
         orderBy: { id: 'asc' },
-      }));
-
-      if (!companies || !Array.isArray(companies) || !companies.length) {
+      });
+      if (!company) {
         return res.status(404).json({ remark: 'not_found', status: 'error', message: ['Company not found'], data: null });
       }
-
-      let selected = companies[0];
-      let best = new Prisma.Decimal(selected?.wallet?.balance || '0');
-      for (const c of companies) {
-        const bal = new Prisma.Decimal(c?.wallet?.balance || '0');
-        if (bal.gt(best)) {
-          best = bal;
-          selected = c;
-        }
-      }
-      company = selected;
     }
 
-    const vaTxRef = String(company.virtual_account_tx_ref || '').trim();
-    const vaNumber = String(company.virtual_account_number || '').replace(/\D/g, '');
-    if (!vaTxRef && !vaNumber) {
-      const wallet = await withDirectFallback(db => db.staffPayWallet.findUnique({ where: { company_id: Number(company.id) } }));
-      return res.json({ remark: 'staffpay_wallet_auto_reconcile', status: 'success', message: ['No virtual account configured'], data: { wallet, credited_count: 0 } });
-    }
-
-    const now = new Date();
-    const fromDate = new Date(Date.now() - (lookbackDays * 24 * 60 * 60 * 1000));
-    const from = formatDateYmd(fromDate);
-    const to = formatDateYmd(now);
-
-    const maxPages = Math.max(1, Math.min(10, Number(process.env.STAFFPAY_RECONCILE_MAX_PAGES || 5)));
-    const maxVerify = Math.max(5, Math.min(200, Number(process.env.STAFFPAY_RECONCILE_MAX_VERIFY || 30)));
-
-    let txList = [];
-    try {
-      if (vaTxRef) {
-        const { data } = await listTransactions({ status: 'successful', tx_ref: vaTxRef, from, to, page: 1 });
-        txList = Array.isArray(data) ? data : [];
-      }
-    } catch (_) {
-      txList = [];
-    }
-
-    if (!txList.length) {
-      const collected = [];
-      for (let page = 1; page <= maxPages; page++) {
-        try {
-          const { data } = await listTransactions({ status: 'successful', from, to, page });
-          const pageRows = Array.isArray(data) ? data : [];
-          if (!pageRows.length) break;
-          collected.push(...pageRows);
-        } catch (_) {
-          break;
-        }
-      }
-      txList = collected;
-    }
-
-    const credited = [];
-    const candidates = Array.isArray(txList) ? txList : [];
-
-    for (const t of candidates.slice(0, maxVerify)) {
-      const tid = t?.id != null ? String(t.id).trim() : '';
-      if (!tid) continue;
-
-      const summaryTxRef = String(t?.tx_ref || t?.txRef || t?.reference || '').trim();
-      if (vaTxRef && summaryTxRef && summaryTxRef !== vaTxRef) {
-        continue;
-      }
-
-      const existing = await withDirectFallback(db => db.staffPayFundingTransaction.findFirst({ where: { flutterwave_tx_id: tid } }));
-      if (existing) continue;
-
-      let verified;
-      try {
-        verified = await verifyTransaction(tid);
-      } catch {
-        continue;
-      }
-
-      const data = verified?.data || {};
-      const status = String(data?.status || '').toLowerCase();
-      const currency = String(data?.currency || '').toUpperCase();
-      const paymentType = String(data?.payment_type || '').toLowerCase();
-      const txRef = String(data?.tx_ref || data?.txRef || data?.reference || '').trim();
-      const flwRef = String(data?.flw_ref || data?.flwRef || '').trim();
-      const orderRef = String(data?.order_ref || data?.orderRef || '').trim();
-      const amount = toDecimalOrNull(data?.amount) || toDecimalOrNull(data?.charged_amount);
-      const acct = String(data?.account_number || data?.account || '').replace(/\D/g, '');
-
-      const isBankTransfer = paymentType === 'bank_transfer' || paymentType === 'account' || paymentType === 'banktransfer';
-      if (status !== 'successful' || currency !== 'NGN' || !isBankTransfer || !amount) continue;
-
-      const matchesCompany =
-        (vaTxRef && txRef && txRef === vaTxRef) ||
-        (flwRef && company.virtual_account_flw_ref && flwRef === String(company.virtual_account_flw_ref)) ||
-        (orderRef && company.virtual_account_order_ref && orderRef === String(company.virtual_account_order_ref)) ||
-        (vaNumber && acct && acct === vaNumber);
-
-      if (!matchesCompany) continue;
-
-      const internalTxRef = `spva_${company.id}_${tid}`;
-      const creditedAt = new Date();
-
-      try {
-        await withDirectFallback(db => db.$transaction(async tx => {
-          await tx.staffPayFundingTransaction.create({
-            data: {
-              company_id: Number(company.id),
-              user_id: Number(company.owner_user_id),
-              tx_ref: internalTxRef,
-              flutterwave_tx_id: tid,
-              amount,
-              currency: 'NGN',
-              status: 'successful',
-              raw_payload: verified?.raw || t,
-              credited_at: creditedAt,
-            },
-          });
-
-          await tx.staffPayWallet.upsert({
-            where: { company_id: Number(company.id) },
-            update: { balance: { increment: amount } },
-            create: { company_id: Number(company.id), balance: amount },
-          });
-        }, { timeout: 15000 }));
-
-        credited.push(tid);
-      } catch (e) {
-        if (e?.code !== 'P2002') {
-          console.error('staffpay autoReconcileWalletFunding credit error:', e);
-        }
-      }
-    }
-
+    const { credited, reason } = await creditMissingCharges({ company, lookbackDays });
     const wallet = await withDirectFallback(db => db.staffPayWallet.findUnique({ where: { company_id: Number(company.id) } }));
+
     return res.json({
       remark: 'staffpay_wallet_auto_reconcile',
       status: 'success',
-      message: ['OK'],
-      data: { wallet, credited_count: credited.length },
+      message: [reason === 'no_dedicated_account' ? 'No dedicated account configured' : 'OK'],
+      data: { wallet, credited_count: credited },
     });
   } catch (e) {
     console.error('staffpay autoReconcileWalletFunding error:', e);
@@ -229,6 +334,7 @@ async function autoReconcileWalletFunding(req, res) {
     return res.status(status).json({ remark: 'error', status: 'error', message: [e?.message || 'Failed'], data: null });
   }
 }
+
 
 async function listFundingHistory(req, res) {
   try {
@@ -253,6 +359,14 @@ async function listFundingHistory(req, res) {
       company_id: Number(company.id),
     };
 
+    if (req.query?.year) {
+      const range = monthYearRange(req.query?.month, req.query?.year);
+      if (!range) {
+        return res.status(400).json({ remark: 'validation_error', status: 'error', message: ['Invalid month or year'], data: null });
+      }
+      where.created_at = range;
+    }
+
     if (status !== 'all') {
       where.status = status;
     }
@@ -272,7 +386,7 @@ async function listFundingHistory(req, res) {
         select: {
           id: true,
           tx_ref: true,
-          flutterwave_tx_id: true,
+          provider_tx_id: true,
           amount: true,
           status: true,
           created_at: true,
@@ -285,6 +399,8 @@ async function listFundingHistory(req, res) {
 
     const hasNext = page * pageSize < (total || 0);
     const nextPageUrl = hasNext ? `page=${page + 1}` : null;
+
+    const companyName = revealCompanyFields(company).name;
 
     const items = (rows || []).map(r => {
       const txRef = String(r.tx_ref || '').trim();
@@ -313,9 +429,9 @@ async function listFundingHistory(req, res) {
         meta: {
           company_id: Number(company.id),
           source: src,
-          flutterwave_tx_id: r.flutterwave_tx_id ? String(r.flutterwave_tx_id) : null,
+          provider_tx_id: r.provider_tx_id ? String(r.provider_tx_id) : null,
         },
-        details: company.name,
+        details: companyName,
         created_at: createdAt,
         created_at_diff: null,
       };
@@ -366,6 +482,14 @@ async function listPayoutHistory(req, res) {
       payroll_run: { is: { company_id: Number(company.id) } },
     };
 
+    if (req.query?.year) {
+      const range = monthYearRange(req.query?.month, req.query?.year);
+      if (!range) {
+        return res.status(400).json({ remark: 'validation_error', status: 'error', message: ['Invalid month or year'], data: null });
+      }
+      where.created_at = range;
+    }
+
     if (status === 'successful') {
       where.status = { in: successStatuses };
     } else if (status === 'failed') {
@@ -398,21 +522,21 @@ async function listPayoutHistory(req, res) {
 
       const createdAt = (r.updated_at || r.created_at || new Date()).toISOString();
 
-      const staffName = String(r.staff?.full_name || '').trim() || 'Staff';
+      const staffName = String(revealStaffFields(r.staff).full_name || '').trim() || 'Staff';
       const bankName = String(r.staff?.bank_name || '').trim();
       const acctLast4 = String(r.staff?.account_number_last4 || '').trim();
       const subtitle = `${bankName || 'Bank'}${acctLast4 ? ` • ****${acctLast4}` : ''}`;
 
       const amount = r.amount != null ? r.amount.toString() : '0';
-      const flwFee = r.flutterwave_fee != null ? r.flutterwave_fee.toString() : '0';
+      const providerFee = r.provider_fee != null ? r.provider_fee.toString() : '0';
       const vpFee = r.voltpay_fee != null ? r.voltpay_fee.toString() : '0';
       const vatFee = r.vat != null ? r.vat.toString() : '0';
 
       const feeTotal = (() => {
         try {
-          return new Prisma.Decimal(flwFee).plus(new Prisma.Decimal(vpFee)).plus(new Prisma.Decimal(vatFee)).toFixed(2);
+          return new Prisma.Decimal(providerFee).plus(new Prisma.Decimal(vpFee)).plus(new Prisma.Decimal(vatFee)).toFixed(2);
         } catch {
-          return flwFee;
+          return providerFee;
         }
       })();
       const totalDebit = (() => {
@@ -444,10 +568,10 @@ async function listPayoutHistory(req, res) {
           company_id: Number(company.id),
           payroll_run_id: Number(r.payroll_run_id),
           staff_id: Number(r.staff_id),
-          flutterwave_transfer_id: r.flutterwave_transfer_id != null ? Number(r.flutterwave_transfer_id) : null,
+          provider_transfer_id: r.provider_transfer_id || null,
           status: st,
           fee_breakdown: {
-            flutterwave_fee: flwFee,
+            provider_fee: providerFee,
             voltpay_fee: vpFee,
             vat: vatFee,
             total_fee: feeTotal,
@@ -478,6 +602,88 @@ async function listPayoutHistory(req, res) {
   }
 }
 
+/**
+ * CSV of the payout history for one month (or a whole year). Same columns the
+ * history screen shows: Date, Staff Name, Amount, Status, Reference.
+ *
+ * Defaults to base64 in the usual envelope because the Flutter ApiService only
+ * parses JSON; `format=file` returns the raw file for the admin dashboard.
+ */
+async function exportPayoutHistory(req, res) {
+  try {
+    const ok = await requireModels(res);
+    if (!ok) return;
+
+    const user = req.user;
+    if (!user) return res.status(401).json({ remark: 'unauthorized', status: 'error', message: ['Please login first'], data: null });
+
+    const company_id = Number(req.query?.company_id);
+    if (!company_id) return res.status(400).json({ remark: 'validation_error', status: 'error', message: ['company_id is required'], data: null });
+
+    const company = await getOwnedCompanyOrFail({ userId: user.id, companyId: company_id, res });
+    if (!company) return;
+
+    const where = { payroll_run: { is: { company_id: Number(company.id) } } };
+
+    let label = 'all';
+    if (req.query?.year) {
+      const range = monthYearRange(req.query?.month, req.query?.year);
+      if (!range) {
+        return res.status(400).json({ remark: 'validation_error', status: 'error', message: ['Invalid month or year'], data: null });
+      }
+      where.created_at = range;
+      label = req.query?.month
+        ? `${req.query.year}-${String(Number(req.query.month)).padStart(2, '0')}`
+        : String(req.query.year);
+    }
+
+    // A month of payroll is tens of rows; the cap only stops an unbounded
+    // "all time" export from paging the whole table into memory.
+    const rows = await prisma.staffPayPayrollItem.findMany({
+      where,
+      orderBy: [{ created_at: 'desc' }, { id: 'desc' }],
+      take: 5000,
+      include: { staff: true },
+    });
+
+    const lines = [['Date', 'Staff Name', 'Amount', 'Status', 'Reference'].join(',')];
+    for (const r of rows) {
+      lines.push([
+        watStamp(r.created_at),
+        String(revealStaffFields(r.staff).full_name || '').trim() || 'Staff',
+        r.amount != null ? r.amount.toString() : '0',
+        String(r.status || '').toUpperCase(),
+        String(r.reference || ''),
+      ].map(csvCell).join(','));
+    }
+
+    const csv = `${lines.join('\r\n')}\r\n`;
+    const filename = `staffpay-payouts-${company.id}-${label}.csv`;
+
+    if (String(req.query?.format || '').toLowerCase() === 'file') {
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+      return res.send(csv);
+    }
+
+    return res.json({
+      remark: 'staffpay_payout_export',
+      status: 'success',
+      message: ['OK'],
+      data: {
+        filename,
+        count: rows.length,
+        mime: 'text/csv',
+        csv: Buffer.from(csv, 'utf8').toString('base64'),
+      },
+    });
+  } catch (e) {
+    console.error('staffpay exportPayoutHistory error:', e);
+    return res.status(500).json({ remark: 'error', status: 'error', message: [e?.message || 'Failed'], data: null });
+  }
+}
+
+/** Manual version of the same sweep, for support to run against one company. */
 async function reconcileWalletFunding(req, res) {
   try {
     const ok = await requireModels(res);
@@ -487,92 +693,30 @@ async function reconcileWalletFunding(req, res) {
     if (!user) return res.status(401).json({ remark: 'unauthorized', status: 'error', message: ['Please login first'], data: null });
 
     const company_id = Number(req.body?.company_id);
-    const transaction_id = String(req.body?.transaction_id || req.body?.id || '').trim();
-    if (!company_id || !transaction_id) {
-      return res.status(400).json({ remark: 'validation_error', status: 'error', message: ['company_id and transaction_id are required'], data: null });
+    if (!company_id) {
+      return res.status(400).json({ remark: 'validation_error', status: 'error', message: ['company_id is required'], data: null });
     }
 
     const company = await getOwnedCompanyOrFail({ userId: user.id, companyId: company_id, res });
     if (!company) return;
 
-    const { raw, data } = await verifyTransaction(transaction_id);
-
-    const status = String(data?.status || '').toLowerCase();
-    const currency = String(data?.currency || '').toUpperCase();
-    const paymentType = String(data?.payment_type || '').toLowerCase();
-    const txRef = String(data?.tx_ref || data?.txRef || data?.reference || '').trim();
-    const flwRef = String(data?.flw_ref || data?.flwRef || '').trim();
-    const orderRef = String(data?.order_ref || data?.orderRef || '').trim();
-    const flwTxId = data?.id != null ? String(data.id).trim() : transaction_id;
-    const amount = toDecimalOrNull(data?.amount) || toDecimalOrNull(data?.charged_amount);
-
-    if (status !== 'successful' || currency !== 'NGN' || !amount) {
-      return res.status(400).json({ remark: 'payment_not_successful', status: 'error', message: ['Payment not successful'], data: null });
-    }
-
-    const isBankTransfer = paymentType === 'bank_transfer' || paymentType === 'account' || paymentType === 'banktransfer';
-    if (!isBankTransfer) {
-      return res.status(400).json({ remark: 'invalid_payment_type', status: 'error', message: ['Payment type is not bank transfer'], data: null });
-    }
-
-    const acct = String(data?.account_number || data?.account || '').replace(/\D/g, '');
-
-    const matchesCompany =
-      (txRef && company.virtual_account_tx_ref && txRef === company.virtual_account_tx_ref) ||
-      (flwRef && company.virtual_account_flw_ref && flwRef === company.virtual_account_flw_ref) ||
-      (orderRef && company.virtual_account_order_ref && orderRef === company.virtual_account_order_ref) ||
-      (acct && company.virtual_account_number && acct === String(company.virtual_account_number).replace(/\D/g, ''));
-
-    if (!matchesCompany) {
-      return res.status(400).json({
-        remark: 'mismatch',
-        status: 'error',
-        message: ['This transaction does not match the StaffPay virtual account for this company'],
-        data: { tx_ref: txRef || null, flw_ref: flwRef || null, order_ref: orderRef || null, account_number: acct || null },
-      });
-    }
-
-    const internalTxRef = `spva_${company.id}_${flwTxId}`;
-    const creditedAt = new Date();
-
-    try {
-      await withDirectFallback(db => db.$transaction(async tx => {
-        await tx.staffPayFundingTransaction.create({
-          data: {
-            company_id: Number(company.id),
-            user_id: Number(company.owner_user_id),
-            tx_ref: internalTxRef,
-            flutterwave_tx_id: flwTxId,
-            amount,
-            currency: 'NGN',
-            status: 'successful',
-            raw_payload: raw,
-            credited_at: creditedAt,
-          },
-        });
-
-        await tx.staffPayWallet.upsert({
-          where: { company_id: Number(company.id) },
-          update: { balance: { increment: amount } },
-          create: { company_id: Number(company.id), balance: amount },
-        });
-      }, { timeout: 15000 }));
-    } catch (e) {
-      if (e?.code !== 'P2002') {
-        console.error('staffpay reconcileWalletFunding credit error:', e);
-        const statusCode = Number(e?.statusCode) || 500;
-        return res.status(statusCode).json({ remark: 'error', status: 'error', message: [e?.message || 'Failed'], data: null });
-      }
-    }
-
+    const lookbackDays = Math.max(1, Math.min(30, Number(req.body?.days || 7)));
+    const { credited, reason } = await creditMissingCharges({ company, lookbackDays });
     const wallet = await withDirectFallback(db => db.staffPayWallet.findUnique({ where: { company_id: Number(company.id) } }));
-    return res.json({ remark: 'staffpay_wallet_reconciled', status: 'success', message: ['OK'], data: { wallet } });
+
+    return res.json({
+      remark: 'staffpay_wallet_reconciled',
+      status: 'success',
+      message: [reason === 'no_dedicated_account' ? 'No dedicated account configured' : 'OK'],
+      data: { wallet, credited_count: credited },
+    });
   } catch (e) {
     console.error('staffpay reconcileWalletFunding error:', e);
     const status = Number(e?.statusCode) || 500;
     return res.status(status).json({ remark: 'error', status: 'error', message: [e?.message || 'Failed'], data: null });
   }
 }
+
 
 function toDecimalOrNull(value) {
   if (value == null) return null;
@@ -581,6 +725,13 @@ function toDecimalOrNull(value) {
   } catch {
     return null;
   }
+}
+
+// Paystack talks in kobo. Everything below this line is naira.
+function koboToDecimal(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return new Prisma.Decimal((n / 100).toFixed(2));
 }
 
 function isAccelerateCommError(e) {
@@ -610,31 +761,6 @@ function safeLast4(accountNumber) {
   const digits = String(accountNumber || '').replace(/\D/g, '');
   if (!digits) return '';
   return digits.slice(-4);
-}
-
-function getFlutterwaveSecretHash() {
-  const v = String(process.env.FLUTTERWAVE_SECRET_HASH || process.env.FLUTTERWAVE_WEBHOOK_HASH || process.env.FLW_SECRET_HASH || '').trim();
-  return v || null;
-}
-
-function isValidFlutterwaveWebhook({ rawBody, headers }) {
-  if (!rawBody) return false;
-  const secretHash = getFlutterwaveSecretHash();
-  if (!secretHash) return false;
-
-  const verifHash = String(headers?.['verif-hash'] || headers?.['Verif-Hash'] || '').trim();
-  if (verifHash) {
-    return verifHash === secretHash;
-  }
-
-  const sig = String(headers?.['flutterwave-signature'] || headers?.['Flutterwave-Signature'] || headers?.['x-flutterwave-signature'] || '').trim();
-  if (!sig) return false;
-
-  const computedBase64 = crypto.createHmac('sha256', secretHash).update(rawBody).digest('base64');
-  if (computedBase64 === sig) return true;
-
-  const computedHex = crypto.createHmac('sha256', secretHash).update(rawBody).digest('hex');
-  return computedHex === sig;
 }
 
 async function requireModels(res) {
@@ -681,47 +807,18 @@ async function banks(req, res) {
     const user = req.user;
     if (!user) return res.status(401).json({ remark: 'unauthorized', status: 'error', message: ['Please login first'], data: null });
 
-    const country = String(req.query?.country || 'NG').trim().toUpperCase() || 'NG';
-    const rows = await listBanksCached({ country });
+    const rows = await listBanks({ currency: 'NGN' });
 
     const banks = (rows || []).map(b => ({
       id: b?.id ?? null,
-      name: b?.name ?? b?.bank_name ?? b?.bankName ?? '',
-      code: String(b?.code ?? b?.bank_code ?? b?.bankCode ?? '').trim(),
+      name: b?.name ?? '',
+      code: String(b?.code ?? '').trim(),
     }));
 
     return res.json({ remark: 'staffpay_bank_list', status: 'success', message: ['OK'], data: { banks } });
   } catch (e) {
     console.error('staffpay banks error:', e);
     return res.status(500).json({ remark: 'error', status: 'error', message: [e?.message || 'Failed'], data: null });
-  }
-}
-
-async function bankBranches(req, res) {
-  try {
-    const ok = await requireModels(res);
-    if (!ok) return;
-
-    const user = req.user;
-    if (!user) return res.status(401).json({ remark: 'unauthorized', status: 'error', message: ['Please login first'], data: null });
-
-    const bankId = String(req.params?.bankId || '').trim();
-    if (!bankId) {
-      return res.status(400).json({ remark: 'validation_error', status: 'error', message: ['bankId is required'], data: null });
-    }
-
-    const rows = await listBankBranches({ bank_id: bankId });
-    const branches = (rows || []).map(b => ({
-      id: b?.id ?? null,
-      branch_code: String(b?.branch_code ?? b?.branchCode ?? b?.code ?? '').trim(),
-      branch_name: b?.branch_name ?? b?.branchName ?? b?.name ?? '',
-    }));
-
-    return res.json({ remark: 'staffpay_bank_branch_list', status: 'success', message: ['OK'], data: { branches } });
-  } catch (e) {
-    console.error('staffpay bankBranches error:', e);
-    const status = Number(e?.statusCode) || 500;
-    return res.status(status).json({ remark: 'error', status: 'error', message: [e?.message || 'Failed'], data: null });
   }
 }
 
@@ -739,7 +836,7 @@ async function resolveBankAccount(req, res) {
       return res.status(400).json({ remark: 'validation_error', status: 'error', message: ['account_number and bank_code are required'], data: null });
     }
 
-    const { data } = await resolveAccount({ account_number, account_bank: bank_code });
+    const { data } = await resolveAccount({ account_number, bank_code });
 
     return res.json({
       remark: 'staffpay_account_resolved',
@@ -748,7 +845,7 @@ async function resolveBankAccount(req, res) {
       data: {
         account_number,
         bank_code,
-        account_name: data?.account_name || data?.accountName || null,
+        account_name: data?.account_name || null,
       },
     });
   } catch (e) {
@@ -789,12 +886,13 @@ async function createCompany(req, res) {
     const created = await prisma.staffPayCompany.create({
       data: {
         owner_user_id: Number(user.id),
-        name,
-        address,
+        ...protectCompanyFields({ name, address, phone, email }),
         cac_number,
-        phone,
-        email,
         auto_pay_enabled: true,
+        // Automatic payroll is not optional, so a new company starts on the
+        // platform default schedule instead of an unset one.
+        payout_time: payoutTimeOrDefault(null),
+        payout_timezone: 'Africa/Lagos',
         wallet: {
           create: {
             balance: new Prisma.Decimal('0.00'),
@@ -810,7 +908,7 @@ async function createCompany(req, res) {
       metadata: { company_id: created.id },
     });
 
-    return res.json({ remark: 'staffpay_company_created', status: 'success', message: ['Company created'], data: { company: created } });
+    return res.json({ remark: 'staffpay_company_created', status: 'success', message: ['Company created'], data: { company: publicCompany(created) } });
   } catch (e) {
     console.error('staffpay createCompany error:', e);
     return res.status(500).json({ remark: 'error', status: 'error', message: [e?.message || 'Failed'], data: null });
@@ -837,7 +935,7 @@ async function listCompanies(req, res) {
       message: ['OK'],
       data: {
         companies: companies.map(c => ({
-          ...c,
+          ...publicCompany(c),
           staff_count: c?._count?.staff ?? 0,
         })),
       },
@@ -859,7 +957,7 @@ async function getCompany(req, res) {
     const company = await getOwnedCompanyOrFail({ userId: user.id, companyId: req.params?.companyId, res });
     if (!company) return;
 
-    return res.json({ remark: 'staffpay_company', status: 'success', message: ['OK'], data: { company } });
+    return res.json({ remark: 'staffpay_company', status: 'success', message: ['OK'], data: { company: publicCompany(company) } });
   } catch (e) {
     console.error('staffpay getCompany error:', e);
     return res.status(500).json({ remark: 'error', status: 'error', message: [e?.message || 'Failed'], data: null });
@@ -883,38 +981,29 @@ async function updateCompany(req, res) {
     const cac_number = req.body?.cac_number != null ? String(req.body.cac_number).trim() : undefined;
     const phone = req.body?.phone != null ? String(req.body.phone).trim() : undefined;
     const email = req.body?.email != null ? String(req.body.email).trim() : undefined;
-    let auto_pay_enabled = undefined;
-    if (req.body?.auto_pay_enabled != null) {
-      const v = req.body.auto_pay_enabled;
-      let parsed = null;
-      if (typeof v === 'boolean') parsed = v;
-      else if (typeof v === 'number') parsed = v === 1;
-      else {
-        const s = String(v).trim().toLowerCase();
-        if (s === 'true' || s === '1' || s === 'yes') parsed = true;
-        else if (s === 'false' || s === '0' || s === 'no') parsed = false;
-      }
-      if (parsed == null) {
-        return res.status(400).json({ remark: 'validation_error', status: 'error', message: ['Invalid auto_pay_enabled'], data: null });
-      }
-      auto_pay_enabled = parsed;
-    }
+    // No AutoPay toggle any more: payroll always runs on the schedule, so
+    // `auto_pay_enabled` is system-controlled (account deactivation) and is not
+    // accepted from the client.
 
+    // The schedule is required, so clearing the field means "use the platform
+    // default", never "no automatic payroll".
     let payout_time = undefined;
     if (req.body?.payout_time != null) {
       const t = String(req.body.payout_time).trim();
-      if (t && !/^\d{2}:\d{2}$/.test(t)) {
-        return res.status(400).json({ remark: 'validation_error', status: 'error', message: ['Invalid payout_time (expected HH:mm)'], data: null });
-      }
-      if (t) {
+      if (!t) {
+        payout_time = payoutTimeOrDefault(null);
+      } else {
+        if (!/^\d{2}:\d{2}$/.test(t)) {
+          return res.status(400).json({ remark: 'validation_error', status: 'error', message: ['Invalid payout_time (expected HH:mm)'], data: null });
+        }
         const [hhRaw, mmRaw] = t.split(':');
         const hh = Number(hhRaw);
         const mm = Number(mmRaw);
         if (!Number.isFinite(hh) || !Number.isFinite(mm) || hh < 0 || hh > 23 || mm < 0 || mm > 59) {
           return res.status(400).json({ remark: 'validation_error', status: 'error', message: ['Invalid payout_time'], data: null });
         }
+        payout_time = t;
       }
-      payout_time = t || null;
     }
 
     let payout_timezone = undefined;
@@ -960,12 +1049,13 @@ async function updateCompany(req, res) {
     const updated = await prisma.staffPayCompany.update({
       where: { id: company.id },
       data: {
-        ...(name !== undefined ? { name } : {}),
-        ...(address !== undefined ? { address } : {}),
+        ...protectCompanyFields({
+          ...(name !== undefined ? { name } : {}),
+          ...(address !== undefined ? { address } : {}),
+          ...(phone !== undefined ? { phone } : {}),
+          ...(email !== undefined ? { email } : {}),
+        }),
         ...(cac_number !== undefined ? { cac_number } : {}),
-        ...(phone !== undefined ? { phone } : {}),
-        ...(email !== undefined ? { email } : {}),
-        ...(auto_pay_enabled !== undefined ? { auto_pay_enabled } : {}),
         ...(payout_time !== undefined ? { payout_time } : {}),
         ...(payout_timezone !== undefined ? { payout_timezone } : {}),
         ...(low_balance_alert_enabled !== undefined ? { low_balance_alert_enabled } : {}),
@@ -980,7 +1070,7 @@ async function updateCompany(req, res) {
       metadata: { company_id: updated.id },
     });
 
-    return res.json({ remark: 'staffpay_company_updated', status: 'success', message: ['Company updated'], data: { company: updated } });
+    return res.json({ remark: 'staffpay_company_updated', status: 'success', message: ['Company updated'], data: { company: publicCompany(updated) } });
   } catch (e) {
     console.error('staffpay updateCompany error:', e);
     return res.status(500).json({ remark: 'error', status: 'error', message: [e?.message || 'Failed'], data: null });
@@ -1015,8 +1105,7 @@ async function deleteCompany(req, res) {
       return res.status(400).json({ remark: 'password_not_set', status: 'error', message: ['Password not set for this account'], data: null });
     }
 
-    const looksHashed = storedPassword.startsWith('$2a$') || storedPassword.startsWith('$2b$') || storedPassword.startsWith('$2y$');
-    const valid = looksHashed ? (await bcrypt.compare(passwordInput, storedPassword)) : storedPassword === passwordInput;
+    const valid = (await verifySecret(passwordInput, storedPassword, 'password')).ok;
     if (!valid) {
       return res.status(400).json({ remark: 'invalid_password', status: 'error', message: ['Invalid password'], data: null });
     }
@@ -1045,7 +1134,8 @@ async function deleteCompany(req, res) {
     await logStaffPayEvent({
       userId: user.id,
       event: 'staffpay_company_deleted',
-      metadata: { company_id: company.id, company_name: company.name },
+      // Ids only: an audit row is read by more people than the company row is.
+      metadata: { company_id: company.id },
     });
 
     return res.json({ remark: 'staffpay_company_deleted', status: 'success', message: ['Company deleted'], data: null });
@@ -1073,25 +1163,31 @@ async function createStaff(req, res) {
     if (!company) return;
 
     const full_name = String(req.body?.full_name || '').trim();
+    // The app collects a job title now, not a phone number. `phone` is still
+    // read so an older build does not lose the value it sends.
     const phone = String(req.body?.phone || '').trim();
+    const role = String(req.body?.role || '').trim();
     const bank_code = String(req.body?.bank_code || '').trim();
     const bank_name = req.body?.bank_name != null ? String(req.body.bank_name).trim() : null;
     const bank_branch_code = req.body?.bank_branch_code != null ? String(req.body.bank_branch_code).trim() : null;
     const bank_branch_name = req.body?.bank_branch_name != null ? String(req.body.bank_branch_name).trim() : null;
     const account_number = String(req.body?.account_number || '').trim();
-    const account_name_input = req.body?.account_name != null ? String(req.body.account_name).trim() : null;
     const salary_amount = normalizeAmountToDecimal(req.body?.salary_amount);
-    const frequency = String(req.body?.frequency || '').trim();
     const payment_day = req.body?.payment_day != null ? Number(req.body.payment_day) : null;
     const start_date_raw = req.body?.start_date;
 
-    if (!full_name || !bank_code || !account_number || !salary_amount || !frequency) {
+    if (!full_name || !bank_code || !account_number || !salary_amount) {
       return res.status(400).json({
         remark: 'validation_error',
         status: 'error',
-        message: ['full_name, bank_code, account_number, salary_amount, frequency are required'],
+        message: ['full_name, bank_code, account_number and salary_amount are required'],
         data: null,
       });
+    }
+
+    const dayError = validatePaymentDay(payment_day);
+    if (dayError) {
+      return res.status(400).json({ remark: 'validation_error', status: 'error', message: [dayError], data: null });
     }
 
     let start_date = new Date();
@@ -1103,42 +1199,45 @@ async function createStaff(req, res) {
       start_date = parsedStart;
     }
 
-    const shouldResolve = req.body?.resolve === false ? false : true;
-    let account_name = null;
-    if (shouldResolve) {
-      try {
-        const { data } = await resolveAccount({ account_number, account_bank: bank_code });
-        account_name = data?.account_name || data?.accountName || null;
-      } catch (_) {
-        account_name = null;
-      }
-      if (!account_name && account_name_input) {
-        account_name = account_name_input;
-      }
-    } else if (account_name_input) {
-      account_name = account_name_input;
-    }
-
     const last4 = safeLast4(account_number);
     if (!last4) {
       return res.status(400).json({ remark: 'validation_error', status: 'error', message: ['Invalid account_number'], data: null });
     }
 
+    // The account name is resolved, not typed. A salary sent to a mistyped
+    // account is gone, so a bank that will not confirm the name blocks the save.
+    let account_name;
+    let recipient_code;
+    try {
+      const { data } = await resolveAccount({ account_number, bank_code });
+      account_name = data?.account_name || null;
+      if (!account_name) throw new Error('Bank did not return an account name');
+
+      ({ recipient_code } = await createTransferRecipient({ name: account_name, account_number, bank_code }));
+    } catch (e) {
+      return res.status(400).json({
+        remark: 'account_not_resolved',
+        status: 'error',
+        message: [e?.message || 'Could not verify this bank account'],
+        data: null,
+      });
+    }
+
     const created = await prisma.staffPayStaff.create({
       data: {
         company_id: company.id,
-        full_name,
-        phone,
+        ...protectStaffFields({ full_name, phone, account_name }),
+        role: role || null,
         bank_code,
         bank_name,
         bank_branch_code,
         bank_branch_name,
         account_number_enc: encryptString(account_number),
         account_number_last4: last4,
-        account_name,
+        paystack_recipient_code: recipient_code,
         salary_amount,
-        frequency,
-        payment_day: payment_day != null && Number.isFinite(payment_day) ? payment_day : null,
+        frequency: 'monthly',
+        payment_day: payment_day != null && Number.isFinite(payment_day) ? payment_day : DEFAULT_PAYMENT_DAY,
         start_date,
         is_active: true,
       },
@@ -1150,7 +1249,18 @@ async function createStaff(req, res) {
       metadata: { company_id: company.id, staff_id: created.id },
     });
 
-    return res.json({ remark: 'staffpay_staff_created', status: 'success', message: ['Staff created'], data: { staff: created } });
+    // Adding a salary changes what payroll costs, so the shortfall is recomputed
+    // here rather than leaving the app to discover it on payday.
+    const coverage = await payrollCoverage(company.id);
+
+    return res.json({
+      remark: 'staffpay_staff_created',
+      status: 'success',
+      message: coverage.is_sufficient
+        ? ['Staff created']
+        : ['Staff created', `You need to fund ₦${coverage.shortfall} more to cover this month's payroll.`],
+      data: { staff: publicStaff(created), payroll_coverage: coverage },
+    });
   } catch (e) {
     console.error('staffpay createStaff error:', e);
     return res.status(500).json({ remark: 'error', status: 'error', message: [e?.message || 'Failed'], data: null });
@@ -1178,7 +1288,7 @@ async function listStaff(req, res) {
       orderBy: { id: 'desc' },
     });
 
-    return res.json({ remark: 'staffpay_staff_list', status: 'success', message: ['OK'], data: { staff } });
+    return res.json({ remark: 'staffpay_staff_list', status: 'success', message: ['OK'], data: { staff: staff.map(publicStaff) } });
   } catch (e) {
     console.error('staffpay listStaff error:', e);
     return res.status(500).json({ remark: 'error', status: 'error', message: [e?.message || 'Failed'], data: null });
@@ -1202,15 +1312,21 @@ async function updateStaff(req, res) {
     }
 
     const data = {};
-    if (req.body?.full_name != null) data.full_name = String(req.body.full_name).trim();
-    if (req.body?.phone != null) data.phone = String(req.body.phone).trim();
+    Object.assign(data, protectStaffFields({
+      ...(req.body?.full_name != null ? { full_name: String(req.body.full_name).trim() } : {}),
+      ...(req.body?.phone != null ? { phone: String(req.body.phone).trim() } : {}),
+    }));
+    if (req.body?.role != null) data.role = String(req.body.role).trim() || null;
     if (req.body?.bank_code != null) data.bank_code = String(req.body.bank_code).trim();
     if (req.body?.bank_name != null) data.bank_name = String(req.body.bank_name).trim();
     if (req.body?.bank_branch_code != null) data.bank_branch_code = String(req.body.bank_branch_code).trim();
     if (req.body?.bank_branch_name != null) data.bank_branch_name = String(req.body.bank_branch_name).trim();
-    if (req.body?.account_name != null) data.account_name = String(req.body.account_name).trim();
-    if (req.body?.frequency != null) data.frequency = String(req.body.frequency).trim();
-    if (req.body?.payment_day != null) data.payment_day = Number(req.body.payment_day);
+    if (req.body?.payment_day != null) {
+      const day = Number(req.body.payment_day);
+      const dayError = validatePaymentDay(day);
+      if (dayError) return res.status(400).json({ remark: 'validation_error', status: 'error', message: [dayError], data: null });
+      data.payment_day = day;
+    }
     if (req.body?.start_date != null) {
       const d = new Date(req.body.start_date);
       if (Number.isNaN(d.getTime())) {
@@ -1239,26 +1355,38 @@ async function updateStaff(req, res) {
       data.is_active = parsed;
     }
 
-    if (req.body?.account_number != null) {
-      const account_number = String(req.body.account_number).trim();
+    // Bank details are re-verified on every change, and the old recipient is
+    // discarded - keeping it would send the next salary to the previous account.
+    const bankChanged = req.body?.account_number != null || (data.bank_code && data.bank_code !== existing.bank_code);
+    if (bankChanged) {
+      const account_number = req.body?.account_number != null
+        ? String(req.body.account_number).trim()
+        : decryptString(existing.account_number_enc);
+      const bank_code = data.bank_code || existing.bank_code;
+
       const last4 = safeLast4(account_number);
       if (!last4) {
         return res.status(400).json({ remark: 'validation_error', status: 'error', message: ['Invalid account_number'], data: null });
       }
-      data.account_number_enc = encryptString(account_number);
-      data.account_number_last4 = last4;
 
-      const bank_code = data.bank_code || existing.bank_code;
-      const shouldResolve = req.body?.resolve === false ? false : true;
-      if (shouldResolve && bank_code) {
-        try {
-          const { data: resolved } = await resolveAccount({ account_number, account_bank: bank_code });
-          data.account_name = resolved?.account_name || resolved?.accountName || null;
-        } catch (_) {
-          // keep existing
-        }
-      } else if (req.body?.account_name != null) {
-        data.account_name = String(req.body.account_name).trim();
+      try {
+        const { data: resolved } = await resolveAccount({ account_number, bank_code });
+        const account_name = resolved?.account_name || null;
+        if (!account_name) throw new Error('Bank did not return an account name');
+
+        const { recipient_code } = await createTransferRecipient({ name: account_name, account_number, bank_code });
+
+        data.account_number_enc = encryptString(account_number);
+        data.account_number_last4 = last4;
+        Object.assign(data, protectStaffFields({ account_name }));
+        data.paystack_recipient_code = recipient_code;
+      } catch (e) {
+        return res.status(400).json({
+          remark: 'account_not_resolved',
+          status: 'error',
+          message: [e?.message || 'Could not verify this bank account'],
+          data: null,
+        });
       }
     }
 
@@ -1267,9 +1395,19 @@ async function updateStaff(req, res) {
     await logStaffPayEvent({
       userId: user.id,
       event: 'staffpay_staff_updated',
-      metadata: { company_id: existing.company_id, staff_id: updated.id },
+      metadata: { company_id: existing.company_id, staff_id: updated.id, bank_changed: Boolean(bankChanged) },
     });
-    return res.json({ remark: 'staffpay_staff_updated', status: 'success', message: ['Staff updated'], data: { staff: updated } });
+
+    const coverage = await payrollCoverage(existing.company_id);
+
+    return res.json({
+      remark: 'staffpay_staff_updated',
+      status: 'success',
+      message: coverage.is_sufficient
+        ? ['Staff updated']
+        : ['Staff updated', `You need to fund ₦${coverage.shortfall} more to cover this month's payroll.`],
+      data: { staff: publicStaff(updated), payroll_coverage: coverage },
+    });
   } catch (e) {
     console.error('staffpay updateStaff error:', e);
     return res.status(500).json({ remark: 'error', status: 'error', message: [e?.message || 'Failed'], data: null });
@@ -1351,11 +1489,22 @@ async function getDashboard(req, res) {
     const startNext = new Date(now.getFullYear(), now.getMonth() + 1, 1);
     const startPrev = new Date(now.getFullYear(), now.getMonth() - 1, 1);
 
-    const trendStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - 6));
-    const trendEnd = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1));
+    // Seven Lagos days ending with today, expressed as the UTC instants that
+    // bound them. TREND_DAYS is the single source for the window length - the
+    // app's "Last 7 days" caption is describing this number.
+    const trendTodayStart = tzStartOfDayUtc(now) || new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+    const trendStart = new Date(trendTodayStart.getTime() - ((TREND_DAYS - 1) * DAY_MS));
+    const trendEnd = new Date(trendTodayStart.getTime() + DAY_MS);
 
-    const [staffCount, incomeTotalAgg, expenseTotalAgg, incomeThisAgg, expenseThisAgg, incomePrevAgg, expensePrevAgg, fundingTrendRows, paidItemRows] = await Promise.all([
+    const [staffCount, salaryAgg, accessState, incomeTotalAgg, expenseTotalAgg, incomeThisAgg, expenseThisAgg, incomePrevAgg, expensePrevAgg, fundingTrendRows, paidItemRows, scheduleRows] = await Promise.all([
       prisma.staffPayStaff.count({ where: { company_id: company.id, is_active: true } }),
+      // What one full payroll costs today - the app warns on the shortfall
+      // before payday rather than after a half-finished run.
+      prisma.staffPayStaff.aggregate({
+        _sum: { salary_amount: true },
+        where: { company_id: company.id, is_active: true },
+      }),
+      getAccessState(company.id),
       prisma.staffPayFundingTransaction.aggregate({
         _sum: { amount: true },
         where: { company_id: company.id, status: 'successful' },
@@ -1404,13 +1553,23 @@ async function getDashboard(req, res) {
         },
         select: { amount: true, credited_at: true },
       }),
+      // paid_at, not updated_at: updated_at is @updatedAt, so a webhook or a
+      // sync poll touching an old row would drag a months-old salary into this
+      // window and file it under today. SUCCESSFUL is the only success status
+      // the payroll service ever writes (mapTransferStatus).
       prisma.staffPayPayrollItem.findMany({
         where: {
           payroll_run: { is: { company_id: company.id } },
-          status: { in: ['SUCCESSFUL', 'SUCCESS', 'COMPLETED'] },
-          updated_at: { gte: trendStart, lt: trendEnd },
+          status: 'SUCCESSFUL',
+          paid_at: { gte: trendStart, lt: trendEnd },
         },
-        select: { staff_id: true, updated_at: true },
+        select: { staff_id: true, paid_at: true },
+      }),
+      // Only what the payday countdown needs - the same fields the scheduler
+      // reads, so the app counts down to the day payroll actually runs.
+      prisma.staffPayStaff.findMany({
+        where: { company_id: company.id, is_active: true },
+        select: { payment_day: true, frequency: true, start_date: true, last_paid_at: true },
       }),
     ]);
 
@@ -1425,16 +1584,16 @@ async function getDashboard(req, res) {
     for (const r of Array.isArray(fundingTrendRows) ? fundingTrendRows : []) {
       const dt = r?.credited_at ? new Date(r.credited_at) : null;
       if (!dt || Number.isNaN(dt.getTime())) continue;
-      const k = formatDateYmd(dt);
+      const k = formatDateYmdInTz(dt);
       const prev = fundedByDay.get(k) || new Prisma.Decimal('0.00');
       fundedByDay.set(k, prev.plus(r?.amount || new Prisma.Decimal('0.00')));
     }
 
     const paidByDay = new Map();
     for (const r of Array.isArray(paidItemRows) ? paidItemRows : []) {
-      const dt = r?.updated_at ? new Date(r.updated_at) : null;
+      const dt = r?.paid_at ? new Date(r.paid_at) : null;
       if (!dt || Number.isNaN(dt.getTime())) continue;
-      const k = formatDateYmd(dt);
+      const k = formatDateYmdInTz(dt);
       const set = paidByDay.get(k) || new Set();
       if (r?.staff_id != null) {
         set.add(Number(r.staff_id));
@@ -1443,9 +1602,11 @@ async function getDashboard(req, res) {
     }
 
     const trendDays = [];
-    for (let i = 6; i >= 0; i--) {
-      const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - i));
-      const k = formatDateYmd(d);
+    for (let i = TREND_DAYS - 1; i >= 0; i--) {
+      // Step whole days back from Lagos midnight today, then re-read the day in
+      // Lagos so the key matches the buckets above exactly.
+      const d = new Date(trendTodayStart.getTime() - (i * DAY_MS));
+      const k = formatDateYmdInTz(d);
       const funded = fundedByDay.get(k) || new Prisma.Decimal('0.00');
       const paidSet = paidByDay.get(k);
       trendDays.push({
@@ -1464,6 +1625,19 @@ async function getDashboard(req, res) {
       new Prisma.Decimal(walletBalance || '0').lt(new Prisma.Decimal(lowBalanceThreshold || '0'))
     );
 
+    // The soonest date any active staff member is due. Null with no staff, so
+    // the app can say "add staff" instead of counting down to nothing.
+    let nextPayday = null;
+    for (const row of Array.isArray(scheduleRows) ? scheduleRows : []) {
+      const due = nextDueAtUtc(row);
+      if (!due || Number.isNaN(due.getTime())) continue;
+      if (!nextPayday || due.getTime() < nextPayday.getTime()) nextPayday = due;
+    }
+
+    const monthlyPayroll = salaryAgg?._sum?.salary_amount || new Prisma.Decimal('0.00');
+    const balanceDec = new Prisma.Decimal(walletBalance || '0');
+    const shortfall = monthlyPayroll.gt(balanceDec) ? monthlyPayroll.minus(balanceDec) : new Prisma.Decimal('0.00');
+
     return res.json({
       remark: 'staffpay_dashboard',
       status: 'success',
@@ -1471,7 +1645,7 @@ async function getDashboard(req, res) {
       data: {
         company: {
           id: company.id,
-          name: company.name,
+          name: revealCompanyFields(company).name,
           low_balance_alert_enabled: lowBalanceEnabled,
           low_balance_threshold: lowBalanceThreshold,
         },
@@ -1481,6 +1655,14 @@ async function getDashboard(req, res) {
           threshold: lowBalanceThreshold,
           is_low_balance: isLowBalance,
         },
+        access: accessState,
+        payroll_coverage: {
+          monthly_total: monthlyPayroll,
+          wallet_balance: walletBalance,
+          shortfall,
+          is_sufficient: shortfall.eq(0),
+        },
+        next_payday: nextPayday,
         staff_count: staffCount,
         income: {
           total: income_total,
@@ -1535,23 +1717,15 @@ async function initiateWalletFunding(req, res) {
       },
     });
 
-    const email = String(user.email || '').trim() || `user${user.id}@voltpay.local`;
-    const customer = {
-      email,
-      name: `${String(user.firstname || '').trim()} ${String(user.lastname || '').trim()}`.trim() || `User ${user.id}`,
-      phonenumber: String(user.mobile || '').trim() || undefined,
-    };
+    const userPii = revealUserFields(user);
+    const email = String(userPii.email || '').trim() || `user${user.id}@voltpay.local`;
 
-    const { link, raw } = await createPaymentLink({
-      tx_ref: txRef,
-      amount: Number(amountDec.toString()),
-      currency: 'NGN',
-      redirect_url: redirectUrl,
-      customer,
-      customizations: {
-        title: 'StaffPay Wallet Funding',
-        description: `Wallet funding for ${company.name}`,
-      },
+    const { authorization_url, raw } = await initializeTransaction({
+      email,
+      amountKobo: Math.round(Number(amountDec.toString()) * 100),
+      reference: txRef,
+      callback_url: redirectUrl,
+      metadata: { purpose: 'staffpay_wallet_funding', company_id: company.id, user_id: Number(user.id) },
     });
 
     await prisma.staffPayFundingTransaction.update({
@@ -1565,7 +1739,7 @@ async function initiateWalletFunding(req, res) {
       message: ['OK'],
       data: {
         tx_ref: txRef,
-        payment_url: link,
+        payment_url: authorization_url,
         redirect_url: redirectUrl,
       },
     });
@@ -1611,10 +1785,11 @@ async function verifyWalletFunding(req, res) {
     const user = req.user;
     if (!user) return res.status(401).json({ remark: 'unauthorized', status: 'error', message: ['Please login first'], data: null });
 
-    const tx_ref = String(req.body?.tx_ref || '').trim();
-    const transaction_id = String(req.body?.transaction_id || req.body?.reference || '').trim();
-    if (!tx_ref || !transaction_id) {
-      return res.status(400).json({ remark: 'validation_error', status: 'error', message: ['tx_ref and transaction_id are required'], data: null });
+    // Paystack verifies by our own reference, so transaction_id is optional and
+    // only kept so the existing app build keeps working.
+    const tx_ref = String(req.body?.tx_ref || req.body?.reference || '').trim();
+    if (!tx_ref) {
+      return res.status(400).json({ remark: 'validation_error', status: 'error', message: ['tx_ref is required'], data: null });
     }
 
     const funding = await prisma.staffPayFundingTransaction.findUnique({ where: { tx_ref } });
@@ -1627,23 +1802,24 @@ async function verifyWalletFunding(req, res) {
       return res.json({ remark: 'staffpay_wallet_funding_verified', status: 'success', message: ['Already verified'], data: { wallet } });
     }
 
-    const { raw, data } = await verifyTransaction(transaction_id);
+    const { raw, data } = await verifyTransaction(tx_ref);
 
-    const txRefFromProvider = String(data?.tx_ref || data?.txRef || '').trim();
+    const txRefFromProvider = String(data?.reference || '').trim();
     const paymentStatus = String(data?.status || '').toLowerCase();
     const currency = String(data?.currency || 'NGN').toUpperCase();
-    const amount = toDecimalOrNull(data?.amount);
+    // Paystack quotes kobo everywhere; the wallet is in naira.
+    const amount = koboToDecimal(data?.amount);
 
     if (!txRefFromProvider || txRefFromProvider !== tx_ref) {
       return res.status(400).json({ remark: 'invalid_reference', status: 'error', message: ['tx_ref mismatch'], data: null });
     }
 
-    if (paymentStatus !== 'successful' || currency !== 'NGN' || !amount) {
+    if (paymentStatus !== 'success' || currency !== 'NGN' || !amount) {
       await prisma.staffPayFundingTransaction.update({
         where: { tx_ref },
         data: {
           status: paymentStatus || 'failed',
-          flutterwave_tx_id: String(data?.id || data?.flw_ref || transaction_id),
+          provider_tx_id: data?.id != null ? String(data.id) : null,
           raw_payload: raw,
         },
       });
@@ -1661,7 +1837,7 @@ async function verifyWalletFunding(req, res) {
         },
         data: {
           status: 'successful',
-          flutterwave_tx_id: String(data?.id || data?.flw_ref || transaction_id),
+          provider_tx_id: data?.id != null ? String(data.id) : null,
           raw_payload: raw,
           credited_at: creditedAt,
           amount: amount,
@@ -1674,11 +1850,7 @@ async function verifyWalletFunding(req, res) {
         return { wallet, credited: false };
       }
 
-      const wallet = await tx.staffPayWallet.upsert({
-        where: { company_id: Number(funding.company_id) },
-        update: { balance: { increment: amount } },
-        create: { company_id: Number(funding.company_id), balance: amount },
-      });
+      const wallet = await upsertBalanceDelta(tx, 'staffPayWallet', funding.company_id, amount);
 
       return { wallet, credited: true };
       },
@@ -1701,6 +1873,14 @@ async function verifyWalletFunding(req, res) {
   }
 }
 
+/**
+ * Paystack Dedicated Virtual Account.
+ *
+ * Unlike the old provider there is no dynamic/static distinction and no expiry:
+ * a DVA is created once per company against a Paystack customer and lives until
+ * it is deactivated. So this is idempotent - once the company has an account
+ * number it is handed back, never re-created.
+ */
 async function getWalletVirtualAccount(req, res) {
   try {
     const ok = await requireModels(res);
@@ -1715,161 +1895,83 @@ async function getWalletVirtualAccount(req, res) {
     const company = await getOwnedCompanyOrFail({ userId: user.id, companyId: company_id, res });
     if (!company) return;
 
-    const preferStatic = String(process.env.STAFFPAY_VIRTUAL_ACCOUNT_IS_PERMANENT || '1').toLowerCase() === 'true' || String(process.env.STAFFPAY_VIRTUAL_ACCOUNT_IS_PERMANENT || '1') === '1';
+    // Opened once for this request: the DVA is created against the business's
+    // own name, email and phone, none of which are stored readable.
+    const companyPii = revealCompanyFields(company);
 
-    const kycBvn = String(req.query?.bvn || req.body?.bvn || '').trim();
-    const kycNin = String(req.query?.nin || req.body?.nin || '').trim();
-    const bvn = kycBvn || null;
-    const nin = kycNin || null;
-
-    const existingType = company.virtual_account_expires_at ? 'dynamic' : 'static';
-    const shouldUpgradeToStatic = preferStatic && existingType !== 'static' && Boolean(bvn);
-
-    if (preferStatic && existingType === 'dynamic' && !bvn) {
-      return res.status(400).json({
-        remark: 'validation_error',
-        status: 'error',
-        message: ['BVN is required to upgrade to a permanent virtual account'],
-        data: null,
-      });
-    }
-
-    if (company.virtual_account_number && company.virtual_account_bank_name && !shouldUpgradeToStatic) {
+    if (company.virtual_account_number && company.virtual_account_bank_name) {
       return res.json({
         remark: 'staffpay_virtual_account',
         status: 'success',
         message: ['OK'],
         data: {
           virtual_account: {
-            tx_ref: company.virtual_account_tx_ref,
             account_number: company.virtual_account_number,
             bank_name: company.virtual_account_bank_name,
-            expires_at: company.virtual_account_expires_at,
-            type: existingType,
+            account_name: companyPii.name,
+            type: 'dedicated',
           },
         },
       });
     }
 
-    if (preferStatic && !bvn) {
-      return res.status(400).json({
-        remark: 'validation_error',
+    const userPii = revealUserFields(user);
+    const email = String(companyPii.email || userPii.email || '').trim() || `user${user.id}@voltpay.local`;
+    const phone = String(companyPii.phone || userPii.mobile || '').trim() || undefined;
+
+    try {
+      let customerCode = String(company.paystack_customer_code || '').trim();
+      if (!customerCode) {
+        ({ customer_code: customerCode } = await createCustomer({
+          email,
+          first_name: String(userPii.firstname || '').trim() || companyPii.name,
+          last_name: String(userPii.lastname || '').trim() || 'StaffPay',
+          phone,
+        }));
+      }
+
+      const dva = await createDedicatedAccount({ customer_code: customerCode, phone });
+
+      await prisma.staffPayCompany.update({
+        where: { id: company.id },
+        data: {
+          paystack_customer_code: customerCode,
+          paystack_dva_id: dva.dedicated_account_id,
+          virtual_account_number: dva.account_number,
+          virtual_account_bank_name: dva.bank_name,
+          virtual_account_expires_at: null,
+        },
+      });
+
+      await logStaffPayEvent({
+        userId: user.id,
+        event: 'staffpay_virtual_account_created',
+        metadata: { company_id: company.id },
+      });
+
+      return res.json({
+        remark: 'staffpay_virtual_account',
+        status: 'success',
+        message: ['OK'],
+        data: {
+          virtual_account: {
+            account_number: dva.account_number,
+            bank_name: dva.bank_name,
+            account_name: companyPii.name,
+            type: 'dedicated',
+          },
+        },
+      });
+    } catch (e) {
+      console.error('staffpay dedicated account create failed:', e?.message || e);
+      const status = Number(e?.statusCode) || 400;
+      return res.status(status).json({
+        remark: 'provider_error',
         status: 'error',
-        message: ['BVN is required to create a permanent virtual account'],
+        message: [e?.message || 'Could not create a dedicated account'],
         data: null,
       });
     }
-
-    const staticTxRef = `spva_${company.id}_static`;
-    const dynamicTxRef = `spva_${company.id}_${Date.now()}`;
-
-    const baseEmail = String(company.email || user.email || '').trim() || `user${user.id}@voltpay.local`;
-    const email = baseEmail;
-    const phonenumber = String(company.phone || user.mobile || '').trim() || undefined;
-    const narration = `StaffPay Wallet - ${company.name}`;
-
-    const bank_code = process.env.STAFFPAY_VIRTUAL_ACCOUNT_BANK_CODE ? String(process.env.STAFFPAY_VIRTUAL_ACCOUNT_BANK_CODE).trim() : undefined;
-
-    const firstName = String(user.firstname || '').trim();
-    const lastName = String(user.lastname || '').trim();
-
-    let acct = '';
-    let bankName = '';
-    let expiresAt = null;
-    let vaRaw = null;
-
-    let virtualAccountType = 'dynamic';
-
-    if (preferStatic) {
-      if (!bvn) {
-        return res.status(400).json({
-          remark: 'validation_error',
-          status: 'error',
-          message: ['BVN is required to create a permanent virtual account'],
-          data: null,
-        });
-      }
-
-      try {
-        const created = await createVirtualAccountNumber({
-          email,
-          tx_ref: staticTxRef,
-          phonenumber,
-          firstname: firstName || undefined,
-          lastname: lastName || undefined,
-          narration,
-          is_permanent: true,
-          bvn,
-          ...(bank_code ? { bank_code } : {}),
-        });
-
-        const data = created?.data || {};
-        acct = String(data?.account_number || '').trim();
-        bankName = String(data?.bank_name || '').trim();
-        expiresAt = null;
-        vaRaw = created?.raw;
-        virtualAccountType = 'static';
-      } catch (e) {
-        console.error('staffpay static virtual account create failed:', e?.message || e);
-        const status = Number(e?.statusCode) || 400;
-        return res.status(status).json({ remark: 'provider_error', status: 'error', message: [e?.message || 'Failed to create static virtual account'], data: null });
-      }
-    } else {
-      const amount = Number(process.env.STAFFPAY_VIRTUAL_ACCOUNT_MIN_AMOUNT || 100);
-      const created = await createVirtualAccountNumber({
-        email,
-        amount,
-        tx_ref: dynamicTxRef,
-        phonenumber,
-        firstname: firstName || undefined,
-        lastname: lastName || undefined,
-        narration,
-      });
-      const data = created?.data || {};
-      acct = String(data?.account_number || '').trim();
-      bankName = String(data?.bank_name || '').trim();
-      if (data?.expiry_date) {
-        const d = new Date(String(data.expiry_date));
-        if (!Number.isNaN(d.getTime())) expiresAt = d;
-      }
-      vaRaw = created?.raw;
-      virtualAccountType = 'dynamic';
-    }
-
-    if (!acct || !bankName) {
-      return res.status(500).json({ remark: 'provider_error', status: 'error', message: ['Flutterwave did not return account details'], data: null });
-    }
-
-    if (expiresAt && expiresAt.getUTCFullYear && expiresAt.getUTCFullYear() >= new Date().getUTCFullYear() + 100) {
-      expiresAt = null;
-    }
-
-    await prisma.staffPayCompany.update({
-      where: { id: company.id },
-      data: {
-        virtual_account_tx_ref: virtualAccountType === 'static' ? staticTxRef : dynamicTxRef,
-        virtual_account_number: acct,
-        virtual_account_bank_name: bankName,
-        virtual_account_order_ref: vaRaw?.data?.order_ref ? String(vaRaw.data.order_ref) : null,
-        virtual_account_flw_ref: vaRaw?.data?.flw_ref ? String(vaRaw.data.flw_ref) : null,
-        virtual_account_expires_at: expiresAt,
-      },
-    });
-
-    return res.json({
-      remark: 'staffpay_virtual_account',
-      status: 'success',
-      message: ['OK'],
-      data: {
-        virtual_account: {
-          tx_ref: virtualAccountType === 'static' ? staticTxRef : dynamicTxRef,
-          account_number: acct,
-          bank_name: bankName,
-          expires_at: expiresAt,
-          type: virtualAccountType,
-        },
-      },
-    });
   } catch (e) {
     console.error('staffpay getWalletVirtualAccount error:', e);
     const status = Number(e?.statusCode) || 500;
@@ -1877,71 +1979,71 @@ async function getWalletVirtualAccount(req, res) {
   }
 }
 
+
+/**
+ * Paystack webhook for everything StaffPay: wallet funding (charge.success,
+ * whether from checkout or a transfer into the dedicated account) and payroll
+ * outcomes (transfer.success / transfer.failed / transfer.reversed).
+ *
+ * Always answers 200 once the signature checks out. Paystack retries on any
+ * other status, and a retry storm over a row we have already credited is worse
+ * than a dropped event the reconciler will pick up anyway.
+ */
 async function walletWebhook(req, res) {
   try {
     const ok = await requireModels(res);
     if (!ok) return;
 
     const rawBody = req.rawBody ? req.rawBody.toString('utf8') : '';
-    if (!isValidFlutterwaveWebhook({ rawBody, headers: req.headers })) {
-      console.error('staffpay walletWebhook unauthorized: invalid webhook signature/hash');
+    const signature = req.headers['x-paystack-signature'];
+    if (!verifyWebhookSignature({ rawBody, signature })) {
+      console.error('staffpay walletWebhook unauthorized: bad signature');
       return res.status(401).send('Unauthorized');
     }
 
-    const payload = req.body;
+    const payload = req.body || {};
     const event = String(payload?.event || '').trim();
-    const eventType = String(payload?.['event.type'] || '').trim();
     const data = payload?.data || {};
 
-    const debug = String(process.env.STAFFPAY_WEBHOOK_DEBUG || '').trim() === '1';
-
-    if (event !== 'charge.completed') {
+    if (event.startsWith('transfer.')) {
+      try {
+        await handleTransferEvent({ event, data });
+      } catch (e) {
+        console.error('staffpay walletWebhook transfer error:', e?.message || e);
+      }
       return res.status(200).json({ received: true });
     }
 
-    const status = String(data?.status || '').toLowerCase();
-    const paymentType = String(data?.payment_type || '').toLowerCase();
+    if (event !== 'charge.success') {
+      return res.status(200).json({ received: true });
+    }
+
     const currency = String(data?.currency || '').toUpperCase();
-    const providerTxRef = String(data?.tx_ref || data?.txRef || data?.reference || '').trim();
-    const flwRef = String(data?.flw_ref || data?.flwRef || '').trim();
-    const orderRef = String(data?.order_ref || data?.orderRef || '').trim();
-    const flwTxId = data?.id != null ? String(data.id).trim() : '';
-    const amount = toDecimalOrNull(data?.amount) || toDecimalOrNull(data?.charged_amount);
+    const reference = String(data?.reference || '').trim();
+    const providerTxId = data?.id != null ? String(data.id) : '';
+    const amount = koboToDecimal(data?.amount);
 
-    const isSuccessful = status === 'successful' || status === 'success' || status === 'completed';
-
-    if (debug) {
-      console.log('staffpay walletWebhook received:', {
-        event,
-        eventType,
-        status,
-        paymentType,
-        currency,
-        tx_ref: providerTxRef,
-        flw_ref: flwRef,
-        order_ref: orderRef,
-        flwTxId,
-        amount: amount ? String(amount) : null,
-      });
-    }
-
-    if (!isSuccessful || currency !== 'NGN' || !flwTxId || !amount) {
+    if (currency !== 'NGN' || !providerTxId || !amount) {
       return res.status(200).json({ received: true });
     }
 
-    if (providerTxRef) {
-      const funding = await prisma.staffPayFundingTransaction.findUnique({ where: { tx_ref: providerTxRef } });
+    // Subscription charges ride the same webhook URL only if misconfigured;
+    // they have their own endpoint and must not be credited as wallet funding.
+    if (reference.startsWith('SPSUB-')) {
+      return res.status(200).json({ received: true });
+    }
+
+    // 1. Checkout funding: we minted the reference, so the row already exists.
+    if (reference) {
+      const funding = await prisma.staffPayFundingTransaction.findUnique({ where: { tx_ref: reference } });
       if (funding) {
         try {
           await withDirectFallback(db => db.$transaction(async tx => {
             const claimed = await tx.staffPayFundingTransaction.updateMany({
-              where: {
-                tx_ref: providerTxRef,
-                credited_at: null,
-              },
+              where: { tx_ref: reference, credited_at: null },
               data: {
                 status: 'successful',
-                flutterwave_tx_id: flwTxId,
+                provider_tx_id: providerTxId,
                 raw_payload: payload,
                 credited_at: new Date(),
                 amount,
@@ -1950,92 +2052,63 @@ async function walletWebhook(req, res) {
             });
 
             if (claimed?.count) {
-              await tx.staffPayWallet.upsert({
-                where: { company_id: Number(funding.company_id) },
-                update: { balance: { increment: amount } },
-                create: { company_id: Number(funding.company_id), balance: amount },
-              });
+              await upsertBalanceDelta(tx, 'staffPayWallet', funding.company_id, amount);
             }
           }, { timeout: 15000 }));
         } catch (e) {
-          if (e?.code !== 'P2002') {
-            console.error('staffpay walletWebhook funding credit error:', e);
-          }
+          if (e?.code !== 'P2002') console.error('staffpay walletWebhook funding credit error:', e);
         }
 
         return res.status(200).json({ received: true });
       }
     }
 
-    const isBankTransfer = paymentType === 'bank_transfer' || paymentType === 'account' || eventType.toUpperCase().includes('BANK_TRANSFER') || eventType.toUpperCase().includes('BANK_TRANSFER_TRANSACTION');
-    if (!isBankTransfer || (!providerTxRef && !flwRef && !orderRef)) {
-      return res.status(200).json({ received: true });
-    }
+    // 2. Dedicated account funding: Paystack picked the reference, so the payer
+    // is identified by the customer the DVA belongs to, or by the account the
+    // money landed in.
+    const customerCode = String(data?.customer?.customer_code || '').trim();
+    const receiverAccount = String(
+      data?.metadata?.receiver_account_number ||
+      data?.authorization?.receiver_bank_account_number ||
+      ''
+    ).replace(/\D/g, '');
 
     let company = null;
-    if (providerTxRef) {
-      company = await prisma.staffPayCompany.findFirst({ where: { virtual_account_tx_ref: providerTxRef } });
+    if (customerCode) {
+      company = await prisma.staffPayCompany.findFirst({ where: { paystack_customer_code: customerCode } });
     }
-    if (!company && flwRef) {
-      company = await prisma.staffPayCompany.findFirst({ where: { virtual_account_flw_ref: flwRef } });
+    if (!company && receiverAccount) {
+      company = await prisma.staffPayCompany.findFirst({ where: { virtual_account_number: receiverAccount } });
     }
-    if (!company && orderRef) {
-      company = await prisma.staffPayCompany.findFirst({ where: { virtual_account_order_ref: orderRef } });
-    }
+
     if (!company) {
-      const webhookAcct = String(data?.account_number || data?.account || '').replace(/\D/g, '');
-      if (webhookAcct) {
-        company = await prisma.staffPayCompany.findFirst({ where: { virtual_account_number: webhookAcct } });
-      }
-    }
-    if (!company) {
-      const originatorAcct = String(
-        payload?.meta_data?.originatoraccountnumber ||
-          payload?.meta_data?.originatorAccountNumber ||
-          data?.meta_data?.originatoraccountnumber ||
-          data?.meta_data?.originatorAccountNumber ||
-          data?.meta?.originatoraccountnumber ||
-          data?.meta?.originatorAccountNumber ||
-          ''
-      ).replace(/\D/g, '');
-      if (originatorAcct) {
-        company = await prisma.staffPayCompany.findFirst({ where: { virtual_account_number: originatorAcct } });
-      }
-    }
-    if (!company) {
-      console.warn('staffpay walletWebhook: company not found', { tx_ref: providerTxRef, flw_ref: flwRef, order_ref: orderRef, flwTxId });
+      console.warn('staffpay walletWebhook: no company for charge', { provider_tx_id: providerTxId });
       return res.status(200).json({ received: true });
     }
 
-    const internalTxRef = `spva_${company.id}_${flwTxId}`;
-    const creditedAt = new Date();
+    const internalTxRef = `spva_${company.id}_${providerTxId}`;
 
     try {
       await withDirectFallback(db => db.$transaction(async tx => {
-          await tx.staffPayFundingTransaction.create({
-            data: {
-              company_id: Number(company.id),
-              user_id: Number(company.owner_user_id),
-              tx_ref: internalTxRef,
-              flutterwave_tx_id: flwTxId,
-              amount,
-              currency: 'NGN',
-              status: 'successful',
-              raw_payload: payload,
-              credited_at: creditedAt,
-            },
-          });
+        await tx.staffPayFundingTransaction.create({
+          data: {
+            company_id: Number(company.id),
+            user_id: Number(company.owner_user_id),
+            tx_ref: internalTxRef,
+            provider_tx_id: providerTxId,
+            amount,
+            currency: 'NGN',
+            status: 'successful',
+            raw_payload: payload,
+            credited_at: new Date(),
+          },
+        });
 
-          await tx.staffPayWallet.upsert({
-            where: { company_id: Number(company.id) },
-            update: { balance: { increment: amount } },
-            create: { company_id: Number(company.id), balance: amount },
-          });
-        }, { timeout: 15000 }));
+        await upsertBalanceDelta(tx, 'staffPayWallet', company.id, amount);
+      }, { timeout: 15000 }));
     } catch (e) {
-      if (e?.code !== 'P2002') {
-        console.error('staffpay walletWebhook credit error:', e);
-      }
+      // P2002 = this transaction was already credited. Nothing to do.
+      if (e?.code !== 'P2002') console.error('staffpay walletWebhook credit error:', e);
     }
 
     return res.status(200).json({ received: true });
@@ -2045,6 +2118,12 @@ async function walletWebhook(req, res) {
   }
 }
 
+
+/**
+ * Pay All Staff. The money logic lives in services/staffpayPayroll.service.js
+ * so the scheduler runs exactly the same path; this only does ownership, the
+ * in-flight guard and the response.
+ */
 async function createPayrollRun(req, res) {
   try {
     const ok = await requireModels(res);
@@ -2079,194 +2158,28 @@ async function createPayrollRun(req, res) {
     const staffIds = Array.isArray(req.body?.staff_ids) ? req.body.staff_ids.map(Number).filter(Boolean) : [];
     const title = String(req.body?.title || '').trim() || `Staff salary payout (${new Date().toISOString().slice(0, 10)})`;
 
-    const staff = await prisma.staffPayStaff.findMany({
-      where: {
-        company_id: company.id,
-        is_active: true,
-        ...(staffIds.length ? { id: { in: staffIds } } : {}),
-      },
-      orderBy: { id: 'asc' },
-    });
-
-    if (!staff.length) {
-      return res.status(400).json({ remark: 'no_staff', status: 'error', message: ['No active staff to pay'], data: null });
-    }
-
-    const totalSalary = staff.reduce((acc, s) => acc.plus(s.salary_amount || new Prisma.Decimal('0.00')), new Prisma.Decimal('0.00'));
-
-    const vatRate = staffPayVatRate();
-
-    const feeByStaffId = new Map();
-    let flutterwaveFeeTotal = new Prisma.Decimal('0.00');
-    let voltpayFeeTotal = new Prisma.Decimal('0.00');
-    let vatTotal = new Prisma.Decimal('0.00');
-
-    for (const s of staff) {
-      const bankCode = String(s.bank_code || '').trim();
-      const isGhanaBank = /^GH/i.test(bankCode);
-      const currency = isGhanaBank ? 'GHS' : 'NGN';
-      const amt = s.salary_amount || new Prisma.Decimal('0.00');
-
-      let flwFee = new Prisma.Decimal('0.00');
-      try {
-        const { data } = await getTransferFee({ amount: Number(new Prisma.Decimal(amt).toString()), currency });
-        const nFee = data?.fee != null && Number.isFinite(Number(data.fee)) ? Number(data.fee) : 0;
-        flwFee = new Prisma.Decimal(nFee.toFixed(2));
-      } catch (_) {
-        flwFee = new Prisma.Decimal('0.00');
-      }
-
-      const voltFee = currency === 'NGN' ? computeVoltPayHybridFee(amt) : new Prisma.Decimal('0.00');
-      let itemVat = currency === 'NGN' ? (new Prisma.Decimal(vatRate.toString()).mul(flwFee.plus(voltFee))) : new Prisma.Decimal('0.00');
-      try {
-        itemVat = new Prisma.Decimal(itemVat.toFixed(2));
-      } catch (_) {}
-
-      flutterwaveFeeTotal = flutterwaveFeeTotal.plus(flwFee);
-      voltpayFeeTotal = voltpayFeeTotal.plus(voltFee);
-      vatTotal = vatTotal.plus(itemVat);
-
-      feeByStaffId.set(Number(s.id), { flutterwave_fee: flwFee, voltpay_fee: voltFee, vat: itemVat });
-    }
-
-    const totalDebit = totalSalary.plus(flutterwaveFeeTotal).plus(voltpayFeeTotal).plus(vatTotal);
-
-    const payrollRun = await prisma.$transaction(async tx => {
-      const reserved = await tx.staffPayWallet.updateMany({
-        where: { company_id: company.id, balance: { gte: totalDebit } },
-        data: { balance: { decrement: totalDebit } },
-      });
-
-      if (!reserved?.count) {
-        throw Object.assign(new Error('Insufficient StaffPay wallet balance'), { statusCode: 400 });
-      }
-
-      const run = await tx.staffPayPayrollRun.create({
-        data: {
-          company_id: company.id,
-          title,
-          status: 'preparing',
-          total_salary: totalSalary,
-          flutterwave_fee_total: flutterwaveFeeTotal,
-          voltpay_fee_total: voltpayFeeTotal,
-          vat_total: vatTotal,
-          total_debit: totalDebit,
-          items: {
-            createMany: {
-              data: staff.map(s => ({
-                staff_id: s.id,
-                amount: s.salary_amount,
-                flutterwave_fee: feeByStaffId.get(Number(s.id))?.flutterwave_fee || new Prisma.Decimal('0.00'),
-                voltpay_fee: feeByStaffId.get(Number(s.id))?.voltpay_fee || new Prisma.Decimal('0.00'),
-                vat: feeByStaffId.get(Number(s.id))?.vat || new Prisma.Decimal('0.00'),
-                status: 'NEW',
-              })),
-            },
-          },
-        },
-      });
-
-      return run;
-    }, { timeout: 15000, maxWait: 15000 });
-
-    await logStaffPayEvent({
-      userId: user.id,
-      event: 'staffpay_payroll_run_initiated',
-      metadata: { company_id: company.id, payroll_run_id: payrollRun.id, total_salary: Number(totalSalary.toString()) },
-    });
-
-    let bulk;
+    let run;
     try {
-      const bulk_data = staff.map(s => {
-        const acct = decryptString(s.account_number_enc);
-        const bankCode = String(s.bank_code || '').trim();
-        const isGhanaBank = /^GH/i.test(bankCode);
-        const currency = isGhanaBank ? 'GHS' : 'NGN';
-
-        const item = {
-          bank_code: bankCode,
-          account_number: acct,
-          amount: Number(new Prisma.Decimal(s.salary_amount || '0').toString()),
-          currency,
-          narration: 'Salary payment',
-        };
-
-        if (isGhanaBank) {
-          const branch = String(s.bank_branch_code || '').trim();
-          if (branch) {
-            item.destination_branch_code = branch;
-          }
-        }
-
-        return item;
-      });
-
-      bulk = await createBulkTransfer({ title, bulk_data });
+      run = await createPayrollRunForCompany({ company, staffIds, title, actorUserId: user.id });
     } catch (e) {
-      console.error('staffpay createPayrollRun bulk transfer error:', {
-        statusCode: e?.statusCode,
-        message: e?.message,
-        flutterwave: e?.flutterwave,
-      });
-
-      await prisma.$transaction([
-        prisma.staffPayPayrollRun.update({ where: { id: payrollRun.id }, data: { status: 'failed' } }),
-        prisma.staffPayWallet.update({ where: { company_id: company.id }, data: { balance: { increment: totalDebit } } }),
-        prisma.staffPayPayrollItem.updateMany({ where: { payroll_run_id: payrollRun.id }, data: { status: 'FAILED', complete_message: e?.message || 'Bulk transfer failed' } }),
-      ]);
-
       const status = Number(e?.statusCode) || 500;
-      return res.status(status).json({ remark: 'error', status: 'error', message: [e?.message || 'Bulk transfer failed'], data: null });
+      return res.status(status).json({
+        remark: e?.remark || 'error',
+        status: 'error',
+        message: [e?.message || 'Failed'],
+        data: e?.remark === 'insufficient_balance' ? await payrollCoverage(company.id) : null,
+      });
     }
 
-    const batchId = bulk?.data?.id;
-    await prisma.staffPayPayrollRun.update({
-      where: { id: payrollRun.id },
-      data: {
-        status: 'queued',
-        batch_id: batchId != null ? Number(batchId) : null,
-      },
-    });
+    await maybeWarnLowBalance({ company, userId: user.id });
 
-    const walletAfter = await prisma.staffPayWallet.findUnique({ where: { company_id: company.id } });
-    try {
-      const settings = await prisma.staffPayCompany.findUnique({ where: { id: company.id } });
-      const enabled = settings?.low_balance_alert_enabled !== false;
-      const threshold = settings?.low_balance_threshold;
-      if (enabled && walletAfter && threshold && new Prisma.Decimal(walletAfter.balance || '0').lt(threshold)) {
-        if (prisma.pushNotification) {
-          await prisma.pushNotification.create({
-            data: {
-              user_id: Number(user.id),
-              subject: 'Low StaffPay wallet balance',
-              message: `Your StaffPay wallet balance is low for ${company.name}.`,
-              notification_type: 'staffpay',
-              data: { company_id: company.id, balance: walletAfter.balance, threshold },
-            },
-          });
-        }
-
-        await logStaffPayEvent({
-          userId: user.id,
-          event: 'staffpay_low_balance_alert',
-          metadata: { company_id: company.id, balance: Number(walletAfter.balance.toString()), threshold: Number(threshold.toString()) },
-        });
-      }
-    } catch (_) {}
-
-    const runWithItems = await prisma.staffPayPayrollRun.findUnique({
-      where: { id: payrollRun.id },
-      include: { items: { include: { staff: true } } },
-    });
+    const failed = (run?.items || []).filter(i => String(i.status).toUpperCase() === 'FAILED').length;
 
     return res.json({
       remark: 'staffpay_payroll_run_created',
       status: 'success',
-      message: ['Bulk transfer queued'],
-      data: {
-        payroll_run: runWithItems,
-        batch: bulk?.data || null,
-      },
+      message: failed ? [`${failed} transfer(s) failed and were refunded. Use Retry Failed Transfers.`] : ['Payroll sent'],
+      data: { payroll_run: publicPayrollRun(run), failed_count: failed },
     });
   } catch (e) {
     console.error('staffpay createPayrollRun error:', e);
@@ -2275,7 +2188,21 @@ async function createPayrollRun(req, res) {
   }
 }
 
-async function clearHistory(req, res) {
+/**
+ * Run payroll now: pay exactly the staff whose payday has arrived, on the same
+ * cycle keys the scheduler uses.
+ *
+ * The difference from Pay All Staff above is what makes this the safe button.
+ * Pay All Staff pays every active staff member, on purpose, and pressing it an
+ * hour after automatic payroll ran pays everybody twice. This one pays only
+ * what is owed for the current cycle, and every item it writes carries the
+ * cycle key - so if the scheduler already paid somebody today, the database
+ * refuses the second item and the wallet is never debited for it.
+ *
+ * One batch per press. A company with more staff than STAFFPAY_PAYROLL_BATCH_SIZE
+ * gets the rest from the scheduler, or from a second press - both are safe.
+ */
+async function runDuePayrollNow(req, res) {
   try {
     const ok = await requireModels(res);
     if (!ok) return;
@@ -2283,35 +2210,160 @@ async function clearHistory(req, res) {
     const user = req.user;
     if (!user) return res.status(401).json({ remark: 'unauthorized', status: 'error', message: ['Please login first'], data: null });
 
-    const company_id = Number(req.query?.company_id);
+    const company_id = Number(req.body?.company_id);
     if (!company_id) return res.status(400).json({ remark: 'validation_error', status: 'error', message: ['company_id is required'], data: null });
 
     const company = await getOwnedCompanyOrFail({ userId: user.id, companyId: company_id, res });
     if (!company) return;
 
-    const [fundingDeleted, runsDeleted] = await prisma.$transaction([
-      prisma.staffPayFundingTransaction.deleteMany({ where: { company_id: company.id } }),
-      prisma.staffPayPayrollRun.deleteMany({ where: { company_id: company.id } }),
-    ]);
-
-    await logStaffPayEvent({
-      userId: user.id,
-      event: 'staffpay_history_cleared',
-      metadata: { company_id: company.id, funding_deleted: fundingDeleted?.count || 0, runs_deleted: runsDeleted?.count || 0 },
+    const inflight = await prisma.staffPayPayrollRun.findFirst({
+      where: { company_id: company.id, status: { in: ['preparing', 'queued', 'processing'] } },
+      orderBy: { id: 'desc' },
+      select: { id: true },
     });
+    if (inflight) {
+      return res.status(409).json({
+        remark: 'staffpay_payroll_in_progress',
+        status: 'error',
+        message: ['A payroll payout is already in progress. Please wait for it to complete before starting another one.'],
+        data: { payroll_run_id: inflight.id },
+      });
+    }
+
+    const due = await listDueStaff({ companyId: company.id });
+    if (!due.length) {
+      return res.json({
+        remark: 'staffpay_no_staff_due',
+        status: 'success',
+        message: ['No staff are due for payment right now.'],
+        data: { due_count: 0, payroll_run: null },
+      });
+    }
+
+    const batchSize = Math.max(1, Number(process.env.STAFFPAY_PAYROLL_BATCH_SIZE) || 200);
+    const batch = due.slice(0, batchSize);
+
+    let run;
+    try {
+      run = await createPayrollRunForCompany({
+        company,
+        staffIds: batch.map(d => d.id),
+        cycleKeys: new Map(batch.map(d => [d.id, d.cycle_key])),
+        title: String(req.body?.title || '').trim() || `Staff salary payout (${new Date().toISOString().slice(0, 10)})`,
+        actorUserId: user.id,
+        mode: 'manual',
+      });
+    } catch (e) {
+      const status = Number(e?.statusCode) || 500;
+      return res.status(status).json({
+        remark: e?.remark || 'error',
+        status: 'error',
+        message: [e?.message || 'Failed'],
+        data: e?.remark === 'insufficient_balance' ? await payrollCoverage(company.id) : null,
+      });
+    }
+
+    await maybeWarnLowBalance({ company, userId: user.id });
+
+    const failed = (run?.items || []).filter(i => String(i.status).toUpperCase() === 'FAILED').length;
+    const remaining = due.length - batch.length;
 
     return res.json({
-      remark: 'staffpay_history_cleared',
+      remark: 'staffpay_payroll_run_created',
       status: 'success',
-      message: ['Cleared'],
-      data: { funding_deleted: fundingDeleted?.count || 0, payroll_runs_deleted: runsDeleted?.count || 0 },
+      message: [
+        failed ? `${failed} transfer(s) failed and were refunded. Use Retry Failed Transfers.` : 'Payroll sent',
+        ...(remaining ? [`${remaining} more staff are due and will be paid in the next batch.`] : []),
+      ],
+      data: {
+        payroll_run: publicPayrollRun(run),
+        failed_count: failed,
+        due_count: due.length,
+        paid_in_this_run: batch.length,
+        remaining_due: remaining,
+      },
     });
   } catch (e) {
-    console.error('staffpay clearHistory error:', e);
+    console.error('staffpay runDuePayrollNow error:', e);
     const status = Number(e?.statusCode) || 500;
     return res.status(status).json({ remark: 'error', status: 'error', message: [e?.message || 'Failed'], data: null });
   }
 }
+
+/** Re-send only the failed items of a run. */
+async function retryPayrollRun(req, res) {
+  try {
+    const ok = await requireModels(res);
+    if (!ok) return;
+
+    const user = req.user;
+    if (!user) return res.status(401).json({ remark: 'unauthorized', status: 'error', message: ['Please login first'], data: null });
+
+    const runId = Number(req.params?.runId);
+    if (!runId) return res.status(400).json({ remark: 'validation_error', status: 'error', message: ['Invalid runId'], data: null });
+
+    const existing = await prisma.staffPayPayrollRun.findUnique({ where: { id: runId }, include: { company: true } });
+    if (!existing || Number(existing.company?.owner_user_id) !== Number(user.id)) {
+      return res.status(404).json({ remark: 'not_found', status: 'error', message: ['Payroll run not found'], data: null });
+    }
+
+    let run;
+    try {
+      run = await retryFailedItems({ runId, actorUserId: user.id });
+    } catch (e) {
+      const status = Number(e?.statusCode) || 500;
+      return res.status(status).json({
+        remark: e?.remark || 'error',
+        status: 'error',
+        message: [e?.message || 'Failed'],
+        data: e?.remark === 'insufficient_balance' ? await payrollCoverage(existing.company_id) : null,
+      });
+    }
+
+    const stillFailed = (run?.items || []).filter(i => String(i.status).toUpperCase() === 'FAILED').length;
+
+    return res.json({
+      remark: 'staffpay_payroll_retried',
+      status: 'success',
+      message: stillFailed ? [`${stillFailed} transfer(s) failed again.`] : ['Retry sent'],
+      data: { payroll_run: publicPayrollRun(run), failed_count: stillFailed },
+    });
+  } catch (e) {
+    console.error('staffpay retryPayrollRun error:', e);
+    const status = Number(e?.statusCode) || 500;
+    return res.status(status).json({ remark: 'error', status: 'error', message: [e?.message || 'Failed'], data: null });
+  }
+}
+
+/** Dashboard alert + email + push when the wallet drops under the threshold. */
+async function maybeWarnLowBalance({ company, userId }) {
+  try {
+    const settings = await prisma.staffPayCompany.findUnique({ where: { id: company.id } });
+    if (settings?.low_balance_alert_enabled === false) return;
+
+    const wallet = await prisma.staffPayWallet.findUnique({ where: { company_id: company.id } });
+    const threshold = settings?.low_balance_threshold;
+    if (!wallet || !threshold) return;
+    if (!new Prisma.Decimal(wallet.balance || '0').lt(threshold)) return;
+
+    await notifyUser({
+      userId: Number(userId || company.owner_user_id),
+      subject: 'Low StaffPay wallet balance',
+      message: `Your StaffPay wallet for ${revealCompanyFields(company).name} is below ₦${new Prisma.Decimal(threshold).toFixed(2)}. Fund it before the next payday.`,
+      type: 'staffpay',
+      data: { company_id: company.id },
+    });
+
+    await logStaffPayEvent({
+      userId: Number(userId || company.owner_user_id),
+      event: 'staffpay_low_balance_alert',
+      metadata: { company_id: company.id, balance: Number(new Prisma.Decimal(wallet.balance || '0').toString()) },
+    });
+  } catch (e) {
+    console.error('staffpay low balance alert failed:', e?.message || e);
+  }
+}
+
 
 async function listPayrollRuns(req, res) {
   try {
@@ -2340,35 +2392,6 @@ async function listPayrollRuns(req, res) {
   }
 }
 
-async function clearPayrollRuns(req, res) {
-  try {
-    const ok = await requireModels(res);
-    if (!ok) return;
-
-    const user = req.user;
-    if (!user) return res.status(401).json({ remark: 'unauthorized', status: 'error', message: ['Please login first'], data: null });
-
-    const company_id = Number(req.query?.company_id);
-    if (!company_id) return res.status(400).json({ remark: 'validation_error', status: 'error', message: ['company_id is required'], data: null });
-
-    const company = await getOwnedCompanyOrFail({ userId: user.id, companyId: company_id, res });
-    if (!company) return;
-
-    const deleted = await prisma.staffPayPayrollRun.deleteMany({ where: { company_id: company.id } });
-
-    return res.json({
-      remark: 'staffpay_payroll_runs_cleared',
-      status: 'success',
-      message: ['Cleared'],
-      data: { deleted: deleted?.count || 0 },
-    });
-  } catch (e) {
-    console.error('staffpay clearPayrollRuns error:', e);
-    const status = Number(e?.statusCode) || 500;
-    return res.status(status).json({ remark: 'error', status: 'error', message: [e?.message || 'Failed'], data: null });
-  }
-}
-
 async function getPayrollRun(req, res) {
   try {
     const ok = await requireModels(res);
@@ -2389,13 +2412,14 @@ async function getPayrollRun(req, res) {
       return res.status(404).json({ remark: 'not_found', status: 'error', message: ['Payroll run not found'], data: null });
     }
 
-    return res.json({ remark: 'staffpay_payroll_run', status: 'success', message: ['OK'], data: { payroll_run: run } });
+    return res.json({ remark: 'staffpay_payroll_run', status: 'success', message: ['OK'], data: { payroll_run: publicPayrollRun(run) } });
   } catch (e) {
     console.error('staffpay getPayrollRun error:', e);
     return res.status(500).json({ remark: 'error', status: 'error', message: [e?.message || 'Failed'], data: null });
   }
 }
 
+/** Poll Paystack for a run's transfers. The webhook normally gets there first. */
 async function syncPayrollRun(req, res) {
   try {
     const ok = await requireModels(res);
@@ -2407,132 +2431,32 @@ async function syncPayrollRun(req, res) {
     const runId = Number(req.params?.runId);
     if (!runId) return res.status(400).json({ remark: 'validation_error', status: 'error', message: ['Invalid runId'], data: null });
 
-    const run = await prisma.staffPayPayrollRun.findUnique({
-      where: { id: runId },
-      include: { company: true, items: { include: { staff: true } } },
-    });
-
+    const run = await prisma.staffPayPayrollRun.findUnique({ where: { id: runId }, include: { company: true } });
     if (!run || Number(run.company?.owner_user_id) !== Number(user.id)) {
       return res.status(404).json({ remark: 'not_found', status: 'error', message: ['Payroll run not found'], data: null });
     }
 
-    if (!run.batch_id) {
-      return res.status(400).json({ remark: 'missing_batch_id', status: 'error', message: ['Payroll run has no batch_id'], data: null });
-    }
-
-    const { data: transfers } = await getBulkTransfer({ batch_id: String(run.batch_id) });
-    const transferList = Array.isArray(transfers) ? transfers : [];
-
-    const itemsByStaffId = new Map(run.items.map(i => [Number(i.staff_id), i]));
-
-    let feeTotal = new Prisma.Decimal('0.00');
-    let vatTotal = new Prisma.Decimal('0.00');
-    let voltpayFeeTotal = new Prisma.Decimal('0.00');
-    const vatRate = staffPayVatRate();
-
-    for (const t of transferList) {
-      const bank_code = String(t?.bank_code || '').trim();
-      const acct = String(t?.account_number || '').trim();
-      const last4 = safeLast4(acct);
-      const staff = run.items.map(i => i.staff).find(s => String(s.bank_code) === bank_code && String(s.account_number_last4) === last4);
-      if (!staff) continue;
-
-      const item = itemsByStaffId.get(Number(staff.id));
-      if (!item) continue;
-
-      const fee = toDecimalOrNull(t?.fee) || new Prisma.Decimal('0.00');
-      feeTotal = feeTotal.plus(fee);
-
-      const existingVoltFee = item?.voltpay_fee != null ? new Prisma.Decimal(item.voltpay_fee) : new Prisma.Decimal('0.00');
-      voltpayFeeTotal = voltpayFeeTotal.plus(existingVoltFee);
-      const bankCode = String(staff?.bank_code || '').trim();
-      const isGhanaBank = /^GH/i.test(bankCode);
-      const itemVat = isGhanaBank ? new Prisma.Decimal('0.00') : new Prisma.Decimal(vatRate.toString()).mul(fee.plus(existingVoltFee));
-      const itemVat2 = (() => {
-        try {
-          return new Prisma.Decimal(itemVat.toFixed(2));
-        } catch {
-          return itemVat;
-        }
-      })();
-      vatTotal = vatTotal.plus(itemVat2);
-
-      await prisma.staffPayPayrollItem.update({
-        where: { id: item.id },
-        data: {
-          flutterwave_transfer_id: t?.id != null ? Number(t.id) : null,
-          reference: t?.reference ? String(t.reference) : null,
-          status: t?.status ? String(t.status) : item.status,
-          complete_message: t?.complete_message ? String(t.complete_message) : (t?.completeMessage ? String(t.completeMessage) : null),
-          flutterwave_fee: fee,
-          vat: itemVat2,
-          raw_payload: t,
-        },
-      });
-    }
-
-    const oldTotalDebit = run.total_debit != null ? new Prisma.Decimal(run.total_debit) : new Prisma.Decimal(run.total_salary || '0');
-    const newTotalDebit = new Prisma.Decimal(run.total_salary || '0').plus(feeTotal).plus(voltpayFeeTotal).plus(vatTotal);
-    const delta = newTotalDebit.minus(oldTotalDebit);
-
-    await prisma.$transaction(async tx => {
-      await tx.staffPayPayrollRun.update({
-        where: { id: run.id },
-        data: {
-          flutterwave_fee_total: feeTotal,
-          voltpay_fee_total: voltpayFeeTotal,
-          vat_total: vatTotal,
-          total_debit: newTotalDebit,
-        },
-      });
-
-      if (!delta.isZero()) {
-        if (delta.gt(new Prisma.Decimal('0.00'))) {
-          await tx.staffPayWallet.upsert({
-            where: { company_id: run.company_id },
-            update: { balance: { decrement: delta } },
-            create: { company_id: run.company_id, balance: new Prisma.Decimal('0.00').minus(delta) },
-          });
-        } else {
-          await tx.staffPayWallet.upsert({
-            where: { company_id: run.company_id },
-            update: { balance: { increment: delta.abs() } },
-            create: { company_id: run.company_id, balance: delta.abs() },
-          });
-        }
-      }
-    }, { timeout: 15000, maxWait: 15000 });
-
-    const refreshed = await prisma.staffPayPayrollRun.findUnique({
-      where: { id: run.id },
-      include: { items: { include: { staff: true } } },
-    });
-
-    const statuses = (refreshed?.items || []).map(i => String(i.status || '').toUpperCase());
-    const hasPending = statuses.some(s => s === 'NEW' || s === 'PENDING');
-    const hasFailed = statuses.some(s => s === 'FAILED');
-    const allSuccessful = statuses.length > 0 && statuses.every(s => s === 'SUCCESSFUL');
-
-    const newStatus = allSuccessful ? 'successful' : (hasPending ? 'processing' : (hasFailed ? 'failed' : 'processing'));
-
-    await prisma.staffPayPayrollRun.update({ where: { id: run.id }, data: { status: newStatus } });
+    await syncPayrollRunById(runId);
 
     const finalRun = await prisma.staffPayPayrollRun.findUnique({
-      where: { id: run.id },
+      where: { id: runId },
       include: { items: { include: { staff: true } } },
     });
 
     await logStaffPayEvent({
       userId: user.id,
       event: 'staffpay_payroll_run_synced',
-      metadata: { company_id: run.company_id, payroll_run_id: run.id, status: newStatus },
+      metadata: { company_id: run.company_id, payroll_run_id: run.id, status: finalRun?.status },
     });
 
     return res.json({
       remark: 'staffpay_payroll_run_synced',
       status: 'success',
       message: ['OK'],
-      data: { payroll_run: finalRun, transfers: transferList },
+      data: {
+        payroll_run: publicPayrollRun(finalRun),
+        failed_count: (finalRun?.items || []).filter(i => String(i.status).toUpperCase() === 'FAILED').length,
+      },
     });
   } catch (e) {
     console.error('staffpay syncPayrollRun error:', e);
@@ -2541,9 +2465,9 @@ async function syncPayrollRun(req, res) {
   }
 }
 
+
 module.exports = {
   banks,
-  bankBranches,
   resolveBankAccount,
 
   createCompany,
@@ -2560,7 +2484,7 @@ module.exports = {
   getDashboard,
   listFundingHistory,
   listPayoutHistory,
-  clearHistory,
+  exportPayoutHistory,
   getWallet,
   getWalletVirtualAccount,
   initiateWalletFunding,
@@ -2570,9 +2494,15 @@ module.exports = {
   reconcileWalletFunding,
   autoReconcileWalletFunding,
 
+  // Exported for test/staffpayPayroll.test.js - the WAT month boundary and CSV
+  // quoting are the only parts of the history endpoints worth pinning down.
+  monthYearRange,
+  csvCell,
+
   createPayrollRun,
+  runDuePayrollNow,
+  retryPayrollRun,
   listPayrollRuns,
-  clearPayrollRuns,
   getPayrollRun,
   syncPayrollRun,
 };

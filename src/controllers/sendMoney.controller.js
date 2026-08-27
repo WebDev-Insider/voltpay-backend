@@ -3,6 +3,9 @@ const { Prisma } = require('@prisma/client');
 const { getCountryByCode } = require('../helpers/country.helper');
 const { setPending } = require('../services/pending.service');
 const { generateTrx } = require('../services/airtime.service');
+const { blindIndex, revealUserFields, revealText } = require('../helpers/pii.helper');
+const { checkVelocity } = require('../helpers/velocity.helper');
+const { isNewBeneficiary, hasAcknowledged, recordAcknowledgementPrompt } = require('../helpers/beneficiary.helper');
 
 function moneyStr(n) {
   const num = Number(n);
@@ -86,8 +89,8 @@ async function store(req, res) {
     const receiver = await prisma.user.findFirst({
       where: {
         OR: [
-          ...(lookup.username ? [{ username: lookup.username }] : []),
-          ...(mobileVariants.length ? mobileVariants.map(m => ({ mobile: m })) : []),
+          ...(lookup.username ? [{ username_idx: blindIndex(lookup.username, 'username') }] : []),
+          ...mobileVariants.map(m => ({ mobile_idx: blindIndex(m, 'mobile') })),
         ],
       },
     });
@@ -104,6 +107,8 @@ async function store(req, res) {
       return res.status(403).json({ remark: 'blocked', status: 'error', message: ['Recipient account is blocked'], data: null });
     }
 
+    const receiverPii = revealUserFields(receiver);
+
     const cfg = chargeConfig();
     const fixed = Number(cfg.fixed_charge || 0) || 0;
     const percent = Number(cfg.percent_charge || 0) || 0;
@@ -112,22 +117,55 @@ async function store(req, res) {
     const charge = cap !== -1 && rawCharge > cap ? cap : rawCharge;
     const total = amount + (Number.isFinite(charge) ? charge : 0);
 
+    // Rate first: it costs one indexed count and it is the check a stolen
+    // handset with a known PIN actually trips.
+    const velocity = await checkVelocity({ userId: user.id, amount: total });
+    if (!velocity.ok) {
+      return res.status(429).json({
+        remark: 'velocity_limit',
+        status: 'error',
+        message: [velocity.message],
+        data: { reason: velocity.reason, retry_after_minutes: velocity.retryAfterMinutes },
+      });
+    }
+
+    // First transfer to this recipient: show the resolved name and make them
+    // send again. The name is the only thing that catches a wrong digit, and it
+    // is worth one extra tap once per recipient, ever.
+    if (await isNewBeneficiary(user.id, receiver.id)) {
+      if (!(await hasAcknowledged(user.id, receiver.id))) {
+        await recordAcknowledgementPrompt(user.id, receiver.id);
+        const displayName = `${String(receiverPii.firstname || '').trim()} ${String(receiverPii.lastname || '').trim()}`.trim() || receiverPii.username || '';
+        return res.status(409).json({
+          remark: 'confirm_beneficiary',
+          status: 'error',
+          message: [`First time sending to ${displayName}. Check the name is right, then tap send again to confirm.`],
+          data: {
+            new_beneficiary: true,
+            receiver_id: Number(receiver.id),
+            receiver_name: displayName,
+            receiver_username: receiverPii.username,
+          },
+        });
+      }
+    }
+
     const payload = {
       amount,
       charge,
       total_amount: total,
       receiver_id: Number(receiver.id),
-      receiver_username: receiver.username,
-      receiver_firstname: receiver.firstname,
-      receiver_lastname: receiver.lastname,
-      receiver_email: receiver.email,
-      receiver_mobile: receiver.mobile,
+      receiver_username: receiverPii.username,
+      receiver_firstname: receiverPii.firstname,
+      receiver_lastname: receiverPii.lastname,
+      receiver_email: receiverPii.email,
+      receiver_mobile: receiverPii.mobile,
       receiver_country_code: receiver.country_code,
       receiver_image: receiver.image,
       transfer_ref: generateTrx('sm'),
     };
 
-    setPending(user.id, remark, payload, { ttlMs: 5 * 60_000 });
+    await setPending(user.id, remark, payload, { ttlMs: 5 * 60_000 });
 
     return res.json({ remark: 'pin', status: 'success', message: ['Proceed to PIN'], data: null });
   } catch (e) {
@@ -177,6 +215,7 @@ async function history(req, res) {
       const receiverId = Number(meta.receiver_id) || null;
       const receiver = receiverId ? receiverMap.get(receiverId) : null;
       const countryDetails = receiver ? getCountryByCode(receiver.country_code) : null;
+      const rPii = revealUserFields(receiver);
 
       return {
         id: r.id,
@@ -188,18 +227,18 @@ async function history(req, res) {
         sender_post_balance: null,
         receiver_post_balance: null,
         trx: String(r.trx),
-        sender_details: r.details || '',
+        sender_details: revealText(r.details || ''),
         receiver_details: '',
         created_at: r.created_at instanceof Date ? r.created_at.toISOString() : new Date(r.created_at).toISOString(),
         updated_at: r.updated_at instanceof Date ? r.updated_at.toISOString() : new Date(r.updated_at).toISOString(),
         receiver_user: receiver
           ? {
               id: receiver.id,
-              firstname: receiver.firstname,
-              lastname: receiver.lastname,
-              username: receiver.username,
-              email: receiver.email,
-              mobile: receiver.mobile,
+              firstname: rPii.firstname,
+              lastname: rPii.lastname,
+              username: rPii.username,
+              email: rPii.email,
+              mobile: rPii.mobile,
               dial_code: countryDetails?.dial_code,
               country_code: receiver.country_code,
               country_name: countryDetails?.name,

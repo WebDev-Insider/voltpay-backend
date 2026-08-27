@@ -1,19 +1,36 @@
 const prisma = require('../../database/prisma');
 const { Prisma } = require('@prisma/client');
+const { categorize, isReversal } = require('../helpers/ledgerCategory.helper');
+const { lagosDateParts, lagosMidnightUtc } = require('../helpers/lagosTime.helper');
 
 function parseMonthYear({ month, year }) {
-  const now = new Date();
+  // "This month" is the Nigerian one. On a UTC host the first hour of every
+  // month would otherwise still default to the previous month.
+  const now = lagosDateParts(new Date());
   const m = Number.parseInt(String(month ?? ''), 10);
   const y = Number.parseInt(String(year ?? ''), 10);
-  const monthNum = Number.isFinite(m) && m >= 1 && m <= 12 ? m : (now.getMonth() + 1);
-  const yearNum = Number.isFinite(y) && y >= 2000 && y <= 2100 ? y : now.getFullYear();
+  const monthNum = Number.isFinite(m) && m >= 1 && m <= 12 ? m : now.month;
+  const yearNum = Number.isFinite(y) && y >= 2000 && y <= 2100 ? y : now.year;
   return { month: monthNum, year: yearNum };
 }
 
+/**
+ * The month, in Nigerian time, as UTC instants.
+ *
+ * Not `new Date(year, month - 1, 1)`: that reads the server's timezone, so the
+ * same statement covers different transactions on a Lagos host and a UTC one.
+ * A purchase at 00:30 WAT on the 1st is 23:30 UTC the day before, and lands in
+ * the previous month's statement on a UTC box. Same anchor the spending-insight
+ * windows use, so a statement and the notification about it cover one period.
+ *
+ * `month + 1` is deliberate - lagosMidnightUtc normalises month 13 to next
+ * January.
+ */
 function monthRange({ month, year }) {
-  const start = new Date(year, month - 1, 1, 0, 0, 0, 0);
-  const endExclusive = new Date(year, month, 1, 0, 0, 0, 0);
-  return { start, endExclusive };
+  return {
+    start: lagosMidnightUtc(year, month, 1),
+    endExclusive: lagosMidnightUtc(year, month + 1, 1),
+  };
 }
 
 function toDecimal(v) {
@@ -56,6 +73,57 @@ async function sumByTypeSince({ userId, since }) {
   return {
     plus: toDecimal(plusAgg?._sum?.amount),
     minus: toDecimal(minusAgg?._sum?.amount),
+  };
+}
+
+/**
+ * What a month's rows add up to, per category.
+ *
+ * Decimal throughout, unlike the Number arithmetic in
+ * spendingInsights.service.summarize() - that one rounds to a sentence, this one
+ * is written to monthly_statements and read back as a figure.
+ *
+ * A refund is a credit that cancels a debit of the same kind (bills.controller
+ * `refund()` stamps meta.reversal_of), so it comes back off the spend. Without
+ * that, a purchase the provider declined reads as money gone - and because this
+ * statement is persisted, the wrong number outlives the request that computed it.
+ */
+function summarizeMonth(rows) {
+  const zero = () => new Prisma.Decimal('0');
+  const byCategory = {};
+
+  for (const r of rows || []) {
+    const debit = String(r.trx_type) === '-';
+    if (!debit && !isReversal(r)) continue;
+
+    const amt = debit ? toDecimal(r.amount) : toDecimal(r.amount).negated();
+    // categorize() is shared with the spending-insight push, so the statement
+    // and the notification cannot quote different airtime/data numbers.
+    const cat = categorize(r);
+    byCategory[cat] = (byCategory[cat] || zero()).plus(amt);
+  }
+
+  // A refund can land in the month after its purchase, leaving that month
+  // holding a reversal with no debit to cancel. Nobody spent less than nothing,
+  // and a negative on a statement reads as a bug.
+  //
+  // Clamp each category first, then total them - clamping a running total
+  // instead would leave the headline figure smaller than the categories printed
+  // under it. Same order as spendingInsights.service.summarize().
+  let monthlyDebitTotal = zero();
+  for (const key of Object.keys(byCategory)) {
+    if (byCategory[key].lessThan(0)) byCategory[key] = zero();
+    monthlyDebitTotal = monthlyDebitTotal.plus(byCategory[key]);
+  }
+
+  const at = key => byCategory[key] || zero();
+
+  return {
+    monthlyDebitTotal,
+    airtimeSpent: at('airtime'),
+    dataSpent: at('data'),
+    electricitySpent: at('electricity'),
+    cableSpent: at('tv'),
   };
 }
 
@@ -119,34 +187,13 @@ async function getStatements(req, res) {
 
     const totalTxCount = monthRows.length;
 
-    let monthlyDebitTotal = new Prisma.Decimal('0');
-    let airtimeSpent = new Prisma.Decimal('0');
-    let dataSpent = new Prisma.Decimal('0');
-    let electricitySpent = new Prisma.Decimal('0');
-    let cableSpent = new Prisma.Decimal('0');
-
-    for (const r of monthRows) {
-      if (String(r.trx_type) !== '-') continue;
-      const amt = toDecimal(r.amount);
-      monthlyDebitTotal = monthlyDebitTotal.plus(amt);
-
-      const remark = String(r.remark || '').toLowerCase();
-      if (remark === 'utility_bill') {
-        electricitySpent = electricitySpent.plus(amt);
-        continue;
-      }
-      if (remark === 'cable_tv') {
-        cableSpent = cableSpent.plus(amt);
-        continue;
-      }
-
-      if (remark === 'mobile_recharge') {
-        const meta = r.meta && typeof r.meta === 'object' ? r.meta : {};
-        const t = String(meta.type || '').toLowerCase();
-        if (t === 'data') dataSpent = dataSpent.plus(amt);
-        else airtimeSpent = airtimeSpent.plus(amt);
-      }
-    }
+    const {
+      monthlyDebitTotal,
+      airtimeSpent,
+      dataSpent,
+      electricitySpent,
+      cableSpent,
+    } = summarizeMonth(monthRows);
 
     const snapshot = monthRows.slice(0, 500).map(r => ({
       trx: String(r.trx || ''),
@@ -248,4 +295,12 @@ async function getStatements(req, res) {
   }
 }
 
-module.exports = { getStatements };
+module.exports = {
+  getStatements,
+  // Exported for test/statements.controller.test.js and
+  // scripts/backfill-statements.js - the backfill has to slice the month on
+  // exactly the same boundaries this endpoint does, or it writes rows that a
+  // fresh fetch immediately disagrees with.
+  summarizeMonth,
+  monthRange,
+};
