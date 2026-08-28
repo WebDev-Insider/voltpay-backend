@@ -8,25 +8,96 @@ function getBrevoApiKey() {
   return process.env.BREVO_API_KEY || null;
 }
 
-function parseSender(fromArg) {
-  // Brevo expects sender as { email, name? }. fromArg may be:
-  // - a plain email string: "no-reply@voltpay.local"
-  // - a "Name <email>" string
-  // - already an object: { email, name }
-  const raw = fromArg || process.env.BREVO_FROM || process.env.EMAIL_FROM || 'no-reply@voltpay.local';
+const FALLBACK_SENDER = 'no-reply@voltpay.local';
+const EMAIL_RE = /^[^\s@<>",;]+@[^\s@<>",;]+\.[^\s@<>",;]+$/;
 
-  if (raw && typeof raw === 'object' && raw.email) {
-    return { email: raw.email, name: raw.name || process.env.EMAIL_BRAND_NAME || undefined };
+// Render stores a dashboard value byte for byte; dotenv strips the surrounding
+// quotes off a .env line. So a value copied out of .env into Render arrives as
+// `"VoltPay <x@y.com>"` - quotes included - and anything that anchors on a
+// trailing `>` stops matching. That mismatch is what Brevo reports as
+// `400 invalid_parameter: valid sender email required`, and it did.
+function unquote(value) {
+  const str = String(value).trim();
+  const quoted =
+    str.length >= 2 &&
+    ((str[0] === '"' && str.endsWith('"')) || (str[0] === "'" && str.endsWith("'")));
+  return quoted ? str.slice(1, -1).trim() : str;
+}
+
+/**
+ * One configured value -> { email, name } or null when it carries no usable
+ * address. Returning null rather than a best guess is the point: a malformed
+ * sender is rejected by Brevo with the whole message attached, so guessing
+ * turns a config typo into a silently undelivered OTP.
+ *
+ * Accepts a plain address, a "Name <address>" string, or { email, name }.
+ */
+function readSender(value) {
+  if (!value) return null;
+
+  if (typeof value === 'object') {
+    const email = unquote(value.email || '');
+    return EMAIL_RE.test(email) ? { email, name: value.name || undefined } : null;
   }
 
-  const str = String(raw).trim();
-  const match = str.match(/^(.*)<(.+)>$/);
-  if (match) {
-    const name = match[1].trim().replace(/^["']|["']$/g, '');
-    const email = match[2].trim();
+  const str = unquote(value);
+  if (!str) return null;
+
+  // Match the last <...> and tolerate trailing junk after it, so a stray quote
+  // or a name containing an angle bracket cannot capture the address.
+  const angled = str.match(/<([^<>]+)>[^<>]*$/);
+  if (angled) {
+    const email = angled[1].trim();
+    if (!EMAIL_RE.test(email)) return null;
+    const name = unquote(str.slice(0, angled.index));
     return { email, name: name || undefined };
   }
-  return { email: str, name: process.env.EMAIL_BRAND_NAME || undefined };
+
+  return EMAIL_RE.test(str) ? { email: str, name: undefined } : null;
+}
+
+let warnedNoSender = false;
+
+/**
+ * Resolves the From address, first usable candidate wins.
+ *
+ * RESEND_FROM is a leftover from the provider before this one and sits last on
+ * purpose: it used to be read at every call site and passed in as `fromArg`,
+ * which put a dead provider's variable ahead of BREVO_FROM. A stale value there
+ * silently overrode the correct one.
+ */
+function parseSender(fromArg) {
+  const candidates = [
+    [fromArg, 'the from argument'],
+    [process.env.BREVO_FROM, 'BREVO_FROM'],
+    [process.env.EMAIL_FROM, 'EMAIL_FROM'],
+    [process.env.RESEND_FROM, 'RESEND_FROM'],
+  ];
+
+  const rejected = [];
+  for (const [value, source] of candidates) {
+    if (!value) continue;
+    const sender = readSender(value);
+    if (sender) {
+      return { email: sender.email, name: sender.name || process.env.EMAIL_BRAND_NAME || undefined };
+    }
+    rejected.push(source);
+  }
+
+  // The variable name, never its value - the log is the one place a misconfigured
+  // address would otherwise get written down.
+  if (rejected.length) {
+    console.error(
+      `❌ Email sender misconfigured: ${rejected.join(', ')} carries no valid address. ` +
+        'Set BREVO_FROM to `Name <address@domain>` with NO surrounding quotes.'
+    );
+  } else if (!warnedNoSender) {
+    warnedNoSender = true;
+    console.warn(
+      `⚠️  No sender configured (BREVO_FROM / EMAIL_FROM unset). Using ${FALLBACK_SENDER}, which is not a deliverable address.`
+    );
+  }
+  return { email: FALLBACK_SENDER, name: process.env.EMAIL_BRAND_NAME || undefined };
 }
 
 function parseRecipients(to) {
@@ -69,9 +140,13 @@ function sendViaBrevo({ from, to, subject, html, text, replyTo, attachments = []
 
       if (text) body.textContent = text;
 
+      // readSender, not parseSender: a reply-to is typed by the person who
+      // opened the support ticket, so a malformed one must drop the field, not
+      // fall back to our own From address and not reach Brevo as junk - one bad
+      // address in the form would otherwise 400 the entire ticket email.
       if (replyTo) {
-        const rt = parseSender(replyTo);
-        body.replyTo = rt;
+        const rt = readSender(replyTo);
+        if (rt) body.replyTo = rt;
       }
 
       if (attachments && attachments.length > 0) {
@@ -503,6 +578,10 @@ async function sendRecoveryPhraseEmail({ to, phrase, firstName, fromArg }) {
 }
 
 module.exports = {
+  // Exported for test/emailTemplate.test.js. The shapes an env var can arrive
+  // in are what broke this, so they get asserted rather than assumed.
+  parseSender,
+  readSender,
   sendResetEmail,
   sendSupportTicketEmail,
   sendStaffPayVerificationEmail,

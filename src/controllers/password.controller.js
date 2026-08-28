@@ -73,7 +73,7 @@ async function requestResetEmail(req, res) {
     console.log('🔐 PasswordReset created', { id: inserted.id, user_id: inserted.user_id, expires_at: inserted.expires_at });
 
     const emailType = resetType === 'password' ? 'password_reset' : 'pin_reset';
-    const sendResult = await sendResetEmail(user.email, code, process.env.RESEND_FROM, { type: emailType });
+    const sendResult = await sendResetEmail(user.email, code, null, { type: emailType });
     if (!sendResult || !sendResult.queued) {
       console.error('❌ Password reset email not queued (controller):', sendResult && sendResult.error ? sendResult.error : 'unknown reason');
       // Hand the slot back. The cooldown exists to stop a duplicate of a mail

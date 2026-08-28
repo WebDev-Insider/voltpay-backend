@@ -285,7 +285,7 @@ async function requestEmailOtp(req, res) {
     const inserted = await PasswordResetModel.insertToken(null, email, code, 'signup');
     console.log('🔐 Signup OTP created', { id: inserted.id, expires_at: inserted.expires_at });
 
-    const sendResult = await sendResetEmail(email, code, process.env.RESEND_FROM, { type: 'email_verification' });
+    const sendResult = await sendResetEmail(email, code, null, { type: 'email_verification' });
     if (!sendResult || !sendResult.queued) {
       console.error('❌ Signup OTP email not queued:', sendResult && sendResult.error ? sendResult.error : 'unknown reason');
       return res.status(200).json({

@@ -769,7 +769,7 @@ async function resendVerify(req, res) {
     const { code } = await issueVerificationCode({ userId: fresh.id, type, target });
 
     if (type === 'email') {
-      const sendResult = await sendResetEmail(String(freshPii.email).trim(), code, process.env.RESEND_FROM, { type: 'email_verification' });
+      const sendResult = await sendResetEmail(String(freshPii.email).trim(), code, null, { type: 'email_verification' });
       if (!sendResult || !sendResult.queued) {
         console.error('❌ resendVerify email not queued:', sendResult && sendResult.error ? sendResult.error : 'unknown reason');
 

@@ -210,10 +210,9 @@ async function emailAdminNewTicket(ticket, message, files) {
   const text = `New Support Ticket ${ticket.ticket}\nSubject: ${subject}\nPriority: ${PRIORITY_LABEL[ticket.priority]}\n\n${message}`;
   const result = await sendSupportTicketEmail({
     to,
-    // No literal fallback: email.service already chains BREVO_FROM ->
-    // EMAIL_FROM, and passing an unverified address instead makes Brevo reject
-    // the send.
-    fromArg: process.env.RESEND_FROM,
+    // No fromArg at all: email.service owns the chain (BREVO_FROM ->
+    // EMAIL_FROM -> RESEND_FROM) and validates what it picks. Passing an
+    // address from here only jumped the queue with a dead provider's variable.
     replyTo: email || undefined,
     subject: `[Support] ${ticket.ticket} - ${subject}`,
     html,
@@ -252,7 +251,6 @@ async function notifyTicketUser(ticket, { subject, body, type }) {
   try {
     const result = await sendSupportTicketEmail({
       to: email,
-      fromArg: process.env.RESEND_FROM,
       subject: `[${ticket.ticket}] ${subject}`,
       html: userEmailHtml({ ticket, subject, body }),
       text: `${subject}\n\n${body}\n\nTicket ${ticket.ticket}\nOpen the VoltPay app to reply.`,

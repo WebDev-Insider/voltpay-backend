@@ -201,11 +201,75 @@ for (const attack of ['../../.env', '../prisma/schema.prisma', '', 'nope.png', '
 /* -------------------------------------------------------------------------- */
 
 const {
+  parseSender,
+  readSender,
   sendResetEmail,
   sendStaffPayVerificationEmail,
   sendAccountClosureEmail,
   sendRecoveryPhraseEmail,
 } = require('../src/services/email.service');
+
+/* -------------------------------------------------------------------------- */
+/* Sender resolution                                                           */
+/* -------------------------------------------------------------------------- */
+
+// Production sent Brevo a From of `"Voltpay <addr>"` - quotes and all - and got
+// `400 invalid_parameter: valid sender email required`, so every OTP and every
+// device-verification email stopped. dotenv strips the quotes off a .env line;
+// Render's dashboard stores the value byte for byte. Both shapes must resolve.
+for (const raw of [
+  'Voltpay <jade@example.com>',
+  '"Voltpay <jade@example.com>"',
+  "'Voltpay <jade@example.com>'",
+  '  Voltpay <jade@example.com>  ',
+]) {
+  const parsed = readSender(raw);
+  assert.ok(parsed, `${JSON.stringify(raw)} resolves`);
+  assert.strictEqual(parsed.email, 'jade@example.com', `${JSON.stringify(raw)} -> address`);
+  assert.strictEqual(parsed.name, 'Voltpay', `${JSON.stringify(raw)} -> name`);
+}
+
+assert.strictEqual(readSender('jade@example.com').email, 'jade@example.com', 'a bare address needs no name');
+assert.strictEqual(readSender({ email: 'jade@example.com', name: 'X' }).name, 'X', 'an object passes through');
+
+// Anything with no address in it is null, never a best guess: a guess is what
+// reached Brevo as a From and took the whole send down with it.
+for (const junk of ['Voltpay', '', '   ', 'VoltPay <>', 'VoltPay <not-an-email>', null, undefined, {}]) {
+  assert.strictEqual(readSender(junk), null, `${JSON.stringify(junk)} carries no address`);
+}
+
+// The chain: first usable candidate wins, and a malformed one is skipped rather
+// than sent. RESEND_FROM is last - it is the previous provider's variable and
+// must never outrank BREVO_FROM again.
+const savedEnv = {
+  BREVO_FROM: process.env.BREVO_FROM,
+  EMAIL_FROM: process.env.EMAIL_FROM,
+  RESEND_FROM: process.env.RESEND_FROM,
+};
+const quietErr = console.error;
+console.error = () => {};
+try {
+  process.env.BREVO_FROM = '"Voltpay <brevo@example.com>"';
+  delete process.env.EMAIL_FROM;
+  delete process.env.RESEND_FROM;
+  assert.strictEqual(parseSender().email, 'brevo@example.com', 'a quoted BREVO_FROM still works');
+  assert.strictEqual(parseSender('Ops <ops@example.com>').email, 'ops@example.com', 'an explicit argument wins');
+
+  process.env.RESEND_FROM = 'Old <resend@example.com>';
+  assert.strictEqual(parseSender().email, 'brevo@example.com', 'BREVO_FROM outranks RESEND_FROM');
+
+  process.env.BREVO_FROM = 'Voltpay';
+  assert.strictEqual(parseSender().email, 'resend@example.com', 'a junk BREVO_FROM is skipped, not sent');
+
+  delete process.env.RESEND_FROM;
+  assert.strictEqual(parseSender().email, 'no-reply@voltpay.local', 'nothing usable falls back');
+} finally {
+  console.error = quietErr;
+  for (const [key, value] of Object.entries(savedEnv)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+}
 
 (async () => {
   // Silence the dev-mode "would send" line so the test output stays readable.

@@ -203,7 +203,10 @@ async function sendDeviceVerificationCode(user, type = 'device') {
 
   const code = generateNumericCode(6);
   await PasswordResetModel.insertToken(user.id, email, code, type);
-  const result = await sendResetEmail(email, code, process.env.RESEND_FROM, { type: 'email_verification' });
+  // No from argument: email.service resolves BREVO_FROM -> EMAIL_FROM ->
+  // RESEND_FROM and validates the result. Reading a variable here only put a
+  // dead provider's name ahead of the live one.
+  const result = await sendResetEmail(email, code, null, { type: 'email_verification' });
   if (!result || !result.queued) {
     console.error('❌ Device verification email not queued for user', user.id);
     await cache.releaseOtpSlot(otpSubject);

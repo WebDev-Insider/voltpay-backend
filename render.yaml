@@ -166,10 +166,11 @@ services:
       # `sync: false` means Render prompts for the value and stores it
       # encrypted. Nothing below is ever committed to git.
       #
-      # PUBLIC_BASE_URL must become the live Render URL
-      # (https://voltpay-api.onrender.com) - Paystack callbacks and virtual
-      # account webhooks are built from it, and it currently points at an
-      # ngrok tunnel that will not exist in production.
+      # PUBLIC_BASE_URL must be the live Render URL of THIS service - as
+      # deployed that is https://voltpay-backend.onrender.com, which does not
+      # match the `name:` above. Paystack callbacks, virtual account webhooks
+      # and the logo on every email are built from it, so it has to be the
+      # hostname the service actually answers on, not the one implied here.
       - key: PUBLIC_BASE_URL
         sync: false
       - key: CORS_ALLOWED_ORIGINS
@@ -221,6 +222,21 @@ services:
         sync: false
 
       # Email
+      #
+      # BREVO_FROM IS ENTERED WITHOUT QUOTES. This is the one env var whose
+      # value differs between .env and the Render dashboard, and it has already
+      # cost a production outage. In .env it is written
+      #     BREVO_FROM="Voltpay <address@domain>"
+      # and dotenv strips the quotes. Render stores the field byte for byte, so
+      # pasting that value with its quotes gives Brevo a From of
+      # `"Voltpay <address@domain>"` and it answers
+      #     400 invalid_parameter: valid sender email required
+      # on every send - OTPs, device verification, password resets, the lot.
+      # Type it as:  Voltpay <address@domain>
+      #
+      # The address must also be an active sender on the Brevo account
+      # (Senders, Domains & Dedicated IPs -> Senders), or mail is accepted and
+      # then fails delivery, which is harder to spot than a 400.
       - key: BREVO_API_KEY
         sync: false
       - key: BREVO_FROM
