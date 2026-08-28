@@ -15,14 +15,9 @@ const EMAIL_RE = /^[^\s@<>",;]+@[^\s@<>",;]+\.[^\s@<>",;]+$/;
 // quotes off a .env line. So a value copied out of .env into Render arrives as
 // `"VoltPay <x@y.com>"` - quotes included - and anything that anchors on a
 // trailing `>` stops matching. That mismatch is what Brevo reports as
-// `400 invalid_parameter: valid sender email required`, and it did.
-function unquote(value) {
-  const str = String(value).trim();
-  const quoted =
-    str.length >= 2 &&
-    ((str[0] === '"' && str.endsWith('"')) || (str[0] === "'" && str.endsWith("'")));
-  return quoted ? str.slice(1, -1).trim() : str;
-}
+// `400 invalid_parameter: valid sender email required`, and it did. Shared with
+// upload.helper, which lost every support attachment to the same stray quote.
+const { unquote } = require('../helpers/env.helper');
 
 /**
  * One configured value -> { email, name } or null when it carries no usable
