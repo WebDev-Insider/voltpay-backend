@@ -524,6 +524,50 @@ const savedUserId = process.env.CLUBKONNECT_USER_ID;
   assert.strictEqual(bills.__test.normalizeProvider('payvessel'), '');
   assert.strictEqual(bills.__test.normalizeProvider(null), '');
 
+  /* ---------------------------------------------------------------- */
+  /* Connection failures name themselves                               */
+  /* ---------------------------------------------------------------- */
+
+  // Production logged `ClubKonnect request failed: fetch failed` and that was
+  // the entire diagnostic. `fetch` reports DNS failure, connection refused, a
+  // mid-flight reset and a rejected certificate with that one message, putting
+  // the reason in `cause` - so the line named none of them and the outage had
+  // to be diagnosed from scratch. These assert the code survives to the log.
+  const { causeCode } = require('../src/helpers/retry.helper');
+
+  assert.strictEqual(causeCode(new TypeError('fetch failed', { cause: { code: 'ECONNRESET' } })), 'ECONNRESET');
+  assert.strictEqual(causeCode({ cause: { cause: { code: 'ENOTFOUND' } } }), 'ENOTFOUND', 'walks more than one level');
+  assert.strictEqual(causeCode(new Error('plain')), '', 'an error we threw ourselves has no code to report');
+  assert.strictEqual(causeCode(null), '');
+
+  const realFetch = global.fetch;
+  const previousRetries = process.env.PROVIDER_MAX_RETRIES;
+
+  process.env.PROVIDER_MAX_RETRIES = '0'; // no backoff sleep in a unit test
+
+  for (const [service, adapter] of [['ClubKonnect', ck], ['PairGate', pg]]) {
+    global.fetch = async () => {
+      throw new TypeError('fetch failed', { cause: { code: 'ECONNRESET' } });
+    };
+
+    const failure = await adapter.getWalletBalance().then(
+      () => null,
+      e => e
+    );
+
+    assert.ok(failure, `${service} surfaces a connection failure rather than resolving`);
+    assert.match(failure.message, /ECONNRESET/, `${service} names the socket code, not just "fetch failed"`);
+    assert.strictEqual(failure.statusCode, 504, `${service} keeps the retryable status`);
+    // The chain has to stay intact: retry.helper walks `cause` and would
+    // otherwise be matching on the words "fetch failed" in our own string.
+    assert.strictEqual(failure.cause?.cause?.code, 'ECONNRESET', `${service} preserves the original error`);
+  }
+
+  global.fetch = realFetch;
+
+  if (previousRetries === undefined) delete process.env.PROVIDER_MAX_RETRIES;
+  else process.env.PROVIDER_MAX_RETRIES = previousRetries;
+
   console.log('clubkonnect.service tests passed');
 })().catch(e => {
   console.error(e);

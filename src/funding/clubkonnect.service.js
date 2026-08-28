@@ -42,7 +42,7 @@
 // Operational note: ClubKonnect authenticates partly by source IP. The
 // deployment's outbound address must be whitelisted on their dashboard or every
 // call answers INVALID_CREDENTIALS regardless of the key.
-const { withRetry } = require('../helpers/retry.helper');
+const { withRetry, causeCode } = require('../helpers/retry.helper');
 const { createCatalogueCache, REFRESH_HELD, REFRESH_NO_LOCK } = require('./catalogueCache');
 const { readDuration } = require('./planDuration');
 
@@ -95,8 +95,11 @@ const { cached, pace: paceCatalogue, drop: dropCatalogue, claimRefresh } = catal
 
 /* -------------------------------------------------------------------- errors */
 
-function providerError(message, { statusCode = 502, payload = null, retryAfterMs = null } = {}) {
-  const err = new Error(message);
+function providerError(message, { statusCode = 502, payload = null, retryAfterMs = null, cause = null } = {}) {
+  // `cause` is carried so retry.helper can walk the original socket error
+  // instead of falling back to matching the words "fetch failed" in a string we
+  // built ourselves.
+  const err = cause ? new Error(message, { cause }) : new Error(message);
   err.statusCode = statusCode;
   // Named for the provider so a caller can tell the two apart in a log without
   // guessing. bills.controller reads `err.pairgate || err.clubkonnect`.
@@ -277,9 +280,20 @@ async function ckRequestOnce(path, query) {
     });
     text = await res.text();
   } catch (e) {
+    // `fetch` says only "fetch failed" for every connection-level problem and
+    // hides the reason in `cause`, so the code is lifted out here. ENOTFOUND is
+    // our DNS, ECONNREFUSED is their box, ECONNRESET is the path between us -
+    // and their origin is in Lagos, so a rail vending from a datacentre on
+    // another continent is exactly where the path is the suspect. Without the
+    // code the line names none of them and the next occurrence is diagnosed
+    // from scratch.
+    const code = causeCode(e);
     const reason =
-      e?.name === 'AbortError' ? 'ClubKonnect request timed out' : `ClubKonnect request failed: ${e?.message || e}`;
-    throw providerError(reason, { statusCode: 504 });
+      e?.name === 'AbortError'
+        ? `ClubKonnect request timed out after ${TIMEOUT_MS}ms`
+        : `ClubKonnect request failed: ${e?.message || e}${code ? ` (${code})` : ''}`;
+
+    throw providerError(reason, { statusCode: 504, cause: e });
   } finally {
     clearTimeout(timer);
   }

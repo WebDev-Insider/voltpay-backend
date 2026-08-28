@@ -60,6 +60,27 @@ function isTransient(err) {
   return false;
 }
 
+/**
+ * The first real error code in undici's cause chain, e.g. ECONNRESET.
+ *
+ * `fetch` reports every connection-level failure with the same useless message,
+ * the literal string "fetch failed", and puts the reason one or more levels down
+ * in `cause`. A log line carrying only the message collapses DNS failure,
+ * connection refused, a reset mid-flight and a rejected certificate into one
+ * indistinguishable string - and those have different owners and different
+ * fixes, so the difference is the whole diagnostic value of the line.
+ *
+ * Returns '' when there is no code, which is the normal case for an error we
+ * threw ourselves rather than one the socket handed us.
+ */
+function causeCode(err) {
+  for (let e = err, depth = 0; e && depth < 4; e = e.cause, depth += 1) {
+    if (e.code) return String(e.code);
+  }
+
+  return '';
+}
+
 function delayFor(attempt, baseMs, maxMs) {
   const window = Math.min(maxMs, baseMs * 2 ** attempt);
   // Full-jitter would allow ~0ms, which retries into a provider that has not
@@ -126,6 +147,7 @@ async function withRetry(fn, opts = {}) {
 module.exports = {
   withRetry,
   isTransient,
+  causeCode,
   // exported for tests
   delayFor,
   MAX_ALLOWED_RETRIES,

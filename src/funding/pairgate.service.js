@@ -33,7 +33,7 @@
 // a customer whose own wallet is funded. isFloatError marks it.
 const crypto = require('crypto');
 
-const { withRetry } = require('../helpers/retry.helper');
+const { withRetry, causeCode } = require('../helpers/retry.helper');
 const { createCatalogueCache, REFRESH_HELD, REFRESH_NO_LOCK } = require('./catalogueCache');
 const { readDuration, durationLabel, toDays } = require('./planDuration');
 
@@ -136,8 +136,11 @@ const { cached, pace: paceCatalogue, drop: dropCatalogue, claimRefresh } = catal
 
 /* -------------------------------------------------------------------- errors */
 
-function providerError(message, { statusCode = 502, payload = null, retryAfterMs = null } = {}) {
-  const err = new Error(message);
+function providerError(message, { statusCode = 502, payload = null, retryAfterMs = null, cause = null } = {}) {
+  // `cause` is carried so retry.helper can walk the original socket error
+  // instead of falling back to matching the words "fetch failed" in a string we
+  // built ourselves.
+  const err = cause ? new Error(message, { cause }) : new Error(message);
   err.statusCode = statusCode;
   err.pairgate = payload;
   if (retryAfterMs != null) err.retryAfterMs = retryAfterMs;
@@ -283,8 +286,17 @@ async function pgRequestOnce(method, path, { query, body } = {}) {
     res = await fetch(url, { method, headers, body: payload, signal: controller.signal });
     text = await res.text();
   } catch (e) {
-    const reason = e?.name === 'AbortError' ? 'PairGate request timed out' : `PairGate request failed: ${e?.message || e}`;
-    throw providerError(reason, { statusCode: 504 });
+    // See the same block in clubkonnect.service.js: `fetch` collapses DNS
+    // failure, connection refused, a mid-flight reset and a rejected
+    // certificate into the one message "fetch failed", so the code is lifted
+    // out of `cause` or the log names none of them.
+    const code = causeCode(e);
+    const reason =
+      e?.name === 'AbortError'
+        ? `PairGate request timed out after ${TIMEOUT_MS}ms`
+        : `PairGate request failed: ${e?.message || e}${code ? ` (${code})` : ''}`;
+
+    throw providerError(reason, { statusCode: 504, cause: e });
   } finally {
     clearTimeout(timer);
   }
