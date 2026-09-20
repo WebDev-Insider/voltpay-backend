@@ -105,7 +105,7 @@ async function createVirtualAccount({ email, name, phoneNumber, bankCode, busine
     email,
     name,
     phoneNumber,
-    bankCode: [process.env.PAYMENTPOINT_OPAY_BANK_CODE],
+    bankCode,
     businessId,
   };
 
