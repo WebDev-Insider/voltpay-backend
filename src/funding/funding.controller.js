@@ -42,7 +42,7 @@ function computeFundingFee(amountNaira) {
 // PaymentPoint for more than one code returns one virtual account per bank.
 function parsePaymentPointBankCodes() {
   const raw = (process.env.PAYMENTPOINT_BANK_CODES || '').trim();
-  if (!raw) return ['20946'];
+  if (!raw) return ['20897'];
   return raw
     .split(',')
     .map(s => s.trim())
