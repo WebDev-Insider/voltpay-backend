@@ -642,10 +642,10 @@ const MIN_NETWORKS_FOR_SIZE = 2;
 // Anything slower than this came off the wire rather than out of the cache.
 const CACHE_HIT_MS = 150;
 
-// Above the per-second floor both rails enforce, not just near it. PairGate
-// answers a burst with "Please wait 1 seconds before retrying" and ClubKonnect
-// paces its own catalogue calls, so a sub-second gap guarantees the throttle on
-// every cold load and spends retries that cannot succeed.
+// Above the per-second floor bills providers enforce, not just near it. A
+// sub-second gap guarantees a throttle on every cold load against a provider
+// that answers a burst with "please wait", and spends retries that cannot
+// succeed.
 const CATALOGUE_CALL_SPACING_MS = 1_500;
 
 // How close a plan has to be to count as that size actually being sold. Loose

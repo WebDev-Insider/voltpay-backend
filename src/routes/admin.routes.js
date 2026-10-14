@@ -16,7 +16,10 @@ const AdminUserProfileController = require('../controllers/adminUserProfile.cont
 const AdminOpsController = require('../controllers/adminOps.controller')
 const AdminRiskController = require('../controllers/adminRisk.controller')
 const AdminInsightsController = require('../controllers/adminInsights.controller')
-const { uploadAnyAttachments } = require('../middlewares/upload.middleware')
+const AdminAirtimeCashController = require('../controllers/adminAirtimeCash.controller')
+const AdminCacController = require('../controllers/adminCac.controller')
+const AdminVirtualCardController = require('../controllers/adminVirtualCard.controller')
+const { uploadAnyAttachments, uploadCacDeliverable } = require('../middlewares/upload.middleware')
 const { requireAdminRole } = require('../middlewares/adminAuth.middleware')
 const rateLimit = require('../middlewares/rateLimit.middleware')
 
@@ -126,9 +129,9 @@ router.patch('/bill-hero/availability', AdminBillHeroController.updateAvailabili
 
 // Challenge authoring. Same reasoning as the lock: any admin can write one,
 // and every write is picked up by adminAudit.middleware.
-// The data sizes a reward can promise, priced per network off PairGate's live
-// catalogue. Read-only, and it degrades to an empty list rather than an error so
-// a provider outage cannot block challenge authoring.
+// The data sizes a reward can promise, priced per network off the data rail's
+// live catalogue. Read-only, and it degrades to an empty list rather than an
+// error so a provider outage cannot block challenge authoring.
 router.get('/bill-hero/data-plans', AdminBillHeroController.listDataPlanOptions)
 
 router.get('/bill-hero/challenges', AdminBillHeroController.listChallengeRows)
@@ -164,10 +167,7 @@ router.get('/providers', AdminOpsController.getProviderHealth)
 // Vending capacity. Bills are prepaid from a float held with the provider, so
 // this is the number that decides whether airtime, data, TV and electricity
 // work at all - independent of how well funded any customer wallet is.
-// `/bills/floats` covers every provider and says which rails each is carrying;
-// `/pairgate/wallet` is the original single-rail read, kept for the card that
-// already renders it.
-router.get('/pairgate/wallet', AdminOpsController.getPairgateWallet)
+// `/bills/floats` covers every provider and says which rails each is carrying.
 router.get('/bills/floats', AdminOpsController.getBillsFloats)
 
 // The provider switch. Four rails, four independent choices, so a provider
@@ -191,6 +191,76 @@ router.get('/revenue', AdminOpsController.getRevenue)
 // aggregates the whole ledger and must not run on page load.
 router.get('/integrity', AdminOpsController.getIntegrity)
 router.get('/integrity/drift', AdminOpsController.getIntegrityDrift)
+
+// Airtime to Cash. Conversions credit our MySubWallet float, not Paystack, so
+// a customer's cash only becomes withdrawable when somebody has moved the money
+// across and marks it available here.
+//
+// The unlock and the failure are money decisions - one lets customers pull cash
+// out of Paystack, the other tells a customer they will not be paid - so they
+// are finance or superadmin. Support can read everything and leave notes. All
+// three writes are audited by the middleware on this router.
+const settlement = requireAdminRole('finance', 'superadmin')
+router.get('/airtime-cash/overview', AdminAirtimeCashController.overview)
+router.get('/airtime-cash/conversions', AdminAirtimeCashController.listConversions)
+router.post('/airtime-cash/conversions/mark-available', settlement, AdminAirtimeCashController.markAvailable)
+router.get('/airtime-cash/conversions/:id', AdminAirtimeCashController.getConversion)
+router.post('/airtime-cash/conversions/:id/mark-failed', settlement, AdminAirtimeCashController.markFailed)
+// MySubWallet credited it, VoltPay never recorded it: credit the customer as
+// pending. A money decision - the same role as the unlock - with a note naming
+// where it was confirmed, since their requery cannot confirm Airtime to Cash.
+router.post('/airtime-cash/conversions/:id/record-success', settlement, AdminAirtimeCashController.recordProviderSuccess)
+router.post('/airtime-cash/conversions/:id/notes', AdminAirtimeCashController.addNote)
+router.get('/airtime-cash/withdrawals', AdminAirtimeCashController.listWithdrawals)
+router.post('/airtime-cash/withdrawals/:id/requery', AdminAirtimeCashController.requeryWithdrawal)
+
+// CAC Registration. The queue is paid applications only - an unpaid draft is
+// never listed and every transition is guarded on payment in the service, so
+// "do not process unpaid applications" is not a rule anybody here has to
+// remember.
+//
+// Processing is ordinary queue work for any admin - including handing over the
+// documents CAC issued, one file per call. The price, the on/off switch and a
+// refund are money decisions: finance or superadmin. Rejecting WITH a refund is
+// checked in the controller, because the flag is in the body.
+//
+// The application and its documents are identity data - the controller logs
+// every read of either, since adminAudit only records writes. Documents stream
+// through this API, so an UploadThing link never reaches the browser.
+const cacMoney = requireAdminRole('finance', 'superadmin')
+router.get('/cac/settings', AdminCacController.getSettings)
+router.patch('/cac/settings', cacMoney, AdminCacController.updateSettings)
+router.get('/cac/applications', AdminCacController.listApplications)
+router.get('/cac/applications/:id', AdminCacController.getApplication)
+router.get('/cac/applications/:id/documents/:kind', AdminCacController.viewDocument)
+router.post('/cac/applications/:id/start', AdminCacController.start)
+router.post('/cac/applications/:id/request-info', AdminCacController.requestInfo)
+router.post('/cac/applications/:id/deliverables', uploadCacDeliverable, AdminCacController.uploadDeliverable)
+router.get('/cac/applications/:id/deliverables/:docId', AdminCacController.viewDeliverable)
+router.delete('/cac/applications/:id/deliverables/:docId', AdminCacController.deleteDeliverable)
+router.post('/cac/applications/:id/complete', AdminCacController.complete)
+router.post('/cac/applications/:id/reject', AdminCacController.reject)
+router.post('/cac/applications/:id/refund', cacMoney, AdminCacController.refund)
+router.post('/cac/applications/:id/notes', AdminCacController.addNote)
+
+// USD Virtual Mastercard. Reads, freezes and syncs are support work for any
+// admin; the price, the dollar rate, the limits and the kill switch are money
+// decisions - finance or superadmin. Nothing here refunds by hand: every
+// refund is the engine's own, guarded and automatic, and "sync" only makes the
+// sweep's work happen now. The fixed paths come before /:id.
+const cardMoney = requireAdminRole('finance', 'superadmin')
+router.get('/virtual-cards/overview', AdminVirtualCardController.overview)
+router.get('/virtual-cards/settings', AdminVirtualCardController.getSettings)
+router.patch('/virtual-cards/settings', cardMoney, AdminVirtualCardController.updateSettings)
+router.get('/virtual-cards/fundings', AdminVirtualCardController.listFundings)
+router.get('/virtual-cards/webhooks', AdminVirtualCardController.listWebhooks)
+router.get('/virtual-cards', AdminVirtualCardController.listCards)
+router.get('/virtual-cards/:id', AdminVirtualCardController.getCard)
+router.post('/virtual-cards/:id/freeze', AdminVirtualCardController.freeze)
+router.post('/virtual-cards/:id/unfreeze', AdminVirtualCardController.unfreeze)
+// Permanent, and it writes money into a wallet: the money roles only.
+router.post('/virtual-cards/:id/terminate', cardMoney, AdminVirtualCardController.terminate)
+router.post('/virtual-cards/:id/sync', AdminVirtualCardController.sync)
 
 // ---------------------------------------------------------------------------
 // Risk and compliance

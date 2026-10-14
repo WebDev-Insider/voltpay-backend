@@ -560,6 +560,10 @@ async function anonymizeUserData(userId, { now = new Date() } = {}) {
     prisma.monthlyStatement.deleteMany({ where: { user_id: id } }),
     prisma.passwordReset.deleteMany({ where: { user_id: id } }),
     prisma.verificationCode.deleteMany({ where: { user_id: id } }),
+    // Standing orders hold *other people's* numbers and nicknames, and a
+    // closed account can never buy one again. Their run rows cascade; the money
+    // they moved stays in wallet_transactions with the rest of the ledger.
+    ...(prisma.scheduledTopup ? [prisma.scheduledTopup.deleteMany({ where: { user_id: id } })] : []),
     prisma.user.update({
       where: { id },
       data: {

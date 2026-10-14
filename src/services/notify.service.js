@@ -65,7 +65,12 @@ async function notifyUser({
 
   if (push) {
     try {
-      await sendToUser(id, { title: subject, body: message, data: pushData || data || {} });
+      // The app routes a tap on `data.type`, so the push always carries one.
+      // A caller's own `type` in `data` wins; `pushData` is sent as given.
+      // Without this, a caller that put its type only in the `type` argument
+      // (Airtime to Cash did) delivered pushes whose tap opened nothing.
+      const payload = pushData || { type: String(type || 'general'), ...(data || {}) };
+      await sendToUser(id, { title: subject, body: message, data: payload });
     } catch (e) {
       console.error('notifyUser: push failed', { user_id: id, error: e?.message || e });
     }

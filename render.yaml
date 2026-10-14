@@ -127,6 +127,56 @@ services:
       - key: STAFFPAY_WEBHOOK_DEBUG
         value: "0"
 
+      # ---- Scheduled top-ups: standing airtime/data orders -----------------
+      # The worker buys due schedules on a one-minute tick in Lagos time. Safe
+      # on several instances - each cycle is claimed once in the database - and
+      # it refuses to start on a serverless host. Without this flag nobody's
+      # Monday top-up happens, and the boot log says so in production.
+      - key: SCHEDULED_TOPUPS_ENABLED
+        value: "true"
+      - key: SCHEDULED_TOPUPS_INTERVAL_MS
+        value: "60000"
+      - key: SCHEDULED_TOPUPS_RETRY_MINUTES
+        value: "60,180,360"   # the "retry 3x if balance low" the app promises
+
+      # ---- Airtime to Cash -------------------------------------------------
+      # Customer-facing price: MTN 75% less a flat ₦100, Airtel 70%. The
+      # provider rates are what MySubWallet pays us - admin margin only.
+      # Airtel's is unpublished; it defaults to the payout rate (margin 0)
+      # until MySubWallet confirms the real figure.
+      - key: A2C_MTN_PAYOUT_RATE
+        value: "0.75"
+      - key: A2C_MTN_FEE
+        value: "100"
+      - key: A2C_AIRTEL_PAYOUT_RATE
+        value: "0.70"
+      - key: A2C_AIRTEL_FEE
+        value: "0"
+      - key: A2C_MTN_PROVIDER_RATE
+        value: "0.75"
+      - key: A2C_AIRTEL_PROVIDER_RATE
+        value: "0.70"
+      - key: A2C_MIN_AMOUNT
+        value: "1000"
+      - key: A2C_MAX_AMOUNT
+        value: "50000"
+      - key: A2C_DAILY_LIMIT
+        value: "100000"
+      - key: A2C_OTP_TTL_SECONDS
+        value: "60"
+      - key: A2C_OTP_LENGTH
+        value: "4"   # the network's code; the app draws this many boxes
+      - key: A2C_REQUIRE_KYC
+        value: "1"
+      - key: A2C_PAYOUT_OWN_NAME_ONLY
+        value: "1"
+      - key: A2C_SETTLEMENT_ALERT_HOURS
+        value: "24"
+      # Step 3 of a conversion only - the network moves the airtime before it
+      # answers, and a live one outran the 30s vend limit (2026-10-12).
+      - key: MYSUBWALLET_CASH_TIMEOUT_MS
+        value: "90000"
+
       # ---- other schedulers already living in server.js -------------------
       - key: BETTING_SWEEP_INTERVAL_MS
         value: "300000"
@@ -201,10 +251,6 @@ services:
       # Payments
       - key: PAYSTACK_SECRET_KEY
         sync: false
-      - key: BUDPAY_SECRET_KEY
-        sync: false
-      - key: BUDPAY_PUBLIC_KEY
-        sync: false
       - key: PAYMENTPOINT_API_KEY
         sync: false
       - key: PAYMENTPOINT_SECRET_KEY
@@ -214,6 +260,10 @@ services:
       - key: PAYVESSEL_API_KEY
         sync: false
       - key: PAYVESSEL_API_SECRET
+        sync: false
+      # Airtime, data, TV and electricity vend through MySubWallet. Betting
+      # stays on Payvessel and uses the PAYVESSEL_* pair above.
+      - key: MYSUBWALLET_API_KEY
         sync: false
       - key: FLUTTERWAVE_SECRET_KEY
         sync: false

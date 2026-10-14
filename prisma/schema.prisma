@@ -98,6 +98,7 @@ model User {
   staffpay_funding_transactions StaffPayFundingTransaction[]
   staffpay_subscriptions        StaffPaySubscription[]
   kyc_verification              KycVerification?
+  scheduled_topups              ScheduledTopup[]
 
   @@map("users")
 }
@@ -589,6 +590,598 @@ model BillHeroClaim {
   @@index([user_id, claimed_at])
   @@index([challenge_id, status])
   @@map("bill_hero_claims")
+}
+
+/// A standing order for airtime or data, paid from the VoltPay wallet on a
+/// weekly or monthly cadence in Lagos time. The worker in
+/// services/scheduledTopup.service.js buys it through the same reserve / vend /
+/// refund path as a tap on the pay button.
+///
+/// The recipient is usually somebody else ("Mom"), so their number is
+/// AES-GCM ciphertext and the nickname goes through protectText() - both are
+/// read back to vend and to display, and neither is ever looked up by.
+model ScheduledTopup {
+  id             Int       @id @default(autoincrement())
+  user_id        Int
+  /// airtime | data. Electricity and TV are not schedulable yet.
+  service        String
+  /// The network as the bills catalogue names it: MTN | AIRTEL | GLO | 9MOBILE.
+  provider       String
+  /// Recipient number in local form (0803...), encrypted.
+  phone_enc      String
+  /// The customer's own name for the recipient. protectText().
+  label          String?
+  /// Naira. Airtime: what each run buys. Data: the plan price the customer
+  /// authorised - a run never charges more than this without a fresh PIN.
+  amount         Decimal   @db.Decimal(15, 2)
+  plan_id        String?
+  plan_name      String?
+  plan_validity  String?
+  /// weekly | monthly
+  frequency      String
+  /// 0 = Sunday ... 6 = Saturday. Weekly only.
+  day_of_week    Int?
+  /// 1-31, clamped to the last day of a shorter month. Monthly only.
+  day_of_month   Int?
+  /// "HH:MM", 24-hour, Lagos wall clock.
+  run_time       String
+  timezone       String    @default("Africa/Lagos")
+  /// active | paused | deleted
+  status         String    @default("active")
+  /// Set when the worker paused it (plan withdrawn, price rose, KYC lock).
+  /// Null when the customer paused it themselves.
+  pause_reason   String?
+  /// "Notify 1 hour prior to debit".
+  notify_before  Boolean   @default(true)
+  next_run_at    DateTime?
+  last_run_at    DateTime?
+  /// The cycle the one-hour reminder went out for, so two instances - or a
+  /// restart - cannot send it twice.
+  reminder_cycle String?
+  deleted_at     DateTime?
+  created_at     DateTime  @default(now())
+  updated_at     DateTime  @updatedAt
+
+  user User                @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  runs ScheduledTopupRun[]
+
+  @@index([user_id, status])
+  @@index([status, next_run_at])
+  @@map("scheduled_topups")
+}
+
+/// One cycle of one schedule. `cycle_key` names the Lagos week (the Monday it
+/// starts on) or month the run belongs to, and the unique index on it is the
+/// double-charge guard: however many instances tick, and however the schedule
+/// is edited mid-week, a cycle can be bought once.
+model ScheduledTopupRun {
+  id              Int       @id @default(autoincrement())
+  schedule_id     Int
+  user_id         Int
+  /// wk:2026-10-12 | mo:2026-10
+  cycle_key       String
+  scheduled_for   DateTime
+  /// running | retrying | processing | success | failed | skipped
+  status          String    @default("running")
+  attempts        Int       @default(0)
+  amount          Decimal   @db.Decimal(15, 2)
+  /// The ledger trx of the latest attempt. Written before any money moves, so
+  /// an attempt cut off mid-flight can always be found in the ledger.
+  trx             String?
+  next_retry_at   DateTime?
+  /// insufficient_balance | provider_error | plan_unavailable | price_changed
+  /// | kyc_required | service_unavailable | missed | ...
+  failure_code    String?
+  /// Customer-safe wording. Never the provider's raw text.
+  failure_message String?
+  completed_at    DateTime?
+  created_at      DateTime  @default(now())
+  updated_at      DateTime  @updatedAt
+
+  schedule ScheduledTopup @relation(fields: [schedule_id], references: [id], onDelete: Cascade)
+
+  @@unique([schedule_id, cycle_key])
+  @@index([status, next_retry_at])
+  @@index([schedule_id, created_at])
+  @@map("scheduled_topup_runs")
+}
+
+/// Airtime to Cash: one row per attempt to sell airtime from an MTN or Airtel
+/// line, from the OTP onwards. MySubWallet takes the airtime and credits OUR
+/// float; the customer is owed `payout`, which is paid to their bank through
+/// Paystack once an admin has moved the money across and marked it available.
+///
+/// This money never touches users.balance or wallet_transactions. It is owed
+/// on this row, and the ledger-drift check would read a ledger row for money
+/// that is not in the wallet as a broken money path.
+///
+///   awaiting_otp -> otp_verified -> submitting -> processing -> available
+///                -> withdrawing -> withdrawn
+///   failed     the provider or an admin said it did not happen
+///   abandoned  a draft that never got as far as moving airtime
+///
+/// No relation to User on purpose, same as WalletTransaction: a record of money
+/// owed is never cascaded away with the account. See services/airtimeCash.service.js.
+model AirtimeCashConversion {
+  id                     Int       @id @default(autoincrement())
+  user_id                Int
+  /// A2C-XXXXXXXXXX. Shown to the customer and to support.
+  reference              String    @unique
+  /// MTN | AIRTEL
+  network                String
+  /// The line the airtime comes from, local form, AES-GCM.
+  phone_enc              String
+  /// blindIndex(local, 'mobile') - the per-line OTP cap and the shared-line check.
+  phone_idx              String
+  /// local | international - what MySubWallet accepted at step 1, reused for 2 and 3.
+  phone_format           String?
+  status                 String    @default("awaiting_otp")
+  /// Set at submit. Whole naira of airtime.
+  amount                 Decimal?  @db.Decimal(15, 2)
+  payout_rate_bps        Int?
+  fee                    Decimal?  @db.Decimal(15, 2)
+  /// What the customer is owed.
+  payout                 Decimal?  @db.Decimal(15, 2)
+  /// What MySubWallet pays us, and our margin on it. Never sent to the app.
+  provider_rate_bps      Int?
+  provider_credit        Decimal?  @db.Decimal(15, 2)
+  margin                 Decimal?  @db.Decimal(15, 2)
+  /// confirmed | pending | unknown. Anything but confirmed is asked about again
+  /// by the sweep, and needs an explicit admin confirmation to unlock.
+  provider_status        String?
+  /// The request-id of the latest step-3 attempt: reference + attempt number,
+  /// because a reused request-id replays the first answer.
+  provider_request_id    String?   @unique
+  /// Their wording on the last refusal, for operators. Never shown as-is.
+  provider_message       String?
+  /// The step-1/step-2 verification token, AES-GCM. Cleared once spent.
+  provider_token_enc     String?
+  otp_sends              Int       @default(0)
+  otp_attempts           Int       @default(0)
+  convert_attempts       Int       @default(0)
+  otp_sent_at            DateTime?
+  otp_expires_at         DateTime?
+  otp_verified_at        DateTime?
+  submitted_at           DateTime?
+  converted_at           DateTime?
+  provider_checked_at    DateTime?
+  available_at           DateTime?
+  /// The admin who marked it available.
+  settled_by             String?
+  withdrawal_id          Int?
+  withdrawn_at           DateTime?
+  failed_at              DateTime?
+  /// Customer-safe wording.
+  failure_reason         String?
+  unconfirmed_alerted_at DateTime?
+  settlement_alerted_at  DateTime?
+  created_at             DateTime  @default(now())
+  updated_at             DateTime  @updatedAt
+
+  events     AirtimeCashEvent[]
+  withdrawal AirtimeCashWithdrawal? @relation(fields: [withdrawal_id], references: [id])
+
+  @@index([user_id, created_at])
+  @@index([status, created_at])
+  @@index([phone_idx, created_at])
+  @@index([withdrawal_id])
+  @@map("airtime_cash_conversions")
+}
+
+/// Every status change, OTP send and admin note on a conversion - the timeline
+/// the app draws and the trail a dispute is settled from. `note` is free text an
+/// admin typed, so it goes through protectText(); `meta` holds ids and counts
+/// only.
+model AirtimeCashEvent {
+  id            Int      @id @default(autoincrement())
+  conversion_id Int
+  /// otp_sent | otp_verified | otp_failed | submit_declined | status | note
+  event         String
+  from_status   String?
+  to_status     String?
+  /// system | user | admin:<name>
+  actor         String   @default("system")
+  note          String?
+  meta          Json?
+  created_at    DateTime @default(now())
+
+  conversion AirtimeCashConversion @relation(fields: [conversion_id], references: [id], onDelete: Cascade)
+
+  @@index([conversion_id, created_at])
+  @@map("airtime_cash_events")
+}
+
+/// One Paystack transfer paying out one or more available conversions. The
+/// conversions point at it while it is in flight; a failure or a reversal
+/// hands them back to `available`, so the money is always owed somewhere.
+///
+///   pending (row written, transfer not yet sent) -> processing -> success
+///   failed | reversed  -> its conversions go back to available
+model AirtimeCashWithdrawal {
+  id                 Int       @id @default(autoincrement())
+  user_id            Int
+  /// A2CW-..., the Paystack transfer reference. Unique per attempt.
+  reference          String    @unique
+  amount             Decimal   @db.Decimal(15, 2)
+  /// What the customer paid for the transfer. Zero: VoltPay absorbs Paystack's fee.
+  fee                Decimal   @default(0) @db.Decimal(15, 2)
+  /// Paystack's fee to us, for the margin report.
+  provider_fee       Decimal   @default(0) @db.Decimal(15, 2)
+  conversion_count   Int       @default(0)
+  bank_code          String
+  bank_name          String?
+  account_number_enc String
+  account_number_idx String
+  account_last4      String?
+  account_name_enc   String?
+  /// kyc | saved | new
+  account_source     String?
+  /// Offer this account again next time.
+  save_account       Boolean   @default(false)
+  recipient_code     String?
+  transfer_code      String?
+  /// pending | processing | success | failed | reversed
+  status             String    @default("pending")
+  failure_reason     String?
+  provider_message   String?
+  submitted_at       DateTime?
+  completed_at       DateTime?
+  created_at         DateTime  @default(now())
+  updated_at         DateTime  @updatedAt
+
+  conversions AirtimeCashConversion[]
+
+  @@index([user_id, created_at])
+  @@index([status, updated_at])
+  @@index([account_number_idx])
+  @@map("airtime_cash_withdrawals")
+}
+
+/// CAC registration: a business name, a limited company or incorporated
+/// trustees (`registration_type`). A row starts as an unpaid `draft` (the form
+/// and its documents, held so a Paystack checkout can settle it later) and
+/// becomes an application the moment it is paid:
+///
+///   draft -> submitted -> in_progress -> completed
+///   submitted | in_progress -> needs_more_info -> submitted (customer updated)
+///   submitted | in_progress | needs_more_info -> rejected (optionally refunded)
+///
+/// Every admin transition is an updateMany guarded on `payment_status: 'paid'`,
+/// so an unpaid draft cannot be processed by construction. Everything the
+/// customer typed - every director's and trustee's details included - is one
+/// AES-GCM blob in `details_enc`, and the documents are one encrypted map of
+/// UploadThing links in `documents_enc` - see helpers/cac.helper.js. Built by
+/// scripts/apply-cac-ddl.js.
+model CacApplication {
+  id                      Int       @id @default(autoincrement())
+  user_id                 Int
+  /// CAC-XXXXXXXX. Shown to the customer and to support.
+  reference               String    @unique
+  /// business_name | limited_company | incorporated_trustees
+  registration_type       String    @default("business_name")
+  /// draft | submitted | in_progress | needs_more_info | completed | rejected
+  status                  String    @default("draft")
+  /// unpaid | paid | refunded
+  payment_status          String    @default("unpaid")
+  /// wallet | paystack
+  payment_method          String?
+  /// The ledger trx (wallet) or the Paystack reference that paid for it.
+  payment_reference       String?
+  /// The price at the moment it was paid. Frozen: a later price change never
+  /// touches an application already bought.
+  amount_paid             Decimal?  @db.Decimal(15, 2)
+  /// protectText(JSON) - proposed names, nature, addresses, the applicant, and
+  /// any other directors, shareholders or trustees.
+  details_enc             String
+  /// protectText(JSON) - { kind: { url, mime } } for every document on the
+  /// form. The mime is sniffed from the file's own bytes, never the client's.
+  documents_enc           String?
+  registered_name_enc     String?
+  /// BN..., RC... or IT..., by type.
+  registration_number_enc String?
+  /// The latest customer-facing admin note: what more is needed, or why it was
+  /// rejected. Cleared when the customer responds.
+  admin_note_enc          String?
+  /// Times the customer answered a request for more information.
+  resubmissions           Int       @default(0)
+  paid_at                 DateTime?
+  submitted_at            DateTime?
+  started_at              DateTime?
+  info_requested_at       DateTime?
+  info_provided_at        DateTime?
+  completed_at            DateTime?
+  rejected_at             DateTime?
+  refunded_at             DateTime?
+  refund_trx              String?
+  created_at              DateTime  @default(now())
+  updated_at              DateTime  @updatedAt
+
+  events       CacApplicationEvent[]
+  payments     CacPayment[]
+  deliverables CacDeliverable[]
+
+  @@index([user_id, created_at])
+  @@index([status, updated_at])
+  @@map("cac_applications")
+}
+
+/// What CAC issued, handed on by an admin: the certificate and whatever comes
+/// with it - status report, memorandum and articles, certified constitution,
+/// TIN. One row per file. The certificate (`kind: certificate`) is the one an
+/// application cannot be completed without, and there is only ever one; the
+/// rest sit beside it. The customer sees them once the application is
+/// completed, streamed through an authenticated endpoint - `url_enc` is an
+/// encrypted UploadThing link and never leaves the server.
+model CacDeliverable {
+  id             Int      @id @default(autoincrement())
+  application_id Int
+  /// certificate | status_report | memart | constitution | tin | other
+  kind           String
+  /// protectText() - what the admin called it. Null: the kind's own name.
+  label_enc      String?
+  url_enc        String
+  /// Sniffed from the file's own bytes.
+  mime           String
+  size           Int?
+  /// admin:<name>
+  uploaded_by    String?
+  created_at     DateTime @default(now())
+
+  application CacApplication @relation(fields: [application_id], references: [id], onDelete: Cascade)
+
+  @@index([application_id])
+  @@map("cac_deliverables")
+}
+
+/// The audit trail of one application, and the history the app draws from.
+/// `note_enc` is free text an admin or the system wrote, through protectText();
+/// `meta` holds ids, amounts and field names only.
+model CacApplicationEvent {
+  id             Int      @id @default(autoincrement())
+  application_id Int
+  /// created | draft_updated | paid | started | info_requested | info_provided |
+  /// deliverable_uploaded | deliverable_removed | completed | rejected |
+  /// refunded | duplicate_payment_refunded | note
+  /// (certificate_uploaded: written before deliverables existed)
+  event          String
+  from_status    String?
+  to_status      String?
+  /// system | user | admin:<name>
+  actor          String   @default("system")
+  note_enc       String?
+  meta           Json?
+  created_at     DateTime @default(now())
+
+  application CacApplication @relation(fields: [application_id], references: [id], onDelete: Cascade)
+
+  @@index([application_id, created_at])
+  @@map("cac_application_events")
+}
+
+/// One payment attempt. A wallet payment is written already `success`, in the
+/// transaction that debits the wallet. A Paystack attempt is `pending` until
+/// Paystack itself says otherwise - by webhook, by the app's verify, or by the
+/// sweep - and money that arrives for an application already paid is handed
+/// back to the wallet (`refunded_to_wallet`), never kept.
+///
+///   pending -> success | abandoned | failed | refunded_to_wallet
+model CacPayment {
+  id                Int       @id @default(autoincrement())
+  application_id    Int
+  user_id           Int
+  /// wallet | paystack
+  method            String
+  /// CACPAY-... for Paystack, the ledger trx for the wallet.
+  reference         String    @unique
+  amount            Decimal   @db.Decimal(15, 2)
+  /// What Paystack says actually landed.
+  amount_received   Decimal?  @db.Decimal(15, 2)
+  status            String    @default("pending")
+  /// Paystack's own word for it on the last check: success | abandoned | failed | ...
+  provider_status   String?
+  /// The checkout link, reused for a second tap within the window.
+  authorization_url String?
+  failure_reason    String?
+  /// The credit that handed a duplicate or short payment back.
+  refund_trx        String?
+  paid_at           DateTime?
+  checked_at        DateTime?
+  created_at        DateTime  @default(now())
+  updated_at        DateTime  @updatedAt
+
+  application CacApplication @relation(fields: [application_id], references: [id], onDelete: Cascade)
+
+  @@index([application_id])
+  @@index([status, created_at])
+  @@map("cac_payments")
+}
+
+/// USD Virtual Mastercard, issued by Payvessel. One live card per user: the
+/// DDL adds a partial unique index on (user_id) WHERE status IN ('creating',
+/// 'active', 'frozen') that Prisma cannot express - a second create races into
+/// a P2002 and its fee debit rolls back with it. Built by
+/// scripts/apply-virtual-card-ddl.js; see services/virtualCard.service.js.
+///
+/// The card number and CVV are NEVER stored. The masked number, the expiry and
+/// the name are protectText(); the BVN and NIN survive only as blind indexes,
+/// so one identity cannot back cards on two VoltPay accounts.
+///
+///   creating -> active <-> frozen -> terminated
+///   creating -> failed (fee refunded, once)
+model VirtualCard {
+  id                     Int       @id @default(autoincrement())
+  user_id                Int
+  /// VC-XXXXXXXX. Ours; sent to Payvessel as the create reference.
+  reference              String    @unique
+  provider               String    @default("payvessel")
+  /// Payvessel's card id. Null until the create answers (or the sweep finds it).
+  provider_card_id       String?   @unique
+  /// creating | active | frozen | failed | terminated
+  status                 String    @default("creating")
+  /// Payvessel's own word on the last read: PENDING | ACTIVE | FROZEN | TERMINATED | FAILED
+  provider_status        String?
+  brand                  String    @default("MASTERCARD")
+  currency               String    @default("USD")
+  name_enc               String?
+  masked_pan_enc         String?
+  expiry_enc             String?
+  /// Payvessel's balance on the last read, in US cents. Display only.
+  balance_cents          Int       @default(0)
+  balance_synced_at      DateTime?
+  creation_fee           Decimal   @db.Decimal(15, 2)
+  creation_trx           String
+  /// `${creation_trx}_r` once the fee went back.
+  refund_trx             String?
+  bvn_idx                String?
+  nin_idx                String?
+  /// pending (debited, not sent) | sent | accepted | unknown (answer lost) | refused
+  create_state           String    @default("pending")
+  create_attempted_at    DateTime?
+  /// Successful reads of Payvessel's card list that did not find a lost create.
+  create_checks          Int       @default(0)
+  failure_reason         String?
+  provider_message       String?
+  /// Card fees Payvessel took from OUR wallet (cross-border / contactless the
+  /// card could not cover), settled out of the next top-up. US cents.
+  fee_due_cents          Int       @default(0)
+  first_funded_at        DateTime?
+  fund_reminder_at       DateTime?
+  activated_at           DateTime?
+  frozen_at              DateTime?
+  /// user | admin:<name> | provider. An admin's freeze cannot be lifted in the app.
+  frozen_by              String?
+  failed_at              DateTime?
+  terminated_at          DateTime?
+  termination_refund_trx String?   @unique
+  pending_alerted_at     DateTime?
+  checked_at             DateTime?
+  created_at             DateTime  @default(now())
+  updated_at             DateTime  @updatedAt
+
+  fundings     VirtualCardFunding[]
+  transactions VirtualCardTransaction[]
+  events       VirtualCardEvent[]
+
+  @@index([user_id, created_at])
+  @@index([status, updated_at])
+  @@index([bvn_idx])
+  @@index([nin_idx])
+  @@map("virtual_cards")
+}
+
+/// One top-up: naira out of the wallet, dollars onto the card. The DDL adds a
+/// partial unique index on (card_id) WHERE status = 'processing' - one top-up in
+/// flight per card, so a lost answer can never become a second debit.
+///
+///   processing -> successful | failed (refunded, once)
+model VirtualCardFunding {
+  id                    Int       @id @default(autoincrement())
+  card_id               Int
+  user_id               Int
+  /// The ledger trx of the debit; `${reference}_r` is its refund.
+  reference             String    @unique
+  status                String    @default("processing")
+  /// pending (debited, not sent) | sent | confirmed | unknown (answer lost) | refused
+  provider_state        String    @default("pending")
+  amount_ngn            Decimal   @db.Decimal(15, 2)
+  fee_ngn               Decimal   @db.Decimal(15, 2)
+  total_ngn             Decimal   @db.Decimal(15, 2)
+  /// US cents bought, the fee in cents, card fees settled from it, and what
+  /// Payvessel was asked to load (amount - fees due).
+  amount_cents          Int
+  fee_cents             Int
+  fee_due_cents         Int       @default(0)
+  provider_amount_cents Int
+  /// Kobo per dollar: what the customer paid, and what a dollar cost us then.
+  rate_kobo             Int
+  cost_rate_kobo        Int?
+  /// Payvessel's FUNDING transaction this top-up matched.
+  provider_txn_id       String?   @unique
+  provider_message      String?
+  failure_reason        String?
+  refund_trx            String?
+  checks                Int       @default(0)
+  sent_at               DateTime?
+  settled_at            DateTime?
+  checked_at            DateTime?
+  created_at            DateTime  @default(now())
+  updated_at            DateTime  @updatedAt
+
+  card VirtualCard @relation(fields: [card_id], references: [id], onDelete: Cascade)
+
+  @@index([card_id, created_at])
+  @@index([status, updated_at])
+  @@index([user_id, created_at])
+  @@map("virtual_card_fundings")
+}
+
+/// What happened on the card at Payvessel: purchases, declines, refunds, fees,
+/// top-ups. A display record - the money in it is the card's, never the
+/// wallet's, so nothing here is a ledger row. Merchant and description are
+/// protectText() like ledger free text.
+model VirtualCardTransaction {
+  id               Int       @id @default(autoincrement())
+  card_id          Int
+  user_id          Int
+  provider_txn_id  String    @unique
+  type             String
+  /// DEBIT | CREDIT
+  entry            String
+  status           String?
+  amount_cents     Int
+  fee_cents        Int       @default(0)
+  currency         String    @default("USD")
+  merchant_enc     String?
+  merchant_country String?
+  description_enc  String?
+  occurred_at      DateTime
+  /// webhook | sync
+  source           String
+  created_at       DateTime  @default(now())
+
+  card VirtualCard @relation(fields: [card_id], references: [id], onDelete: Cascade)
+
+  @@index([card_id, occurred_at])
+  @@map("virtual_card_transactions")
+}
+
+/// Every transition, refund, freeze and reveal. A reveal records THAT it
+/// happened, never what was shown.
+model VirtualCardEvent {
+  id         Int      @id @default(autoincrement())
+  card_id    Int
+  event      String
+  actor      String   @default("system")
+  meta       Json?
+  created_at DateTime @default(now())
+
+  card VirtualCard @relation(fields: [card_id], references: [id], onDelete: Cascade)
+
+  @@index([card_id, created_at])
+  @@map("virtual_card_events")
+}
+
+/// Every signed delivery from Payvessel's card webhook. Keyed on the sha256 of
+/// the raw body, so a resend of the same delivery is recognised and not applied
+/// twice. Ids and outcomes only - the body can name the cardholder and the
+/// merchant, and is never stored. No relation to VirtualCard on purpose: a
+/// delivery about a card we do not know is still a delivery.
+///
+///   received -> processed | ignored | failed
+model VirtualCardWebhook {
+  id                 Int       @id @default(autoincrement())
+  delivery_key       String    @unique
+  event              String
+  card_id            Int?
+  provider_reference String?
+  outcome            String    @default("received")
+  detail             String?
+  attempts           Int       @default(1)
+  received_at        DateTime  @default(now())
+  processed_at       DateTime?
+
+  @@index([received_at])
+  @@map("virtual_card_webhooks")
 }
 
 /// "Pay me ₦X" from one VoltPay user to another. Nothing moves until the

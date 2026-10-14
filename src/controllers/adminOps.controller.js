@@ -87,7 +87,6 @@ const PROVIDER_BY_PREFIX = [
   { prefix: 'ppcust_', provider: 'paymentpoint' },
   { prefix: 'spfund_', provider: 'paystack' },
   { prefix: 'spva_', provider: 'paystack' },
-  { prefix: 'bud_', provider: 'budpay' },
   { prefix: 'flw_', provider: 'flutterwave' },
 ];
 
@@ -640,11 +639,11 @@ async function getIntegrityDrift(req, res) {
  * purchase on that rail while every customer wallet is perfectly funded, so
  * this number is an outage countdown rather than an accounting figure.
  *
- * Both floats are read now that a rail can point at either provider, and the
- * one that matters is whichever the switch is currently on - a healthy PairGate
- * float says nothing about a platform vending through ClubKonnect. Never throws:
- * an unreachable provider is a value on the screen, not a failed request, or one
- * dead upstream would blank the card for the other.
+ * Every registered provider's float is read, and the one that matters is
+ * whichever the switch is currently on - with a second provider registered, a
+ * healthy float on one says nothing about a platform vending through the
+ * other. Never throws: an unreachable provider is a value on the screen, not a
+ * failed request, or one dead upstream would blank the card for the rest.
  *
  * The funding account is returned even when the provider cannot be reached,
  * which is the whole reason it is served from our own environment rather than
@@ -703,20 +702,13 @@ async function readFloat(name) {
   }
 }
 
-// The original single-rail endpoint, kept on its own shape because the existing
-// dashboard card reads these fields flat.
-async function getPairgateWallet(req, res) {
-  const { name, label, ...rest } = await readFloat('pairgate');
-  return ok(res, 'pairgate_wallet', rest);
-}
-
 /**
  * Every provider's float, side by side.
  *
  * In parallel and independently: one rail being down must not delay or hide the
  * other, which is exactly the situation an admin opens this screen to resolve.
  * `active_services` names the rails currently routed to each provider, so the
- * screen can say "ClubKonnect is critical *and* it is carrying data and TV"
+ * screen can say "this float is critical *and* it is carrying data and TV"
  * rather than leaving that join to the reader.
  */
 async function getBillsFloats(req, res) {
@@ -813,7 +805,6 @@ module.exports = {
   getReconciliation,
   creditFunding,
   getProviderHealth,
-  getPairgateWallet,
   getBillsFloats,
   getBillsProviders,
   updateBillsProvider,

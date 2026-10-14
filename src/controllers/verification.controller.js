@@ -1,9 +1,11 @@
 const prisma = require('../../database/prisma');
 const { getPending, clearPending } = require('../services/pending.service');
 const { addHistory, generateTrx } = require('../services/airtime.service');
-const { applyBalanceDelta } = require('../helpers/balance.helper');
+const { applyBalanceDelta, restampBalance } = require('../helpers/balance.helper');
 const { verifySecret, revealUserFields, protectText } = require('../helpers/pii.helper');
 const { createOrder, resolveBettingItemId, verifyOrder } = require('../funding/payvesselBiller.service');
+const { settleOrder } = require('./betting.controller');
+const alerts = require('../services/alerts.service');
 const { getCountryByCode } = require('../helpers/country.helper');
 const { Prisma } = require('@prisma/client');
 const { generateNumericCode } = require('../helpers/code.helper');
@@ -479,16 +481,9 @@ async function verifyPin(req, res) {
       return res.status(400).json({ remark: 'validation_error', status: 'error', message: ['Invalid betting pending payload'], data: null });
     }
 
-    const trx = generateTrx('bet');
-
-    const preBalance = Number(freshUser.balance?.toString?.() ?? freshUser.balance);
-    if (!Number.isFinite(preBalance) || preBalance < amount) {
-      return res.status(400).json({ remark: 'insufficient_balance', status: 'error', message: ['Insufficient balance'], data: null });
-    }
-
     // Checked here rather than at quote time: betting funds an external wallet
-    // over a GET that cannot be reversed, so the last gate before dispatch is
-    // the only one that counts.
+    // that cannot be reversed, so the last gate before dispatch is the only one
+    // that counts.
     const bettingVelocity = await checkVelocity({ userId: user.id, amount });
     if (!bettingVelocity.ok) {
       return res.status(429).json({
@@ -499,85 +494,50 @@ async function verifyPin(req, res) {
       });
     }
 
-    // Resolved at verify time and carried in the pending payload; looked up
-    // again only if the payload predates that.
+    // The variable-priced item the order needs. Resolved at verify time and
+    // carried in the pending payload; looked up again only if the payload
+    // predates that. Before the reserve, deliberately: if Payvessel cannot name
+    // the item, nothing can be ordered, and the customer's history should not
+    // gain a debit and a refund for an order that was never placed.
     let itemId = String(pending.item_id || '').trim();
-
-    let providerRef = '';
-    let orderStatus = 'processing';
-    try {
-      if (!itemId) itemId = await resolveBettingItemId(bettingCompany);
-
-      const base = String(process.env.PUBLIC_BASE_URL || process.env.APP_URL || process.env.BACKEND_URL || '')
-        .trim()
-        .replace(/\/+$/, '');
-
-      const order = await createOrder({
-        billerId: bettingCompany,
-        itemId,
-        rechargeAccount: bettingCustomerId,
-        amount,
-        reference: trx,
-        // Only sent when the deployment has a reachable public URL. Without it
-        // the receipt requery (GET /betting/query) is what settles the row.
-        webhookUrl: base ? `${base}${process.env.API_PREFIX || '/api'}/betting/callback` : undefined,
-      });
-
-      providerRef = order.order_reference || '';
-      orderStatus = order.status;
-
-      // Rejected outright: nothing was funded and nothing was charged, so the
-      // wallet is never touched.
-      if (orderStatus === 'failed') {
-        return res.status(400).json({
-          remark: 'provider_error',
-          status: 'error',
-          message: [order.error_message || 'Betting wallet funding failed'],
-          data: null,
-        });
-      }
-    } catch (err) {
-      // A create that never came back may still have landed - the order is
-      // keyed on our own `trx`, so ask before concluding nobody was charged.
-      // If it exists, Payvessel has already debited us and credited the
-      // customer's betting wallet, and walking away would leave the user's
-      // wallet untouched for a top-up they received.
-      let recovered = null;
+    if (!itemId) {
       try {
-        recovered = await verifyOrder(trx);
-      } catch {
-        recovered = null;
-      }
-
-      if (!recovered || recovered.status === 'failed') {
-        return res.status(err?.statusCode === 503 ? 503 : 400).json({
+        itemId = await resolveBettingItemId(bettingCompany);
+      } catch (err) {
+        return res.status(Number(err?.statusCode) >= 500 ? 503 : 400).json({
           remark: 'provider_error',
           status: 'error',
           message: [err?.message || 'Betting wallet funding failed'],
           data: null,
         });
       }
-
-      providerRef = recovered.order_reference || '';
-      orderStatus = recovered.status;
     }
 
+    const trx = generateTrx('bet');
     const detailsStr = `${bettingCompanyName} - ${bettingCustomerId}`;
-
     const debit = new Prisma.Decimal(amount.toFixed(2));
     const zero = new Prisma.Decimal('0.00');
 
+    // Step 1 - reserve, before Payvessel hears a word. This rail used to order
+    // first and debit afterwards, which left a window where two confirms on one
+    // pending payload both passed a balance check, both funded the bookmaker,
+    // and the second debit then failed - a free top-up, paid for out of our
+    // Payvessel wallet. The guard is in the SQL (`balance: { gte }`), so two
+    // concurrent reserves cannot both pass it, and the MAC is restamped after,
+    // as for every conditional reserve (CLAUDE.md).
     let updated;
-    await prisma.$transaction(async tx => {
-      const u = await tx.user.findUnique({ where: { id: Number(user.id) } });
-      const current = Number(u.balance?.toString?.() ?? u.balance);
-      if (!Number.isFinite(current) || current < amount) {
-        throw new Error('Insufficient balance');
-      }
-      updated = await applyBalanceDelta(tx, 'user', user.id, debit.negated());
-      await tx.user.update({ where: { id: Number(user.id) }, data: { currency_symbol: '₦' } });
+    try {
+      await prisma.$transaction(async tx => {
+        const reserved = await tx.user.updateMany({
+          where: { id: Number(user.id), balance: { gte: debit } },
+          data: { balance: { decrement: debit } },
+        });
+        if (!reserved?.count) {
+          throw Object.assign(new Error('Insufficient balance'), { code: 'INSUFFICIENT' });
+        }
+        updated = await restampBalance(tx, 'user', user.id);
+        await tx.user.update({ where: { id: Number(user.id) }, data: { currency_symbol: '₦' } });
 
-      try {
         await tx.walletTransaction.create({
           data: {
             user_id: Number(user.id),
@@ -591,30 +551,116 @@ async function verifyPin(req, res) {
             other_data: {
               title: 'Betting',
               subtitle: protectText(detailsStr),
-              // Payvessel fulfils after it accepts, so an accepted order is
-              // not a funded betting wallet. The webhook or the receipt
-              // requery flips this through betting.controller `settleOrder`.
-              feedback: orderStatus === 'success' ? 'Successful' : 'Processing',
+              // Written as Processing and settled by betting.controller
+              // `settleOrder` - right after the order call below for a clear
+              // answer, later (webhook, receipt requery, sweep) for an order
+              // Payvessel fulfils asynchronously.
+              feedback: 'Processing',
               note: 'Wallet',
               image_src: '',
             },
             // The betting account id names the counterparty, so it stays out
             // of meta - only the company and the provider references go here.
+            // Payvessel's own order reference is filled in by settleOrder once
+            // the order call answers.
             meta: {
               gateway: 'payvessel',
               provider: bettingCompanyName,
               betting_company: bettingCompany,
               item_id: itemId,
-              bill_status: orderStatus === 'success' ? 'successful' : 'processing',
+              bill_status: 'processing',
               reference: trx,
-              provider_reference: providerRef || '',
+              provider_reference: '',
             },
           },
         });
-      } catch (e) {
-        if (e?.code !== 'P2002') throw e;
+      });
+    } catch (e) {
+      if (e?.code === 'INSUFFICIENT') {
+        return res.status(400).json({ remark: 'insufficient_balance', status: 'error', message: ['Insufficient balance'], data: null });
       }
-    });
+      throw e;
+    }
+
+    // Step 2 - order. Anything that fails from here is refunded, because the
+    // money has already left the wallet.
+    const base = String(process.env.PUBLIC_BASE_URL || process.env.APP_URL || process.env.BACKEND_URL || '')
+      .trim()
+      .replace(/\/+$/, '');
+
+    let order = null;
+    let dispatchError = null;
+    try {
+      order = await createOrder({
+        billerId: bettingCompany,
+        itemId,
+        rechargeAccount: bettingCustomerId,
+        amount,
+        reference: trx,
+        // Only sent when the deployment has a reachable public URL. Without it
+        // the receipt requery (GET /betting/query) and the sweep settle the row.
+        webhookUrl: base ? `${base}${process.env.API_PREFIX || '/api'}/betting/callback` : undefined,
+      });
+    } catch (err) {
+      // A create that never came back may still have landed - the order is
+      // keyed on our own `trx`, so ask before refunding. If it exists, Payvessel
+      // has already debited us and is funding the customer's betting wallet,
+      // and refunding would pay for the same top-up twice.
+      dispatchError = err;
+      try {
+        order = await verifyOrder(trx);
+      } catch {
+        order = null;
+      }
+    }
+
+    // Refused outright, or never landed as far as anyone can tell: nothing was
+    // funded, so everything comes back - with a visible credit leg.
+    if (!order || order.status === 'failed') {
+      await settleOrder(trx, {
+        status: 'failed',
+        raw_status: order?.raw_status || 'dispatch_failed',
+        order_reference: order?.order_reference || '',
+      });
+      await clearPending(user.id, remark);
+
+      // Payvessel answers 402 when our prepaid business wallet is empty, and
+      // the biller module surfaces it as a 503. Not the customer's doing, so
+      // the incident goes to whoever funds it.
+      const code = Number(dispatchError?.statusCode) || 0;
+      if (code === 503) {
+        alerts.paymentFailure({
+          provider: 'payvessel',
+          action: 'float',
+          reference: trx,
+          userId: user.id,
+          message: 'Payvessel refused a betting order as unavailable - empty business wallet or outage',
+        });
+      }
+
+      // A connection that failed (no status at all) or a 5xx is an outage, said
+      // as one - never as "fetch failed" or a line naming the provider. A
+      // refusal Payvessel explains, like an account it cannot fund, keeps its
+      // own words: that one the customer can act on.
+      const outage = Boolean(dispatchError) && (code === 0 || code >= 500);
+      return res.status(outage ? 503 : 400).json({
+        remark: 'provider_error',
+        status: 'error',
+        message: [
+          order?.error_message ||
+            (outage ? 'Betting top-ups are temporarily unavailable. Please try again shortly.' : dispatchError?.message) ||
+            'Betting wallet funding failed',
+        ],
+        data: null,
+      });
+    }
+
+    // Accepted. A success is settled now; an order still processing records
+    // Payvessel's own reference and waits for the webhook, the receipt requery
+    // or the sweep.
+    await settleOrder(trx, order);
+    const providerRef = order.order_reference || '';
+    const orderStatus = order.status;
 
     const post_balance = Number(updated.balance?.toString?.() ?? updated.balance);
 

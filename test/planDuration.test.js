@@ -13,6 +13,7 @@ const assert = require('assert');
 
 const {
   readDuration,
+  splitDuration,
   durationLabel,
   durationBucket,
   stripDuration,
@@ -21,13 +22,22 @@ const {
 
 /* ------------------------------------------------- reading a stated validity */
 
-// PairGate's own format, before they split the field out. Still live on cached
-// rows and on anything they have not migrated.
+// A delimited suffix, the commonest shape across providers.
 assert.deepStrictEqual(readDuration('1GB (AWOOF Special) - 30 Days'), { days: 30, label: '30 days' });
 assert.deepStrictEqual(readDuration('1GB (CG) - 7 Days'), { days: 7, label: '7 days' });
 assert.deepStrictEqual(readDuration('500MB - 1 Day'), { days: 1, label: '1 day' });
 
-// ClubKonnect states the tier instead of the count, and keeps its own wording:
+// MySubWallet's live names: the validity mid-sentence, after the price.
+assert.deepStrictEqual(readDuration('750MB GIFTING = ₦194.00 1 Day Special'), { days: 1, label: '1 day' });
+assert.deepStrictEqual(readDuration('2.7GB GIFTING = ₦1,920.00 1 Month'), { days: 30, label: '1 month' });
+assert.deepStrictEqual(readDuration('100MB SME = ₦80.00 1 Days'), { days: 1, label: '1 day' }, 'their "1 Days" reads as one day');
+assert.strictEqual(
+  readDuration('5GB SME = ₦1,480.00 incl. 3GB Night Data 30 Days').days,
+  30,
+  'a bundle size is not a duration, so the first duration is still the validity'
+);
+
+// A provider that states the tier instead of the count keeps its own wording:
 // "Monthly" is not rewritten as "30 days". The 30 is ours, for bucketing, and
 // printing it back as though the provider had said it is the thing this module
 // exists to prevent.
@@ -36,7 +46,7 @@ assert.deepStrictEqual(readDuration('1 GB - Weekly (SME)'), { days: 7, label: 'W
 assert.deepStrictEqual(readDuration('750MB Daily Plan'), { days: 1, label: 'Daily' });
 assert.deepStrictEqual(readDuration('120GB - Yearly'), { days: 365, label: 'Yearly' });
 
-// Spellings both rails actually produce.
+// Spellings providers actually produce.
 assert.strictEqual(readDuration('2GB - 30days').days, 30);
 assert.strictEqual(readDuration('2GB - 7-day plan').days, 7);
 assert.strictEqual(readDuration('1GB - 24 hrs').days, 1, 'an hours bundle rounds up to a day');
@@ -54,7 +64,11 @@ assert.strictEqual(readDuration('1GB Monthly - 45 Days').days, 45);
 // The rule: no duration stated, no duration claimed. Every one of these has to
 // come back null so the plan ships with no expiry badge and lands in "All"
 // rather than under a shelf somebody chose for it.
-assert.strictEqual(readDuration('1GB (AWOOF Special)'), null, 'the post-change PairGate name');
+assert.strictEqual(readDuration('1GB (AWOOF Special)'), null, 'a family is not a validity');
+// A live MySubWallet typo. The unit has to end at a word boundary, so "daysb"
+// is not "days" - and a plan whose validity cannot be read honestly goes to
+// "All" rather than under a shelf we inferred from a misspelling.
+assert.strictEqual(readDuration('16.5GB GIFTING = ₦4,850.00 30 daysb(14GB + 2.5GB Night)'), null);
 assert.strictEqual(readDuration('230MB'), null);
 assert.strictEqual(readDuration('1.5GB'), null, 'a decimal size is not a duration');
 assert.strictEqual(readDuration('100 MB (GIFTING)'), null);
@@ -100,8 +114,7 @@ assert.strictEqual(durationBucket(null), '');
 /* --------------------------------------------------------- name for the tile */
 
 // The duration comes out because the tile prints it on its own line. Left in,
-// a ClubKonnect plan would say "Monthly" twice while a PairGate one said it once
-// - the same product reading differently depending on which switch is flipped.
+// a plan would say "Monthly" twice.
 assert.strictEqual(stripDuration('1GB (AWOOF Special) - 30 Days'), '1GB (AWOOF Special)');
 assert.strictEqual(stripDuration('500 MB - Monthly (SME)'), '500 MB (SME)');
 assert.strictEqual(stripDuration('1 GB - Weekly (SME)'), '1 GB (SME)');
@@ -120,5 +133,34 @@ assert.strictEqual(stripDuration('30 Days'), '30 Days');
 assert.strictEqual(stripDuration('Monthly'), 'Monthly');
 assert.strictEqual(stripDuration(''), '');
 assert.strictEqual(stripDuration(null), '');
+
+/* ------------------------------------------- cutting a mid-sentence validity */
+
+// For a provider that writes the validity inside a sentence, where the
+// delimiter guard above would rightly leave it. The caller asserts the first
+// duration is the validity; this only cuts it out.
+assert.deepStrictEqual(splitDuration('1 Day Special'), { duration: { days: 1, label: '1 day' }, rest: 'Special' });
+assert.deepStrictEqual(splitDuration('7 Days (6.5GB + 2.5GB Night)'), {
+  duration: { days: 7, label: '7 days' },
+  rest: '(6.5GB + 2.5GB Night)',
+});
+assert.deepStrictEqual(splitDuration('incl. 3GB Night Data 30 Days'), {
+  duration: { days: 30, label: '30 days' },
+  rest: 'incl. 3GB Night Data',
+});
+assert.deepStrictEqual(splitDuration('1 month'), { duration: { days: 30, label: '1 month' }, rest: '' });
+
+// Nothing stated, nothing cut: the text comes back whole, tidied.
+assert.deepStrictEqual(splitDuration('30 daysb(14GB +  2.5GB Night)'), {
+  duration: null,
+  rest: '30 daysb(14GB + 2.5GB Night)',
+});
+assert.deepStrictEqual(splitDuration(''), { duration: null, rest: '' });
+assert.deepStrictEqual(splitDuration(null), { duration: null, rest: '' });
+
+// It agrees with readDuration on what the validity is - one matcher, two views.
+for (const s of ['1 Day Special', 'Monthly bundle', '2GB + 100 Mins', '48 Hours', '']) {
+  assert.deepStrictEqual(splitDuration(s).duration, readDuration(s), `same answer for "${s}"`);
+}
 
 console.log('✅ planDuration tests passed');

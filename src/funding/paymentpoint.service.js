@@ -94,12 +94,14 @@ async function paymentpointRequestOnce(path, { method = 'GET', body } = {}) {
   return json;
 }
 
-async function createVirtualAccount({ email, name, phoneNumber, bankCode, businessId }) {
+async function createVirtualAccount({ email, name, phoneNumber, bankCode, businessId, idType, idNumber }) {
   if (!email) throw new Error('email is required');
   if (!name) throw new Error('name is required');
   if (!phoneNumber) throw new Error('phoneNumber is required');
   if (!Array.isArray(bankCode) || bankCode.length === 0) throw new Error('bankCode must be a non-empty array');
   if (!businessId) throw new Error('businessId is required');
+  if (!idType) throw new Error('idType is required');
+  if (!idNumber) throw new Error('idNumber is required');
 
   const body = {
     email,
@@ -107,6 +109,8 @@ async function createVirtualAccount({ email, name, phoneNumber, bankCode, busine
     phoneNumber,
     bankCode,
     businessId,
+    idType,
+    idNumber,
   };
 
   const json = await paymentpointRequest('/api/v1/createVirtualAccount', { method: 'POST', body });

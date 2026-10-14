@@ -4,15 +4,20 @@
 // a pending payload) -> POST /verify-pin, which is where the debit and the
 // order actually happen (controllers/verification.controller.js).
 //
+// Betting stays on Payvessel while every other bill is on MySubWallet. It was
+// moved there and back on 2026-10-06: MySubWallet's API has no bookmaker list,
+// and its dashboard did not expose the bookmaker ids its purchase call needs.
+// Payvessel lists its billers, names included, over the API.
+//
 // The order settles asynchronously at Payvessel, so this file also owns the
-// after-the-fact half: the webhook and the requery both funnel into
-// `settleOrder`, which is the only place a betting row changes outcome.
+// after-the-fact half: the webhook, the receipt requery and the sweep all
+// funnel into `settleOrder`, which is the only place a betting row changes
+// outcome.
 
 const prisma = require('../../database/prisma');
 const { Prisma } = require('@prisma/client');
 const { setPending } = require('../services/pending.service');
 const { applyBalanceDelta } = require('../helpers/balance.helper');
-const { protectText } = require('../helpers/pii.helper');
 const {
   listBettingCompanies,
   resolveBettingItemId,
@@ -20,6 +25,8 @@ const {
   verifyOrder,
   MIN_AMOUNT,
 } = require('../funding/payvesselBiller.service');
+
+const GATEWAY = 'payvessel';
 
 const companiesCache = new Map();
 const verifyCache = new Map();
@@ -223,11 +230,12 @@ async function store(req, res) {
 /**
  * Apply a verified order outcome to the ledger row, once.
  *
- * Payvessel debits us at order creation and fulfils afterwards, so the row is
- * written as `Processing` and lands here when the answer is known. A failed
- * order means the customer's betting wallet was never funded, so the naira
- * goes back - that credit is what makes this worth having rather than a
- * cosmetic status update.
+ * The row is written as `Processing` when the customer's wallet is reserved,
+ * before Payvessel hears anything, and lands here when the answer is known -
+ * straight after the order call for a clear answer, later for one Payvessel
+ * fulfils asynchronously. A failed order means the customer's betting wallet
+ * was never funded, so the naira goes back - that credit is what makes this
+ * worth having rather than a cosmetic status update.
  *
  * @returns {Promise<'processing'|'successful'|'failed'|'unchanged'>}
  */
@@ -268,6 +276,9 @@ async function settleOrder(trx, order) {
   try {
     await prisma.$transaction(async tx => {
       await applyBalanceDelta(tx, 'user', row.user_id, debit);
+      // The unique `trx` is the concurrency guard: two callers racing to
+      // refund the same row both reach this create, and the loser's P2002
+      // rolls its balance credit back with it.
       await tx.walletTransaction.create({
         data: {
           user_id: Number(row.user_id),
@@ -286,7 +297,8 @@ async function settleOrder(trx, order) {
             image_src: '',
           },
           meta: {
-            gateway: 'payvessel',
+            // The gateway that sold the top-up, so the two legs agree.
+            gateway: meta.gateway || GATEWAY,
             reference: `${trx}_r`,
             reversal_of: trx,
             bill_status: 'refunded',
@@ -299,6 +311,7 @@ async function settleOrder(trx, order) {
       });
     });
   } catch (e) {
+    if (e?.code === 'P2002') return 'unchanged';
     // A refund that fails is a real incident: the user is out of pocket and
     // nothing was delivered. Ids only - never the provider reason, which can
     // quote a betting account id.
@@ -315,8 +328,36 @@ async function settleOrder(trx, order) {
 
 /* ------------------------------------------------------------- requery/hook */
 
+// The ledger's own word for a betting row, in the vocabulary the receipt reads.
+function ledgerStatus(meta) {
+  const status = String(meta?.bill_status || '');
+  if (status === 'successful') return 'success';
+  if (status === 'refunded' || status === 'failed') return 'failed';
+  return 'processing';
+}
+
+/**
+ * Ask Payvessel about a row still in flight, and settle it if the answer is
+ * final. Our trx is the merchant reference the order was created with, so it
+ * is what the verify call is keyed on. A settled row, or one another gateway
+ * sold, is never asked about.
+ */
+async function requeryRow(row) {
+  const meta = (row.meta && typeof row.meta === 'object') ? row.meta : {};
+  if (String(meta.gateway || '') !== GATEWAY) return 'unchanged';
+  if (ledgerStatus(meta) !== 'processing') return 'unchanged';
+
+  return settleOrder(row.trx, await verifyOrder(row.trx));
+}
+
 // Receipt refresh. Keyed on our own trx, which is the merchant reference the
 // order was created with.
+//
+// Answers from the ledger once the row is terminal: asking Payvessel about a
+// top-up that was refunded at confirm time - an order it may have no record of
+// - would report it as still processing on a receipt that has already been
+// paid back. And a Payvessel hiccup never breaks the receipt: the ledger row is
+// already a valid answer, and the sweep settles the order either way.
 async function query(req, res) {
   try {
     const user = req.user;
@@ -327,25 +368,31 @@ async function query(req, res) {
       return res.status(400).json({ remark: 'validation_error', status: 'error', message: ['trx is required'], data: null });
     }
 
-    const row = await prisma.walletTransaction.findUnique({ where: { trx } });
+    let row = await prisma.walletTransaction.findUnique({ where: { trx } });
     // Same 404 for "no such transaction" and "not yours" - the distinction
     // would turn this into a lookup oracle for other people's references.
     if (!row || Number(row.user_id) !== Number(user.id) || row.remark !== 'betting') {
       return res.status(404).json({ remark: 'not_found', status: 'error', message: ['Transaction not found'], data: null });
     }
 
-    const order = await verifyOrder(trx);
-    const outcome = await settleOrder(trx, order);
+    let outcome = 'unchanged';
+    try {
+      outcome = await requeryRow(row);
+    } catch (e) {
+      console.error('betting.query requery failed:', { trx, error: e?.message });
+    }
+    if (outcome !== 'unchanged') row = (await prisma.walletTransaction.findUnique({ where: { trx } })) || row;
 
+    const meta = (row.meta && typeof row.meta === 'object') ? row.meta : {};
     return res.json({
       remark: 'betting_query',
       status: 'success',
       message: ['OK'],
       data: {
         trx,
-        status: order.status,
+        status: ledgerStatus(meta),
         settled: outcome,
-        provider_reference: order.order_reference || null,
+        provider_reference: meta.provider_reference || null,
       },
     });
   } catch (e) {
@@ -397,7 +444,10 @@ async function sweepProcessingOrders({ limit = 20, olderThanMs = 2 * 60_000, win
       remark: 'betting',
       trx_type: '-',
       created_at: { lt: new Date(now - olderThanMs), gt: new Date(now - windowMs) },
-      meta: { path: ['bill_status'], equals: 'processing' },
+      AND: [
+        { meta: { path: ['gateway'], equals: GATEWAY } },
+        { meta: { path: ['bill_status'], equals: 'processing' } },
+      ],
     },
     orderBy: { created_at: 'asc' },
     take: limit,
@@ -406,7 +456,7 @@ async function sweepProcessingOrders({ limit = 20, olderThanMs = 2 * 60_000, win
   let settled = 0;
   for (const row of rows) {
     try {
-      const outcome = await settleOrder(row.trx, await verifyOrder(row.trx));
+      const outcome = await requeryRow(row);
       if (outcome === 'successful' || outcome === 'failed') settled += 1;
     } catch (e) {
       // Ids only - a provider message can quote a betting account id.
@@ -417,4 +467,13 @@ async function sweepProcessingOrders({ limit = 20, olderThanMs = 2 * 60_000, win
   return { checked: rows.length, settled };
 }
 
-module.exports = { companies, verifyCustomer, store, query, callback, settleOrder, sweepProcessingOrders };
+module.exports = {
+  companies,
+  verifyCustomer,
+  store,
+  query,
+  callback,
+  settleOrder,
+  sweepProcessingOrders,
+  __test: { ledgerStatus },
+};

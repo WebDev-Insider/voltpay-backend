@@ -5,8 +5,7 @@ const rateLimit = require('../middlewares/rateLimit.middleware');
 const idempotency = require('../middlewares/idempotency.middleware');
 const requireKyc = require('../middlewares/kycGate.middleware');
 const BillsController = require('../controllers/bills.controller');
-const PairgateWebhook = require('../controllers/pairgateWebhook.controller');
-const ClubkonnectWebhook = require('../controllers/clubkonnectWebhook.controller');
+const MysubwalletWebhook = require('../controllers/mysubwalletWebhook.controller');
 const { requireFeature } = require('../helpers/featureFlag.helper');
 
 // Kill switch. Catalogue and lookups stay up so the app can still render, the
@@ -22,16 +21,11 @@ const confirmLimit = rateLimit({ windowMs: 10 * 60_000, max: 10, name: 'bills-co
 // loop on meter validation is both a provider bill and an enumeration oracle.
 const lookupLimit = rateLimit({ windowMs: 60_000, max: 30, name: 'bills-lookup', byUser: true });
 
-// The webhooks are unauthenticated by necessity, and every delivery that cannot
-// be verified from its own body costs one status call against a global budget of
-// sixty a minute. Unlimited, a flood of forged deliveries would starve live
-// vending of provider calls - a payments outage caused from outside. Keyed on
-// IP, and set well above anything either provider would send.
-//
-// One limiter, shared. Separate budgets would let a flood on the unsigned
-// endpoint spend the calls the other rail's vends need anyway, since the two
-// providers' rate limits are the thing actually being protected and a forger
-// picks whichever endpoint is cheapest.
+// The webhook is unauthenticated by necessity, and every delivery costs one
+// status call against the provider's rate budget - the same budget live vending
+// spends. Unlimited, a flood of forged deliveries would starve vending of
+// provider calls: a payments outage caused from outside. Keyed on IP, and set
+// well above anything the provider would send.
 const webhookLimit = rateLimit({ windowMs: 60_000, max: 240, name: 'bills-webhook' });
 
 // Catalogue
@@ -66,19 +60,20 @@ router.post(
 // Receipt refresh - reads the ledger row, so it shares the lookup budget.
 router.get('/bills/status/:trx', userAuth, lookupLimit, BillsController.status);
 
-// Delivery notifications. No userAuth: the caller is a provider, not a customer,
-// and both paths are allowlisted in server.js.
+// Delivery notifications. No userAuth: the caller is a provider, not a
+// customer, and the path is allowlisted in server.js.
 //
-// PairGate authenticates by HMAC when a secret is configured (see the
-// controller). This is the only route on which a PairGate electricity token ever
-// arrives.
-router.post('/bills/webhook/pairgate', webhookLimit, PairgateWebhook.webhook);
-
-// ClubKonnect has no signature scheme at all, so its callback is never trusted
-// on its own - the controller re-reads every outcome over the authenticated API
-// before settling. GET as well as POST: their callback has been observed
-// arriving as a bare query string, and a 404 on it would just burn their retries.
-router.post('/bills/webhook/clubkonnect', webhookLimit, ClubkonnectWebhook.webhook);
-router.get('/bills/webhook/clubkonnect', webhookLimit, ClubkonnectWebhook.webhook);
+// MySubWallet has no signature scheme, so the callback is never trusted on its
+// own - the controller re-reads every outcome over the authenticated requery
+// before settling. Bills and Bill Hero rewards report here.
+//
+// **Optional.** Their docs say the callback URL is set on their dashboard, but
+// as of 2026-10-06 the dashboard offers no such setting, so nothing calls this
+// yet. Nothing depends on it: most purchases answer on the purchase call
+// itself, and a pending one is settled by the receipt poll and the bills sweep,
+// which ask MySubWallet directly. If the setting ever appears, point it at
+// `<PUBLIC_BASE_URL><API_PREFIX>/bills/webhook/mysubwallet` and settlement
+// simply gets faster.
+router.post('/bills/webhook/mysubwallet', webhookLimit, MysubwalletWebhook.webhook);
 
 module.exports = router;

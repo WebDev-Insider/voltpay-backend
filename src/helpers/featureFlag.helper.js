@@ -29,6 +29,16 @@ const FEATURES = {
   funding: 'Wallet funding / virtual accounts',
   staffpay_payroll: 'StaffPay payroll runs',
   withdrawals: 'Withdrawals to bank',
+  // Conversions only. Paying out cash already converted is `withdrawals`, so a
+  // MySubWallet incident can stop new conversions without stranding the money
+  // customers are already owed.
+  airtime_cash: 'Airtime to Cash conversions',
+  // New applications and payments only. Customers already paid can still
+  // answer a request for more information and download their certificate.
+  cac_registration: 'CAC business name registration',
+  // New cards and top-ups only. Freeze, unfreeze, reveal and history never sit
+  // behind it - a customer must always be able to stop a card they lost.
+  virtual_card: 'USD virtual card - new cards and top-ups',
 };
 
 const OFF_VALUES = new Set(['0', 'false', 'off', 'no', 'disabled']);

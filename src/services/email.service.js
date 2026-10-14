@@ -343,6 +343,75 @@ async function sendStaffPayVerificationEmail({ to, status, companyName, reason, 
 }
 
 /**
+ * CAC Registration: the business, company or organisation is registered and
+ * the certificate is in the app.
+ *
+ * The certificate is deliberately NOT attached. It stays behind the app's
+ * login, where the download endpoint checks who is asking - an attachment is a
+ * copy of a legal document in an inbox we cannot take it back out of.
+ */
+async function sendCacCertificateEmail({
+  to,
+  reference,
+  businessName,
+  registrationNumber,
+  typeLabel,
+  certificateLabel,
+  documents = [],
+  fromArg,
+}) {
+  const brand = brandName();
+  const plainName = String(businessName || 'Your registration').trim();
+  // Typed by the customer, so escaped like every other value that was not ours.
+  const name = esc(plainName);
+  const subject = `${plainName} is registered with CAC`;
+  // What was issued, by name only - the files stay behind the app's login.
+  const issued = (Array.isArray(documents) && documents.length ? documents : [certificateLabel || 'CAC certificate'])
+    .map(d => String(d || '').trim())
+    .filter(Boolean);
+  const several = issued.length > 1;
+
+  // detailList writes its values as HTML, so each one is escaped here.
+  const rows = [
+    ['Registered name', name],
+    ['Type', esc(String(typeLabel || 'Business Name'))],
+    ['Application', esc(String(reference || ''))],
+  ];
+  if (registrationNumber) rows.push(['Registration number', esc(String(registrationNumber))]);
+
+  const html = renderEmail({
+    subject,
+    preheader: several
+      ? `Your certificate and ${issued.length - 1} more document${issued.length > 2 ? 's are' : ' is'} ready in the app.`
+      : `Your ${String(issued[0])} is ready to download in the app.`,
+    eyebrow: 'CAC Registration',
+    heading: several ? 'Your documents are ready' : 'Your certificate is ready',
+    blocks: [
+      blocks.paragraph(`Congratulations - <b>${name}</b> is now registered with the Corporate Affairs Commission.`),
+      blocks.detailList(rows),
+      blocks.notice({
+        tone: 'success',
+        title: several ? 'In the app for you' : 'Download it in the app',
+        body: several
+          ? `${issued.map(esc).join(' &middot; ')}<br/>Open ${brand}, go to CAC Registration, then My Applications, and tap the application to download them.`
+          : `Open ${brand}, go to CAC Registration, then My Applications, and tap the application to download your certificate.`,
+      }),
+      blocks.paragraph('Keep copies somewhere safe. Banks ask for them when you open a business account.'),
+    ],
+    footnote: `You are receiving this because you applied for a CAC registration in the ${brand} app.`,
+  });
+
+  const text = toPlainText([
+    `Congratulations - ${plainName} is now registered with the Corporate Affairs Commission.`,
+    `Application: ${reference}${registrationNumber ? ` - Registration number: ${registrationNumber}` : ''}`,
+    several ? `Ready for you: ${issued.join(', ')}.` : '',
+    `Open ${brand}, go to CAC Registration, then My Applications, to download ${several ? 'them' : 'your certificate'}.`,
+  ]);
+
+  return await sendViaBrevo({ from: fromArg, to, subject, html, text });
+}
+
+/**
  * The two account-closure notices.
  *
  * Sent to the address on file, never to whoever typed the request: a session
@@ -506,6 +575,7 @@ module.exports = {
   sendResetEmail,
   sendSupportTicketEmail,
   sendStaffPayVerificationEmail,
+  sendCacCertificateEmail,
   sendAccountClosureEmail,
   sendRecoveryPhraseEmail,
   renderEmailHtml,

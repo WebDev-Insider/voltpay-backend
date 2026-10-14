@@ -12,11 +12,12 @@
 // amount comes from the provider catalogue on this side. A client-supplied
 // price would let anyone buy a 20,000 naira bundle for 100.
 //
-// **Two upstreams serve these four rails, switchable per rail from the admin
-// dashboard** - see funding/billsProvider.js. Nothing below knows which one
-// answered: every provider module exports the same surface, and this file goes
-// through `bills.resolve(service)` rather than importing one directly. Three
-// rules keep that honest:
+// **The four rails are served through the provider registry** - see
+// funding/billsProvider.js. MySubWallet is the only upstream registered today,
+// but nothing below knows which one answered: every provider module exports the
+// same surface, and this file goes through `bills.resolve(service)` rather than
+// importing one directly. Three rules keep that honest, and they matter the day
+// a second provider is registered again:
 //
 //   1. **Resolve once per request, then carry it.** A quote and its confirm can
 //      straddle an admin switch, so re-resolving mid-flow would price against
@@ -24,20 +25,23 @@
 //   2. **The resolved name is stamped into `meta.gateway`.** The webhook and
 //      the settlement sweep read that to know who to ask about this row later.
 //      A row stamped with the wrong upstream never settles and never refunds.
-//   3. **Floors come from the resolved provider, not from a constant.** The two
-//      do not agree - electricity starts at 100 on one and 1,000 on the other -
-//      and quoting under the live floor reserves a customer's money for a vend
-//      that is rejected on arrival.
+//   3. **Floors come from the resolved provider, not from a constant.**
+//      Providers do not agree on them - past ones started electricity at 100
+//      and at 1,000 - and quoting under the live floor reserves a customer's
+//      money for a vend that is rejected on arrival.
 //
-// An electricity token may or may not come back on the purchase call: one rail
-// only ever delivers it on the webhook, the other usually returns it inline. So
-// a prepaid receipt legitimately settles as "processing" and fills its token in
-// seconds later, and the app already polls /bills/status for exactly that.
+// An electricity token normally comes back on the purchase call, but a vend the
+// provider accepts as `pending` has none yet. So a prepaid receipt can
+// legitimately settle as "processing" and fill its token in later - from the
+// webhook, the receipt poll or the sweep - and the app already polls
+// /bills/status for exactly that. A prepaid bill the provider calls delivered
+// is still not closed until its token arrives: billSettlement parks it as
+// `awaiting_token`, which this file reports as "processing".
 const prisma = require('../../database/prisma');
 const { Prisma } = require('@prisma/client');
 const bills = require('../funding/billsProvider');
 const { setPending, getPending, clearPending } = require('../services/pending.service');
-const { applyBalanceDelta } = require('../helpers/balance.helper');
+const { restampBalance } = require('../helpers/balance.helper');
 const { verifySecret, protectText } = require('../helpers/pii.helper');
 const { generateTrx } = require('../services/airtime.service');
 const { logMoneyEvent } = require('../services/userAudit.service');
@@ -70,12 +74,12 @@ const SERVICES = {
 /**
  * The floor a customer actually hits on this rail, right now.
  *
- * Was a constant computed once at module load against a single provider. It
- * cannot be: the two upstreams disagree, and by an order of magnitude on
- * electricity - 100 against 1,000. Pinning the lower one would let a customer
- * on the stricter rail be quoted 500, have their wallet debited, and then watch
- * the vend bounce and refund. Pinning the higher one would refuse perfectly
- * good 500 naira top-ups on the rail that accepts them.
+ * Not a constant computed once at module load, because providers disagree -
+ * by an order of magnitude on electricity, 100 against 1,000, between two past
+ * ones. Pinning the lower would let a customer on the stricter rail be quoted
+ * 500, have their wallet debited, and then watch the vend bounce and refund.
+ * Pinning the higher would refuse perfectly good 500 naira top-ups on a rail
+ * that accepts them.
  */
 function minAmountFor(service, provider) {
   const ours = Number(service.minAmount) || 0;
@@ -112,30 +116,38 @@ function serviceOf(req) {
 // is too low is both wrong and unactionable, so it is swapped for a neutral
 // outage message and the incident is pushed at whoever tops the float up.
 //
-// `gateway` names which upstream failed. It is the actionable half of the alert
-// now that there are two of them: the responder has to know whose float to top
-// up, and - since the other rail may be fine - whether flipping the switch is
-// the faster fix than funding.
+// A misconfiguration - a missing or rejected key, a sandbox key on production,
+// one of our own ids refused by their validator - gets the same treatment for
+// the same reason: nothing the customer does can fix it, and every purchase on
+// the rail is failing until somebody on our side does.
+//
+// `gateway` names which upstream failed. It is the actionable half of the alert:
+// the responder has to know whose float to top up or whose keys to check.
 function providerFail(res, e, fallbackMessage, gateway = bills.DEFAULT_PROVIDER) {
   const label = bills.PROVIDER_LABELS[gateway] || gateway;
-  if (e?.floatExhausted) {
+  if (e?.floatExhausted || e?.misconfigured) {
     alerts.paymentFailure({
       provider: gateway,
-      action: 'float',
-      message: `${label} float exhausted - bill vending is failing`,
-      context: { provider_message: e?.message || '' },
+      action: e?.floatExhausted ? 'float' : 'config',
+      message: e?.floatExhausted
+        ? `${label} float exhausted - bill vending is failing`
+        : `${label} rejected our configuration - bill vending is failing`,
+      // The provider's own words, for the responder. Never the customer's
+      // message - it is ours and says nothing - and never a raw body.
+      context: { provider_message: String(e?.providerMessage || e?.message || '').slice(0, 200) },
     });
     return fail(res, 503, 'provider_unavailable', 'This service is briefly unavailable. Please try again shortly.');
   }
-  // Each adapter names its payload after itself so a log line says which one
-  // spoke; only one is ever set.
-  const payload = e?.pairgate ?? e?.clubkonnect ?? null;
+  // The adapter names its payload after itself so a log line says which
+  // provider spoke. It is trimmed to status and message in the adapter: the
+  // raw body can carry our float balance, which no customer needs to see.
+  const payload = e?.mysubwallet ?? null;
   return fail(res, e?.statusCode || 502, 'provider_error', e?.message || fallbackMessage, payload);
 }
 
 // Thin pass-throughs. They are cached inside the provider module, so hammering
-// the screen does not hammer the provider - which matters more here than it
-// used to, because the rate limit is 60 requests a minute across the whole key.
+// the screen does not hammer the provider, whose rate budget is shared by every
+// catalogue read and every vend on the key.
 //
 // `service` is which rail's switch decides who answers. The client never says -
 // it asks for "data providers" and gets whichever upstream is serving data.
@@ -165,13 +177,13 @@ const electricityProviders = catalogue('electricity', p => p.listElectricityDisc
 // the name put 97% of MTN's 75 plans in "other": all three tabs were empty on
 // every network and the UI hid them.
 //
-// That is no longer the shape of the data. PairGate returns `duration` as an
-// integer of days on every data endpoint, and ClubKonnect states it in the plan
-// name ("500 MB - Monthly (SME)"), so the validity is now *read* rather than
-// guessed - see funding/planDuration.js, which also holds the rule that an
-// unreadable one produces no claim at all. It is the axis the customer is
-// actually shopping on, too: "I want a monthly plan" is a sentence people say,
-// "I want a CG plan" is not.
+// That is no longer the shape of the data. MySubWallet states the validity in
+// every plan name ("750MB GIFTING = ₦194.00 1 Day Special"), and the provider
+// module reads it out into `duration_days` and `validity` - so the validity is
+// *read* rather than guessed. See funding/planDuration.js, which also holds the
+// rule that an unreadable one produces no claim at all. It is the axis the
+// customer is actually shopping on, too: "I want a monthly plan" is a sentence
+// people say, "I want a CG plan" is not.
 //
 // The family is not lost, it is demoted. It stays on `plan_type`, it stays
 // inside the plan name the tile renders ("1GB (CG)"), and because the catalogue
@@ -195,9 +207,9 @@ const FAMILY_LABELS = {
 // Cheapest and highest-traffic families first. This is a display preference, not
 // a whitelist - a family a provider adds later is appended rather than dropped,
 // so a new tier is on sale the day it appears instead of the day we notice. It
-// is also what lets the two upstreams name their families differently without
-// either one losing plans: anything unrecognised sorts to the end and gets a
-// title-cased tab rather than disappearing.
+// is also what lets providers name their families however they like without
+// losing plans: anything unrecognised sorts to the end and gets a title-cased
+// tab rather than disappearing.
 const FAMILY_ORDER = ['SME', 'CG', 'GIFTING', 'AWOOF', 'CORPORATE', 'DATASHARE', 'DIRECT'];
 
 // How many of the cheap end lead the picker.
@@ -209,11 +221,11 @@ const HOT_PLAN_COUNT = 8;
 // This guard is the whole reason the first attempt at this screen shipped
 // broken. With no duration in the data a validity split produces four tabs the
 // UI hides and one "All" nobody can navigate - so the axis is chosen from the
-// data rather than assumed. If a rail stops stating duration (a PairGate
-// regression, a ClubKonnect renaming) or simply has not caught up yet - a Redis
-// catalogue entry lives 30 minutes and survives a deploy, so right after a
-// release the cached plans still have no duration on them - the family tabs come
-// back on their own, and the validity tabs return on the next catalogue warm.
+// data rather than assumed. If a rail stops stating duration (a provider
+// renaming its plans) or simply has not caught up yet - a Redis catalogue entry
+// lives 30 minutes and survives a deploy, so right after a release the cached
+// plans may not carry it - the family tabs come back on their own, and the
+// validity tabs return on the next catalogue warm.
 const VALIDITY_COVERAGE_MIN = 0.6;
 
 function familyKey(planType) {
@@ -326,10 +338,10 @@ function buildPlanTabs(shaped) {
 // customer taps is worded identically to the plan they are asked to pay for.
 function displayPlan(plan) {
   return {
-    // The validity comes back out of the name because it is shown on its own.
-    // Left in, a ClubKonnect plan would read "Monthly" twice - and PairGate has
-    // already taken it out of theirs, which is what makes a separate field the
-    // only way either rail keeps showing it at all.
+    // The validity is shown on its own line, so it must not also be in the
+    // name. The provider module already takes it out of the names it hands
+    // over; this catches any that still carry it delimited, rather than letting
+    // a tile read "Monthly" twice.
     name: stripDuration(plan?.name),
     validity: String(plan?.validity || ''),
     duration_days: planDays(plan),
@@ -350,15 +362,12 @@ async function dataPlans(req, res) {
     //
     // `validity` and `duration_days` are the same fact twice: the wording to
     // print, and the number to sort or filter on. Sent separately rather than
-    // baked into the name because one upstream has stopped putting it there -
-    // parsed out client-side, the duration would have vanished from the tile the
-    // day PairGate changed their format.
+    // baked into the name because where a provider writes it is theirs to
+    // change - parsed out client-side, the duration would vanish from the tile
+    // the day a provider changed their format.
     // `plan_type` is normalised here rather than passed through, because it is
-    // now a filter key the app matches against `family_labels` and the two
-    // upstreams do not agree on case - ClubKonnect derives the family from the
-    // plan name, PairGate repeats whatever its categories endpoint said. A
-    // filter that matches on case is one provider rename away from returning
-    // nothing.
+    // a filter key the app matches against `family_labels`, and a filter that
+    // matches on case is one provider rename away from returning nothing.
     const shaped = plans.map(p => ({
       id: p.id,
       amount: moneyStr(p.amount),
@@ -441,9 +450,10 @@ async function electricityValidate(req, res) {
     if (!result.customer_name) {
       return fail(res, 400, 'validation_failed', `Could not verify that ${meterType} meter number`);
     }
-    // `address` is always empty - neither upstream's meter lookup answers with
-    // one. The key is kept because the app's BillCustomer model reads it, and an
-    // absent key would break older builds' parsing.
+    // `address` is filled for a postpaid meter and usually empty for prepaid.
+    // The key is always present because the app's BillCustomer model reads it,
+    // and an absent key would break older builds' parsing. Display only - it
+    // goes back to the customer who looked their own meter up and nowhere else.
     return ok(res, 'electricity_validated', 'Meter verified', {
       provider,
       number,
@@ -496,6 +506,12 @@ async function quote(req, res) {
       const amount = Number(req.body?.amount);
       if (!Number.isFinite(amount) || amount < minAmount) {
         return fail(res, 400, 'validation_error', `Minimum airtime amount is NGN ${minAmount}`);
+      }
+      // Whole naira only: the provider's validator takes an integer, so 150.50
+      // would be reserved from the wallet and then refused on arrival. Said
+      // here, before the PIN sheet, rather than as a refund after it.
+      if (!Number.isInteger(amount)) {
+        return fail(res, 400, 'validation_error', 'Enter a whole naira amount');
       }
       payload.amount = amount;
       payload.item_name = 'Airtime';
@@ -576,12 +592,13 @@ async function quote(req, res) {
         return fail(res, 400, 'validation_error', 'Enter a whole naira amount');
       }
 
+      // The lookup's address (postpaid meters have one) is deliberately not
+      // kept: nothing after this reads it, and the pending payload sits in
+      // Redis, which is held to the same no-plaintext-PII rule as a column.
       let customerName = '';
-      let address = '';
       try {
         const verified = await upstream.validateElectricityMeter({ provider, number: meterNumber, meterType });
         customerName = verified.customer_name;
-        address = verified.address;
       } catch (e) {
         return fail(res, e?.statusCode || 400, 'validation_failed', e?.message || 'Could not verify that meter number');
       }
@@ -594,7 +611,6 @@ async function quote(req, res) {
       payload.amount = amount;
       payload.item_name = `${meterType.toUpperCase()} meter`;
       payload.customer_name = customerName;
-      payload.address = address;
       summary.push({ label: 'Disco', value: provider });
       summary.push({ label: 'Meter number', value: meterNumber });
       summary.push({ label: 'Meter type', value: meterType === 'postpaid' ? 'Postpaid' : 'Prepaid' });
@@ -678,13 +694,259 @@ function detailsFor(pending) {
   if (pending.service === 'data') {
     // The validity is carried into the ledger line rather than left on the
     // confirmation sheet. It is the answer to "when does this expire", asked a
-    // fortnight later against the transaction history, and it is no longer
-    // recoverable from the plan name once PairGate strips it out.
+    // fortnight later against the transaction history, and it is not in the
+    // plan name any more - the provider module took it out for the tile.
     const validity = pending.validity ? `, ${pending.validity}` : '';
     return `${pending.provider} Data - ${pending.item_name}${validity} - ${pending.phone_msisdn}`;
   }
   if (pending.service === 'tv') return `${pending.provider} - ${pending.item_name} - ${pending.smartcard}`;
   return `${pending.provider} ${pending.meter_type} - ${pending.meter_number}`;
+}
+
+/**
+ * Reserve, vend, record - the half of a bill purchase that moves money.
+ *
+ * Shared by confirm() and the scheduled top-up worker
+ * (services/scheduledTopup.service.js), so a standing order is bought exactly
+ * the way a tap on the pay button is: the same guarded reserve, the same
+ * dispatch, the same refund, the same ledger row. A second copy for the worker
+ * would be a second thing to keep correct, and the two would drift the first
+ * time either one changed.
+ *
+ * The caller has already priced it (`pending`, in the shape quote() builds),
+ * resolved the upstream it was priced against, and run the checks that belong
+ * to it - PIN and expiry for a tap, ownership and KYC for the worker, velocity
+ * for both.
+ *
+ * Returns the outcome instead of throwing it, because each caller handles each
+ * one differently:
+ *
+ *   { outcome: 'insufficient' }                    nothing was reserved
+ *   { outcome: 'provider_failed', error, refund }  reserved, refused, refunded
+ *   { outcome: 'delivered', processing, ... }      reserved and accepted
+ *
+ * Anything else - a database failure inside the reserve - propagates.
+ *
+ * `withinReserve(tx, { trx })` runs inside the reserve transaction, before the
+ * debit. The worker uses it to prove it still owns the run it is paying for and
+ * to stamp the trx onto that run in the same commit as the ledger row: a throw
+ * there rolls the debit back, so a worker that has lost its claim can never
+ * move money. `meta` is merged into both ledger writes - ids only, never a
+ * name or a number, because `meta` is not encrypted.
+ */
+async function executePurchase({
+  userId,
+  service,
+  pending,
+  gateway,
+  upstream,
+  req = null,
+  meta: extraMeta = null,
+  auditExtra = null,
+  withinReserve = null,
+}) {
+  const amount = Number(pending.amount);
+  const total = Number(pending.total ?? amount);
+  const trx = generateTrx(service.trxPrefix);
+  const debit = new Prisma.Decimal(total.toFixed(2));
+  const details = detailsFor(pending);
+  const extra = extraMeta && typeof extraMeta === 'object' ? extraMeta : {};
+
+  // Step 1 - reserve. The guard is in the SQL (`balance: { gte }`), so two
+  // concurrent reserves cannot both pass it - two taps on the pay button, or
+  // two of one customer's schedules falling due on two instances in the same
+  // minute. A read-then-decrement would let both through. The MAC is restamped
+  // after, as for every conditional reserve (CLAUDE.md), and the ledger row is
+  // written in the same transaction.
+  let reserved;
+  try {
+    await prisma.$transaction(async tx => {
+      if (withinReserve) await withinReserve(tx, { trx });
+
+      const taken = await tx.user.updateMany({
+        where: { id: Number(userId), balance: { gte: debit } },
+        data: { balance: { decrement: debit } },
+      });
+      if (!taken?.count) {
+        throw Object.assign(new Error('Insufficient balance'), { code: 'INSUFFICIENT' });
+      }
+      reserved = await restampBalance(tx, 'user', userId);
+
+      await tx.walletTransaction.create({
+        data: {
+          user_id: Number(userId),
+          trx,
+          trx_type: '-',
+          amount: debit,
+          charge: new Prisma.Decimal('0.00'),
+          total_amount: debit,
+          remark: service.dbRemark,
+          details: protectText(details),
+          other_data: {
+            title: service.title,
+            subtitle: protectText(details),
+            feedback: 'Processing',
+            note: pending.item_name || service.title,
+            image_src: '',
+          },
+          // No name, phone, meter or smartcard here - `meta` is not
+          // encrypted. Only provider and reference, which identify the
+          // transaction without describing the person.
+          //
+          // `gateway` is the pinned upstream, never a constant: the webhook
+          // and the settlement sweep filter on it to decide who to ask about
+          // this row. Stamp the wrong one and this bill never settles and
+          // never refunds.
+          meta: {
+            gateway,
+            service: pending.service,
+            provider: pending.provider,
+            reference: trx,
+            bill_status: 'processing',
+            // From the first write, not only after the vend: settlement
+            // will not close a prepaid bill without its token, and this is
+            // how it knows the bill is prepaid - even on a row whose request
+            // died before the post-vend update below.
+            meter_type: pending.service === 'electricity' ? pending.meter_type : undefined,
+            ...extra,
+          },
+        },
+      });
+    });
+  } catch (e) {
+    if (e?.code === 'INSUFFICIENT') return { outcome: 'insufficient', trx };
+    throw e;
+  }
+
+  // Step 2 - dispatch. Anything that fails from here is refunded, because
+  // the money has already left the wallet.
+  let providerResponse;
+  try {
+    providerResponse = await dispatch(upstream, pending, trx);
+  } catch (e) {
+    const refunded = await refund({ trx, reason: e?.message || '' });
+    return { outcome: 'provider_failed', trx, error: e, refund: refunded };
+  }
+
+  // One shape for every rail, built in the provider module so the
+  // differences between purchase responses stay there.
+  const vend = upstream.parseVendResult(providerResponse);
+  const providerRef = vend.reference || vend.order_no;
+  // Normally here for prepaid electricity, but not on a vend the provider
+  // accepted as pending - that one fills in later. Either way the receipt
+  // shape is the same before and after.
+  const token = vend.token;
+  const units = vend.units;
+
+  // A biller that accepted the order but has not delivered it answers
+  // "pending". A prepaid meter with no token yet is the same situation said
+  // differently, so it stays processing until a token arrives.
+  const processing =
+    vend.status === 'pending' ||
+    vend.status === 'processing' ||
+    vend.status === 'initiated' ||
+    (pending.service === 'electricity' && pending.meter_type === 'prepaid' && !token);
+
+  // What we debited, against what the upstream actually billed the float. Every
+  // rail - MTN, Airtel, Glo and 9mobile, every TV brand, every DISCO - when the
+  // field comes back. What differs is what a difference *means*, so the two
+  // shapes are read differently:
+  //
+  //   data / tv   - priced from the catalogue, and the purchase call sends no
+  //                 amount at all: the upstream prices it from the plan or
+  //                 package id. Our debit and their charge are the same number
+  //                 by definition, so any difference is the cached catalogue
+  //                 having moved under us.
+  //   airtime /   - the customer typed the amount and we send it. The float is
+  //   electricity   charged that amount less our reseller commission, so a
+  //                 *lower* provider figure is the margin working, not a fault.
+  //                 Only an overcharge is worth reporting on these two.
+  //
+  // Recorded, not acted on. The vend has already succeeded and the customer has
+  // already been quoted, so there is nothing to correct on this request, and the
+  // 25-minute warm replaces a stale catalogue on its own. Deliberately no alert
+  // and no dropCatalogue: if a provider's `amount` is the face value rather than
+  // the reseller price, both would fire on every purchase - paging on noise, and
+  // dumping a catalogue we just warmed back onto a cold load. Watch
+  // `meta.price_drift` on real traffic before turning either on - and watch it
+  // per gateway, since providers discount differently.
+  let priceDrift = null;
+  if (vend.amount > 0) {
+    const drift = Number((vend.amount - amount).toFixed(2));
+    const cataloguePriced = pending.service === 'data' || pending.service === 'tv';
+    // Being billed more than we collected is a loss on any rail. Being billed
+    // less only means something where we did not pick the amount ourselves.
+    if (drift >= 0.01 || (cataloguePriced && drift <= -0.01)) {
+      priceDrift = drift;
+      // Provider and service only - no phone, smartcard, meter or name in a log.
+      console.warn(
+        `⚠️  ${pending.provider} ${pending.service} price drift: quoted ${amount}, billed ${vend.amount}`,
+        { trx }
+      );
+    }
+  }
+
+  await prisma.walletTransaction.update({
+    where: { trx },
+    data: {
+      other_data: {
+        title: service.title,
+        subtitle: protectText(details),
+        feedback: processing ? 'Processing' : 'Successful',
+        note: pending.item_name || service.title,
+        image_src: '',
+      },
+      meta: {
+        gateway,
+        service: pending.service,
+        // Bill Hero counts weekly purchases on meta.type. Stamped only here,
+        // after the provider accepted - a refunded attempt must not earn
+        // progress towards a reward.
+        type: pending.service,
+        provider: pending.provider,
+        reference: trx,
+        // A webhook only knows the upstream's own reference, so this is the
+        // key it joins back on. Losing it strands the electricity token.
+        provider_reference: providerRef,
+        bill_status: processing ? 'processing' : 'successful',
+        meter_type: pending.service === 'electricity' ? pending.meter_type : undefined,
+        // Stamped only when the provider billed something other than what we
+        // quoted, so the rows carrying these are exactly the ones worth reading.
+        provider_amount: priceDrift === null ? undefined : vend.amount,
+        price_drift: priceDrift ?? undefined,
+        token,
+        units,
+        ...extra,
+      },
+    },
+  });
+
+  // No meter, smartcard or phone number here - `details` names the customer.
+  // The trx is enough to join back to the ledger row that does hold it.
+  await logMoneyEvent({
+    req,
+    userId,
+    event: `bill.${service.key}`,
+    trx,
+    amount: total,
+    extra: {
+      provider: pending.provider || null,
+      provider_reference: providerRef || null,
+      status: processing ? 'processing' : 'successful',
+      ...(auditExtra && typeof auditExtra === 'object' ? auditExtra : {}),
+    },
+  });
+
+  return {
+    outcome: 'delivered',
+    trx,
+    processing,
+    providerRef,
+    token,
+    units,
+    details,
+    postBalance: Number(reserved?.balance?.toString?.() ?? reserved?.balance ?? 0),
+  };
 }
 
 async function confirm(req, res) {
@@ -715,9 +977,11 @@ async function confirm(req, res) {
     // the customer re-prices - it is not dispatched to either provider.
     //
     // Sending it to the *new* upstream is the obvious-looking bug: a plan id, a
-    // package code and a price all belong to whoever issued them, so a
-    // ClubKonnect plan id posted to PairGate either bounces or - far worse -
-    // matches something else and delivers a bundle nobody agreed to buy.
+    // package code and a price all belong to whoever issued them, so one
+    // provider's plan id posted to another either bounces or - far worse -
+    // matches something else and delivers a bundle nobody agreed to buy. This
+    // is also what makes a provider *removal* safe to deploy: a quote stamped
+    // with a gateway that no longer exists fails this check and is re-priced.
     //
     // Honouring the *old* pin is the subtler one. It is defensible on price,
     // but the reason an admin flips this switch is that an upstream is
@@ -759,206 +1023,40 @@ async function confirm(req, res) {
       });
     }
 
-    const trx = generateTrx(service.trxPrefix);
-    const debit = new Prisma.Decimal(total.toFixed(2));
-    const details = detailsFor(pending);
+    const result = await executePurchase({ userId: user.id, service, pending, gateway, upstream, req });
 
-    // Step 1 - reserve. The balance guard lives in the same transaction as the
-    // ledger write, so two taps on the pay button cannot both pass it.
-    let reserved;
-    try {
-      await prisma.$transaction(async tx => {
-        const row = await tx.user.findUnique({ where: { id: Number(user.id) } });
-        const current = Number(row?.balance?.toString?.() ?? row?.balance ?? 0);
-        if (!Number.isFinite(current) || current < total) {
-          const err = new Error('Insufficient balance');
-          err.code = 'INSUFFICIENT';
-          throw err;
-        }
-
-        reserved = await applyBalanceDelta(tx, 'user', user.id, debit.negated());
-
-        await tx.walletTransaction.create({
-          data: {
-            user_id: Number(user.id),
-            trx,
-            trx_type: '-',
-            amount: debit,
-            charge: new Prisma.Decimal('0.00'),
-            total_amount: debit,
-            remark: service.dbRemark,
-            details: protectText(details),
-            other_data: {
-              title: service.title,
-              subtitle: protectText(details),
-              feedback: 'Processing',
-              note: pending.item_name || service.title,
-              image_src: '',
-            },
-            // No name, phone, meter or smartcard here - `meta` is not
-            // encrypted. Only provider and reference, which identify the
-            // transaction without describing the person.
-            //
-            // `gateway` is the pinned upstream, never a constant: the webhook
-            // and the settlement sweep filter on it to decide who to ask about
-            // this row. Stamp the wrong one and this bill never settles and
-            // never refunds.
-            meta: {
-              gateway,
-              service: pending.service,
-              provider: pending.provider,
-              reference: trx,
-              bill_status: 'processing',
-            },
-          },
-        });
-      });
-    } catch (e) {
-      if (e?.code === 'INSUFFICIENT') return fail(res, 400, 'insufficient_balance', 'Insufficient balance');
-      throw e;
+    // Nothing was reserved. The quote is left in place so a customer who tops
+    // up can pay it inside its five minutes without pricing it again.
+    if (result.outcome === 'insufficient') {
+      return fail(res, 400, 'insufficient_balance', 'Insufficient balance');
     }
 
-    // Step 2 - dispatch. Anything that fails from here is refunded, because
-    // the money has already left the wallet.
-    let providerResponse;
-    try {
-      providerResponse = await dispatch(upstream, pending, trx);
-    } catch (e) {
-      await refund({ trx, reason: e?.message || '' });
+    // Reserved, refused and already refunded inside executePurchase.
+    if (result.outcome === 'provider_failed') {
       await clearPending(user.id, service.remark);
-      return providerFail(res, e, `${service.title} purchase failed`, gateway);
+      return providerFail(res, result.error, `${service.title} purchase failed`, gateway);
     }
-
-    // One shape for every rail and both upstreams, built in the provider module
-    // so the differences between eight purchase responses stay there.
-    const vend = upstream.parseVendResult(providerResponse);
-    const providerRef = vend.reference || vend.order_no;
-    // May or may not be here, depending on the upstream: one rail only ever
-    // delivers an electricity token on the webhook, the other usually returns it
-    // inline. Either way the receipt shape is the same before and after.
-    const token = vend.token;
-    const units = vend.units;
-
-    // A biller that accepted the order but has not delivered it answers
-    // "pending". A prepaid meter with no token yet is the same situation said
-    // differently, so it stays processing until a token arrives - which is
-    // always on one rail and merely usually on the other, where nearly every
-    // vend is acknowledged asynchronously before it is delivered.
-    const processing =
-      vend.status === 'pending' ||
-      vend.status === 'processing' ||
-      vend.status === 'initiated' ||
-      (pending.service === 'electricity' && pending.meter_type === 'prepaid' && !token);
-
-    // What we debited, against what the upstream actually billed the float. Every
-    // rail and every provider - MTN, Airtel, Glo and 9mobile, all four TV brands,
-    // every DISCO - because the field comes back on all of them. What differs is
-    // what a difference *means*, so the two shapes are read differently:
-    //
-    //   data / tv   - priced from the catalogue, and the purchase call sends no
-    //                 amount at all: the upstream prices it from the plan or
-    //                 package id. Our debit and their charge are the same number
-    //                 by definition, so any difference is the cached catalogue
-    //                 having moved under us.
-    //   airtime /   - the customer typed the amount and we send it. The float is
-    //   electricity   charged that amount less our reseller commission, so a
-    //                 *lower* provider figure is the margin working, not a fault.
-    //                 Only an overcharge is worth reporting on these two.
-    //
-    // Recorded, not acted on. The vend has already succeeded and the customer has
-    // already been quoted, so there is nothing to correct on this request, and the
-    // 25-minute warm replaces a stale catalogue on its own. Deliberately no alert
-    // and no dropCatalogue: if a provider's `amount` is the face value rather than
-    // the reseller price, both would fire on every purchase - paging on noise, and
-    // dumping a catalogue we just warmed back onto a cold load. Watch
-    // `meta.price_drift` on real traffic before turning either on. Worth watching
-    // per gateway now that there are two, since they discount differently.
-    let priceDrift = null;
-    if (vend.amount > 0) {
-      const drift = Number((vend.amount - amount).toFixed(2));
-      const cataloguePriced = pending.service === 'data' || pending.service === 'tv';
-      // Being billed more than we collected is a loss on any rail. Being billed
-      // less only means something where we did not pick the amount ourselves.
-      if (drift >= 0.01 || (cataloguePriced && drift <= -0.01)) {
-        priceDrift = drift;
-        // Provider and service only - no phone, smartcard, meter or name in a log.
-        console.warn(
-          `⚠️  ${pending.provider} ${pending.service} price drift: quoted ${amount}, billed ${vend.amount}`,
-          { trx }
-        );
-      }
-    }
-
-    await prisma.walletTransaction.update({
-      where: { trx },
-      data: {
-        other_data: {
-          title: service.title,
-          subtitle: protectText(details),
-          feedback: processing ? 'Processing' : 'Successful',
-          note: pending.item_name || service.title,
-          image_src: '',
-        },
-        meta: {
-          gateway,
-          service: pending.service,
-          // Bill Hero counts weekly purchases on meta.type. Stamped only here,
-          // after the provider accepted - a refunded attempt must not earn
-          // progress towards a reward.
-          type: pending.service,
-          provider: pending.provider,
-          reference: trx,
-          // A webhook only knows the upstream's own reference, so this is the
-          // key it joins back on. Losing it strands the electricity token.
-          provider_reference: providerRef,
-          bill_status: processing ? 'processing' : 'successful',
-          meter_type: pending.service === 'electricity' ? pending.meter_type : undefined,
-          // Stamped only when the provider billed something other than what we
-          // quoted, so the rows carrying these are exactly the ones worth reading.
-          provider_amount: priceDrift === null ? undefined : vend.amount,
-          price_drift: priceDrift ?? undefined,
-          token,
-          units,
-        },
-      },
-    });
 
     await clearPending(user.id, service.remark);
-    // No meter, smartcard or phone number here - `details` names the customer.
-    // The trx is enough to join back to the ledger row that does hold it.
-    await logMoneyEvent({
-      req,
-      userId: user.id,
-      event: `bill.${service.key}`,
-      trx,
-      amount: total,
-      extra: {
-        provider: pending.provider || null,
-        provider_reference: providerRef || null,
-        status: processing ? 'processing' : 'successful',
-      },
-    });
-
-    const postBalance = Number(reserved?.balance?.toString?.() ?? reserved?.balance ?? 0);
 
     return ok(
       res,
       `${service.key}_success`,
-      processing
+      result.processing
         ? 'Payment is processing. Your token will appear shortly.'
         : `${service.title} purchase successful`,
       {
         service: service.key,
-        trx,
-        provider_reference: providerRef,
+        trx: result.trx,
+        provider_reference: result.providerRef,
         amount: moneyStr(amount),
         charge: '0.00',
         total: moneyStr(total),
-        post_balance: moneyStr(postBalance),
-        details,
-        token,
-        units,
-        status: processing ? 'processing' : 'successful',
+        post_balance: moneyStr(result.postBalance),
+        details: result.details,
+        token: result.token,
+        units: result.units,
+        status: result.processing ? 'processing' : 'successful',
         created_at: new Date().toISOString(),
       }
     );
@@ -981,17 +1079,18 @@ async function refund({ trx, reason = 'Provider declined' }) {
 
 /* ------------------------------------------------------------------- status */
 
-// Receipt refresh. Prepaid electricity never hands back its token on the confirm
-// call on this rail, so the receipt screen polls this.
+// Receipt refresh. A vend the provider accepted as pending - prepaid electricity
+// included, whose token then arrives later - leaves the receipt processing, so
+// the receipt screen polls this.
 //
-// Mostly it just reads the ledger row - the webhook is what writes the token, and
-// it usually lands within seconds. But a webhook that never arrives would leave
-// the row processing forever, so a row that has been open long enough is also
-// requeried against PairGate here. `reconcile` throttles itself; a client polling
-// every second still costs at most one provider call per window.
+// Mostly it just reads the ledger row, which the webhook settles. But a webhook
+// that never arrives would leave the row processing forever, so a row that has
+// been open long enough is also requeried against the provider that sold it.
+// `reconcile` throttles itself; a client polling every second still costs at
+// most one provider call per window.
 //
-// A requery can settle the amount but never recovers a token - `transaction/status`
-// does not carry one. That is the webhook's job alone.
+// The requery can carry the token as well as the outcome, so a receipt can be
+// completed from here even when the webhook is lost.
 async function status(req, res) {
   try {
     const user = req.user;
@@ -1024,7 +1123,11 @@ async function status(req, res) {
     return ok(res, 'bill_status', 'OK', {
       trx,
       service: String(meta.service || ''),
-      bill_status: String(meta.bill_status || ''),
+      // Delivered without its token is, to the customer, still processing - and
+      // "processing" is the word every installed app keeps polling on. Any other
+      // word would end the poll on a receipt with no token.
+      bill_status:
+        meta.bill_status === settlement.AWAITING_TOKEN ? 'processing' : String(meta.bill_status || ''),
       feedback: String(otherData.feedback || ''),
       token: String(meta.token || ''),
       units: String(meta.units || ''),
@@ -1047,6 +1150,12 @@ module.exports = {
   quote,
   confirm,
   status,
+  // The scheduled top-up worker buys through these, so a standing order is
+  // priced, floored and paid exactly like a tap on the pay button.
+  executePurchase,
+  displayPlan,
+  minAmountFor,
+  SERVICES,
   // exported for tests
   normalizeNgPhone,
   buildPlanTabs,

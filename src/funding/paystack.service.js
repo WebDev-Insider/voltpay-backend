@@ -188,6 +188,20 @@ async function verifyTransfer(reference) {
   return { data: json?.data, raw: json };
 }
 
+/**
+ * What the integration holds to pay transfers from, in kobo. Read by the ops
+ * screens only - Paystack is the authority at transfer time, and a balance read
+ * a second earlier is not a reservation.
+ */
+async function getBalance() {
+  const json = await paystackRequest('/balance');
+  const rows = Array.isArray(json?.data) ? json.data : [];
+  const ngn = rows.find(r => String(r?.currency || '').toUpperCase() === 'NGN');
+  if (!ngn) return null;
+  const kobo = Number(ngn.balance);
+  return { balance_kobo: Number.isFinite(kobo) ? kobo : 0, currency: 'NGN' };
+}
+
 // Paystack publishes flat NGN transfer fees rather than an API to quote them,
 // so the tiers live here. Overridable because Paystack has changed them before
 // and a wrong fee under-reserves the wallet.
@@ -294,6 +308,7 @@ module.exports = {
   createTransferRecipient,
   initiateTransfer,
   verifyTransfer,
+  getBalance,
   transferFeeNaira,
   createCustomer,
   createDedicatedAccount,

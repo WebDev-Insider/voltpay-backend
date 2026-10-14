@@ -31,6 +31,12 @@ const SAFE_BODY_KEYS = new Set([
   // a rail was switched but not to what, which is the only fact anyone reads
   // this row for.
   'provider',
+  // CAC: whether a rejection also refunded the customer, and the service's
+  // admin-set terms - which type a price change was for, and the time quoted.
+  // All admin-chosen; none carries customer data.
+  'refund',
+  'processing_time',
+  'registration_type',
 ]);
 
 function safeBody(body) {

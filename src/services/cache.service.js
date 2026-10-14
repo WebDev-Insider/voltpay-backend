@@ -9,8 +9,9 @@
  *    opening the transaction screen the second a key expires produce fifty
  *    identical full-history queries against Neon. Here the first caller runs
  *    the loader and the other forty-nine await the same promise. This is the
- *    same pattern pairgate.service uses for provider catalogues, and it is the
- *    reason a cold cache costs one query rather than a thundering herd.
+ *    same pattern funding/catalogueCache.js uses for provider catalogues, and
+ *    it is the reason a cold cache costs one query rather than a thundering
+ *    herd.
  *    It works even with Redis switched off, which is what makes the fallback
  *    path survivable.
  * 2. **One place that owns the key names and TTLs.** Invalidation is only ever

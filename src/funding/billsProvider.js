@@ -1,10 +1,18 @@
 // Which provider serves which bill, switchable from the admin dashboard.
 //
-// VoltPay buys airtime, data, cable TV and electricity from two interchangeable
-// upstreams - PairGate and ClubKonnect. When one goes down, starts declining,
-// or simply prices a rail worse than the other, an admin flips that rail over
-// without a deploy. The switch is **per service**, so a broken data upstream
-// does not drag airtime with it.
+// VoltPay buys airtime, data, cable TV and electricity from MySubWallet, which
+// is the only registered upstream today. PairGate and ClubKonnect were removed
+// in October 2026. The registry and the per-rail switch are kept anyway,
+// because the provider has changed four times: a second upstream is one
+// adapter exporting the same surface plus one line in ADAPTERS below, and every
+// caller - the controller, Bill Hero, the sweep, the ops screen - already goes
+// through here rather than importing a provider directly. With two registered,
+// an admin flips a broken rail over without a deploy, **per service**, so a
+// broken data upstream does not drag airtime with it.
+//
+// A stored setting that names a provider no longer registered (the live
+// `bills_provider_*` rows still say "pairgate") reads as unknown and resolves
+// to the default below - no data migration is needed for the switchover.
 //
 // Four settings rows, one per rail:
 //   bills_provider_airtime | bills_provider_data
@@ -31,8 +39,7 @@
 const prisma = require('../../database/prisma');
 const redis = require('../services/redis.service');
 
-const pairgate = require('./pairgate.service');
-const clubkonnect = require('./clubkonnect.service');
+const mysubwallet = require('./mysubwallet.service');
 
 const TTL = Number(process.env.BILLS_PROVIDER_TTL_SECONDS || 30);
 
@@ -45,24 +52,25 @@ const SERVICES = {
   electricity: 'Electricity',
 };
 
-// The adapters. Every one of these exports the same surface - see the module
-// header of either - which is what lets bills.controller stay ignorant of which
-// is answering.
+// The adapters. Every one exports the same surface - see the header of
+// mysubwallet.service.js - which is what lets bills.controller stay ignorant of
+// which is answering.
+//
+// **A name in here is also a gateway the sweep asks about.** billReconcile
+// settles only rows whose `meta.gateway` is a key of this object, so removing a
+// provider while it still has bills in `processing` strands them: never
+// settled, never refunded. Check for open rows before removing one.
 const ADAPTERS = {
-  pairgate,
-  clubkonnect,
+  mysubwallet,
 };
 
 const PROVIDER_LABELS = {
-  pairgate: 'PairGate',
-  clubkonnect: 'ClubKonnect',
+  mysubwallet: 'MySubWallet',
 };
 
 // The answer when a setting is missing, unreadable, or names a provider that is
-// no longer usable. PairGate because it is the incumbent: every bill written
-// before this module existed carries `meta.gateway = 'pairgate'`, and the
-// settlement sweep keys off that.
-const DEFAULT_PROVIDER = 'pairgate';
+// no longer usable - including one that has since been removed from ADAPTERS.
+const DEFAULT_PROVIDER = 'mysubwallet';
 
 function settingKey(service) {
   return `bills_provider_${service}`;
@@ -86,7 +94,7 @@ function isKnownProvider(name) {
 function isProviderConfigured(name) {
   const adapter = ADAPTERS[name];
   if (!adapter) return false;
-  // Both adapters answer this. An adapter added later without one is assumed
+  // Every adapter answers this. One added later without it is assumed
   // usable rather than assumed broken - its own request path still throws on a
   // missing key, so the failure surfaces either way.
   return typeof adapter.isConfigured === 'function' ? adapter.isConfigured() : true;
@@ -103,7 +111,7 @@ function normalizeProvider(value) {
  * Cached, and every failure path lands on DEFAULT_PROVIDER: an unreadable
  * setting, an unknown name left behind by an older deploy, or a provider whose
  * credentials have since been removed. The last one is the important one - an
- * admin can switch to ClubKonnect and someone can later rotate the key out of
+ * admin can switch to a provider and someone can later rotate the key out of
  * the environment, and this keeps the rail selling rather than refunding every
  * order until somebody notices.
  */

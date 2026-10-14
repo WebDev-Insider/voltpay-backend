@@ -70,7 +70,7 @@ assert.deepStrictEqual(BILL_REMARKS, ['mobile_recharge', 'cable_tv', 'utility_bi
 
 // --- refunds -------------------------------------------------------------
 // The reason this file exists. A declined bill is refunded with a credit
-// carrying meta.reversal_of, and on the PairGate rail the decline can arrive on
+// carrying meta.reversal_of, and a vend accepted as pending can be declined on
 // the webhook minutes later.
 {
   const debits = [

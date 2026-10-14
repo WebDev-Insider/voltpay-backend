@@ -8,9 +8,9 @@
 //   1. **A catalogue price is what the customer is charged.** Quote a stale one
 //      and we collect the old amount while the provider bills us the new one, so
 //      staleness here is a money bug rather than a freshness annoyance.
-//   2. **The origin is rate-limited and bursty.** One network's data plans is a
-//      categories call plus one call per plan family, and the app asks for
-//      several networks at once. Uncoordinated, that is a self-inflicted 429.
+//   2. **The origin is rate-limited and bursty.** The app asks for several
+//      networks and lists at once, and some providers need more than one call
+//      per list. Uncoordinated, that is a self-inflicted 429.
 //   3. **Nobody may wait on it.** The bills screen has to render. A refresh that
 //      blocks the first customer through the door after a TTL expiry is a
 //      several-second stall for one unlucky person.
@@ -22,11 +22,10 @@
 //
 // Each provider instantiates its own cache with its own timings - see the
 // comments at those call sites for why each number is what it is. Cache keys are
-// fully qualified by the caller (`pairgate:providers:data`), which is what keeps
+// fully qualified by the caller (`mysubwallet:data:all`), which is what keeps
 // two providers' catalogues from ever colliding. That matters more than it
-// sounds: a ClubKonnect data plan id is a price-like string scoped to one
-// network and a PairGate plan id is an opaque token, so serving one provider's
-// list under the other's key would vend the wrong bundle.
+// sounds: plan ids are only meaningful to the provider that issued them, so
+// serving one provider's list under another's key would vend the wrong bundle.
 const redis = require('../services/redis.service');
 
 // Three outcomes, not two, because "nobody else is refreshing" and "there is no

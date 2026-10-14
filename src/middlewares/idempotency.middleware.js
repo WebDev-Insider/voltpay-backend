@@ -32,6 +32,9 @@ function keyDigest(userId, name, key) {
 function fingerprint(body) {
   const copy = { ...(body || {}) };
   delete copy.pin;
+  // Airtime to Cash: the network's Share & Sell PIN. Four digits under a keyed
+  // digest is still four digits - same reason as the PIN above.
+  delete copy.share_pin;
   delete copy.password;
   delete copy.access_token;
   return blindIndex(JSON.stringify(copy), 'idempotency');
@@ -163,7 +166,7 @@ async function paymentStatus(req, res) {
 
   // The endpoint namespace is part of the digest, so the key is looked up
   // against each money route in turn rather than stored raw.
-  const names = ['bills_confirm', 'verify_pin_settle', 'send_money_store', 'request_money_approve', 'staffpay_payroll_run', 'staffpay_payroll_retry', 'betting_store'];
+  const names = ['bills_confirm', 'verify_pin_settle', 'send_money_store', 'request_money_approve', 'staffpay_payroll_run', 'staffpay_payroll_retry', 'betting_store', 'virtual_card_create', 'virtual_card_fund'];
   let row = null;
   for (const name of names) {
     row = await prisma.idempotencyKey.findUnique({ where: { key_idx: keyDigest(userId, name, key) } });

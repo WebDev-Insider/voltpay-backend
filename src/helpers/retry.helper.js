@@ -132,7 +132,10 @@ async function withRetry(fn, opts = {}) {
         attempt: attempt + 1,
         of: retries,
         in_ms: wait,
-        reason: String(e?.message || e).slice(0, 120),
+        // A provider module that words its errors for the customer keeps the
+        // diagnostic - "fetch failed (ECONNRESET)" - on providerMessage, and
+        // that is what an operator reading this line needs.
+        reason: String(e?.providerMessage || e?.message || e).slice(0, 120),
       });
       if (typeof opts.onRetry === 'function') {
         try { opts.onRetry(e, attempt, wait); } catch (_) {}

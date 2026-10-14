@@ -25,6 +25,10 @@ const transactionsRoutes = require('./src/routes/transactions.routes');
 const bettingRoutes = require('./src/routes/betting.routes');
 const billsRoutes = require('./src/routes/bills.routes');
 const billHeroRoutes = require('./src/routes/billHero.routes');
+const scheduledTopupRoutes = require('./src/routes/scheduledTopup.routes');
+const airtimeCashRoutes = require('./src/routes/airtimeCash.routes');
+const cacRoutes = require('./src/routes/cac.routes');
+const virtualCardRoutes = require('./src/routes/virtualCard.routes');
 const sendMoneyRoutes = require('./src/routes/sendMoney.routes');
 const requestMoneyRoutes = require('./src/routes/requestMoney.routes');
 const verificationRoutes = require('./src/routes/verification.routes');
@@ -46,6 +50,7 @@ const { captureError } = require('./src/services/alerts.service');
 const { ensurePasswordResetsTable } = require('./src/models/passwordReset.model');
 const userAuth = require('./src/middlewares/userAuth.middleware');
 const appVersionGate = require('./src/middlewares/appVersionGate.middleware');
+const { uploadErrorMessage, bodyErrorReply } = require('./src/middlewares/upload.middleware');
 const { startStaffPayScheduler } = require('./src/services/staffpayScheduler.service');
 const { initNotificationWs } = require('./src/services/notificationWs.service');
 const redis = require('./src/services/redis.service');
@@ -194,19 +199,27 @@ const PUBLIC_API_PATHS = [
   '/health',
   '/policies',
   '/faq',
+  // PaymentPoint's credit webhook. Authenticated by its HMAC signature in the
+  // controller, not by a session.
   '/funding/webhook',
-  // PairGate bill delivery. Authenticated by HMAC in the controller, not by a
-  // session - the caller is a provider, and it carries the only copy of an
-  // electricity token.
-  '/bills/webhook/pairgate',
-  // ClubKonnect bill delivery. Their API has no signature scheme, so this one is
-  // authenticated by *not being believed*: the controller re-reads the outcome
-  // over the authenticated query API before anything settles.
-  '/bills/webhook/clubkonnect',
+  // MySubWallet delivery, for bills and Bill Hero rewards. Their API has no
+  // signature scheme, so this one is authenticated by *not being believed*: the
+  // controller re-reads the outcome over the authenticated requery before
+  // anything settles.
+  '/bills/webhook/mysubwallet',
   '/staffpay/wallet/webhook',
   '/staffpay/wallet/fund/callback',
   '/staffpay/subscription/webhook',
-  '/betting/callback'
+  // Payvessel betting orders. Unsigned too, and treated the same way: the
+  // controller re-fetches the order from Payvessel before settling it.
+  '/betting/callback',
+  // Where Paystack sends the browser after a CAC checkout. A static page that
+  // settles nothing - the signed webhook, the app's verify and the sweep do.
+  '/cac/paystack/callback',
+  // Payvessel card events. HMAC-SHA512 over the raw body, checked in the
+  // controller; lifecycle events are then re-read from Payvessel, never
+  // believed on their own. Nothing depends on it arriving - see the sweep.
+  '/virtual-card/webhook'
   // No KYC path is public. Payvessel answers both the BVN and the NIN check in
   // the HTTP response, so there is no callback for a provider to deliver and
   // nothing on /kyc that should be reachable without a session.
@@ -243,6 +256,10 @@ app.use(API_PREFIX, fundingRoutes);
 app.use(API_PREFIX, bettingRoutes);
 app.use(API_PREFIX, billsRoutes);
 app.use(API_PREFIX, billHeroRoutes);
+app.use(API_PREFIX, scheduledTopupRoutes);
+app.use(API_PREFIX, airtimeCashRoutes);
+app.use(API_PREFIX, cacRoutes);
+app.use(API_PREFIX, virtualCardRoutes);
 app.use(API_PREFIX, sendMoneyRoutes);
 app.use(API_PREFIX, requestMoneyRoutes);
 app.use(API_PREFIX, verificationRoutes);
@@ -374,6 +391,27 @@ app.get('/', (req, res) => {
 
 // Error handling middleware
 app.use((error, req, res, next) => {
+  // A refused upload - too large, the wrong type - is the caller's file, not
+  // our failure. Answered as a 400 that says what was wrong; it used to reach
+  // the 500 below and tell the customer only "Internal server error".
+  const uploadMessage = uploadErrorMessage(error);
+  if (uploadMessage) {
+    return res.status(400).json({ remark: 'validation_error', status: 'error', message: [uploadMessage], data: null });
+  }
+  // The same for a body the JSON / form parser refused. A client hanging up
+  // mid-upload (a phone losing signal while it sends a photo) used to land
+  // below as a crash and page ops on every dropped connection: it is one quiet
+  // line now - route and byte counts only, never the body - and no answer,
+  // because the socket is already closed.
+  const bodyReply = bodyErrorReply(error);
+  if (bodyReply) {
+    const path = String(req.originalUrl || req.url || '').split('?')[0];
+    if (bodyReply.quiet) {
+      console.warn(`[http] client closed the request mid-upload: ${req.method} ${path} (${error.received ?? '?'} of ${error.expected ?? '?'} bytes)`);
+      return undefined;
+    }
+    return res.status(bodyReply.status).json({ remark: 'validation_error', status: 'error', message: [bodyReply.message], data: null });
+  }
   console.error('Unhandled error:', error);
   // The client still gets nothing but "Internal server error"; the alert carries
   // the route and the user id, never the body.
@@ -426,6 +464,22 @@ initNotificationWs(server);
   }
 }
 
+// Scheduled top-ups: standing airtime and data orders, bought in Lagos time on
+// a one-minute tick. Same contract as payroll - opt-in, always-on process only,
+// safe on several instances (each cycle is claimed once in the database) - and
+// the same loud warning when production is not running it, because a customer
+// whose Monday top-up silently never happens finds out from their mother.
+{
+  const { startScheduledTopupWorker } = require('./src/services/scheduledTopup.service');
+  const scheduledTopups = startScheduledTopupWorker();
+  if (!scheduledTopups && process.env.NODE_ENV === 'production') {
+    console.error(
+      '⚠️  Scheduled top-ups are NOT running on this instance. Standing orders will not be bought. ' +
+      'It needs SCHEDULED_TOPUPS_ENABLED=true on an always-on Node process.',
+    );
+  }
+}
+
 // One pass an hour is enough for a 24h request window, and the reminder itself
 // is stamped in the row so a restart mid-tick cannot double-notify.
 {
@@ -449,11 +503,11 @@ initNotificationWs(server);
   if (bettingSweepTimer && typeof bettingSweepTimer.unref === 'function') bettingSweepTimer.unref();
 }
 
-// Same problem on the bills rails. Both upstreams accept a vend and report the
-// outcome later, and both retry a webhook a handful of times and then drop it.
-// A bill left processing because none of those landed is a customer whose money
-// is gone with nothing delivered, so the outcome is also pulled on a timer. One
-// sweep covers every bills provider - it dispatches on each row's own gateway.
+// Same problem on the bills rails. A provider can accept a vend as pending and
+// report the outcome later, and a webhook can be dropped. A bill left processing
+// because none of those landed is a customer whose money is gone with nothing
+// delivered, so the outcome is also pulled on a timer. One sweep covers every
+// bills provider - it dispatches on each row's own gateway.
 {
   const { sweepProcessingBills } = require('./src/helpers/billReconcile.helper');
   const billsSweepTimer = setInterval(
@@ -463,11 +517,71 @@ initNotificationWs(server);
   if (billsSweepTimer && typeof billsSweepTimer.unref === 'function') billsSweepTimer.unref();
 }
 
+// Bill Hero rewards, the same problem with no money behind it. A reward the
+// provider accepted can fail minutes later, and nothing else would notice:
+// the provider's webhook cannot be configured. This finishes every reward with
+// nobody involved - confirms it, re-sends it on a fresh reference with backoff,
+// or, when every send has failed, hands it back for the customer to claim with
+// another number and tells them so. See "reward delivery" in
+// billHero.controller.
+{
+  const { settleRewardDeliveries } = require('./src/controllers/billHero.controller');
+  const rewardSweepTimer = setInterval(
+    () => settleRewardDeliveries().catch(() => null),
+    Number(process.env.BILL_HERO_REWARD_SWEEP_INTERVAL_MS || 5 * 60_000)
+  );
+  if (rewardSweepTimer && typeof rewardSweepTimer.unref === 'function') rewardSweepTimer.unref();
+}
+
+// Airtime to Cash finishes itself: payouts Paystack has not answered for,
+// conversions MySubWallet has not confirmed, submits a dead process left
+// behind, and drafts nobody came back to. The Paystack webhook settles payouts
+// faster when it arrives; this is the path that does not depend on it. Also
+// pages ops once a conversion has waited too long for somebody to fund
+// Paystack and mark it available. See sweep() in airtimeCash.service.
+{
+  const { sweep: sweepAirtimeCash } = require('./src/services/airtimeCash.service');
+  const airtimeCashSweepTimer = setInterval(
+    () => sweepAirtimeCash().catch(e => captureError('airtime_cash.sweep', e)),
+    Number(process.env.A2C_SWEEP_INTERVAL_MS || 5 * 60_000)
+  );
+  if (airtimeCashSweepTimer && typeof airtimeCashSweepTimer.unref === 'function') airtimeCashSweepTimer.unref();
+}
+
+// CAC Registration finishes itself too: a Paystack checkout whose webhook never
+// arrived and whose app never came back to verify is asked about here, and any
+// payment that lands on an application already paid is handed back to the
+// wallet in the same pass. Also clears out drafts nobody returned to, documents
+// and all. See sweep() in cac.service.
+{
+  const { sweep: sweepCac } = require('./src/services/cac.service');
+  const cacSweepTimer = setInterval(
+    () => sweepCac().catch(e => captureError('cac.sweep', e)),
+    Number(process.env.CAC_SWEEP_INTERVAL_MS || 5 * 60_000)
+  );
+  if (cacSweepTimer && typeof cacSweepTimer.unref === 'function') cacSweepTimer.unref();
+}
+
+// USD cards finish themselves: a card Payvessel is still making is read until
+// it is active (or refunded), a top-up whose answer was lost is matched in the
+// card's own history (or refunded once a run of good reads shows it never
+// landed), live balances are re-read, and a card nobody funded gets its
+// reminder before Payvessel closes it. Payvessel's webhook only makes this
+// faster - their dashboard may not accept our callback URL at all. See sweep()
+// in virtualCard.service.
+{
+  const { sweep: sweepVirtualCards } = require('./src/services/virtualCard.service');
+  const virtualCardSweepTimer = setInterval(
+    () => sweepVirtualCards().catch(e => captureError('virtual_card.sweep', e)),
+    Number(process.env.VCARD_SWEEP_INTERVAL_MS || 5 * 60_000)
+  );
+  if (virtualCardSweepTimer && typeof virtualCardSweepTimer.unref === 'function') virtualCardSweepTimer.unref();
+}
+
 // Provider catalogues - data plans, TV bouquets, DISCO lists - are what the
-// bills screen renders, and the upstreams rate-limit per second as well as per
-// minute. Loading them on demand means the customer who arrives on a cold cache
-// pays for a categories call plus one call per plan family, spaced a second
-// apart: several seconds of spinner for a list everyone else gets instantly.
+// bills screen renders, and the upstream's rate budget is shared with live
+// vending. Loading them on demand means the customer who arrives on a cold
+// cache waits on the provider for a list everyone else gets instantly.
 //
 // So the refresh is moved off the request path entirely. Warm once shortly after
 // boot, then replace on an interval shorter than the freshness window, so the
@@ -511,28 +625,28 @@ initNotificationWs(server);
   // second - which a fixed delay guaranteed they would.
   //
   // The boot pass does not force, so an instance that starts behind another one
-  // reads each catalogue back out of Redis and calls PairGate zero times. That
-  // dedup is free, but only if the first instance has already written the key,
-  // and identical delays put them in the provider together instead. A small
-  // offset is enough to fix it: both walk the same steps at the same paced
-  // interval, so once staggered the later instance stays a step behind and hits
-  // L2 the whole way down. With Redis unavailable there is no dedup at all, and
-  // spreading the starts is the only thing keeping N boots off one 60/min key.
-  const warmJitterMs = Number(process.env.PAIRGATE_WARM_JITTER_MS || 5_000);
-  const warmDelayMs = Number(process.env.PAIRGATE_WARM_DELAY_MS || 3_000) + Math.random() * warmJitterMs;
+  // reads each catalogue back out of Redis and calls the provider zero times.
+  // That dedup is free, but only if the first instance has already written the
+  // key, and identical delays put them in the provider together instead. A
+  // small offset is enough to fix it: both walk the same steps at the same
+  // paced interval, so once staggered the later instance stays a step behind
+  // and hits L2 the whole way down. With Redis unavailable there is no dedup at
+  // all, and spreading the starts is the only thing keeping N boots off one key.
+  const warmJitterMs = Number(process.env.BILLS_WARM_JITTER_MS || 5_000);
+  const warmDelayMs = Number(process.env.BILLS_WARM_DELAY_MS || 3_000) + Math.random() * warmJitterMs;
 
   setTimeout(() => {
     warmCatalogues()
       .then(r => {
         if (r?.skipped) return;
         // `calls` is the rate-limit cost, and it is the number that matters:
-        // `loaded` counts steps, and one data-plans step is one call per family.
+        // `loaded` counts steps, and a step is not always exactly one call.
         console.log(`📚 Bills catalogues warmed (${r.loaded} loaded, ${r.failed} failed, ${r.calls} provider calls)`);
       })
       .catch(() => null);
   }, warmDelayMs).unref();
 
-  const warmIntervalMs = Number(process.env.PAIRGATE_WARM_INTERVAL_MS || 25 * 60_000);
+  const warmIntervalMs = Number(process.env.BILLS_WARM_INTERVAL_MS || 25 * 60_000);
   // The lock has to expire *before* the next tick, or the tick that finds it
   // still held skips - and a lock TTL equal to the interval makes that a coin
   // flip. A minute of headroom is far more than a warm pass takes.

@@ -10,7 +10,7 @@ const assert = require('assert');
 
 process.env.PII_HASH_KEY = process.env.PII_HASH_KEY || 'a'.repeat(64);
 process.env.PII_ENC_KEY = process.env.PII_ENC_KEY || 'b'.repeat(64);
-process.env.PAIRGATE_API_KEY = process.env.PAIRGATE_API_KEY || 'pg_test';
+process.env.MYSUBWALLET_API_KEY = process.env.MYSUBWALLET_API_KEY || 'msw_test';
 
 const { normalizeNgPhone, buildPlanTabs } = require('../src/controllers/bills.controller');
 
@@ -42,8 +42,8 @@ assert.strictEqual(normalizeNgPhone(undefined), null);
 
 /* plan tabs - by validity, with the family split as the fallback */
 
-// Real names, as they arrive now that PairGate states the validity as its own
-// integer field instead of burying it in the description.
+// Shaped plans, as the provider module hands them over: the validity already
+// read out of the name into `duration_days`.
 const mtn = [
   { id: '19', name: '500MB (SME)', amount: '500.00', plan_type: 'SME', duration_days: 30 },
   { id: '20', name: '1GB (SME)', amount: '840.00', plan_type: 'SME', duration_days: 30 },

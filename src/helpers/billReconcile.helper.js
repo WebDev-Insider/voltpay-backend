@@ -3,9 +3,13 @@
 // A purchase call returns "accepted", not "delivered". So there are three ways a
 // bill reaches its final state:
 //
-//   1. the provider's webhook  - the only source of a token on one of the rails;
+//   1. the provider's webhook  - where the provider has one switched on;
 //   2. the receipt poll        - when the customer is looking at the screen;
 //   3. the sweep, on a timer   - when nobody is.
+//
+// "Final" includes the token on a prepaid meter. A bill the provider calls
+// delivered but whose token has not reached us is `awaiting_token` - still
+// open, still asked about - never successful (see billSettlement.helper).
 //
 // (1) is provider-specific and lives in each provider's webhook controller.
 // (2) and (3) are this file. All three converge on billSettlement.helper, which
@@ -17,23 +21,36 @@
 // actually failed - never refunds. The customer is just out of pocket.
 //
 // **What this must never touch is anything that is not a bills rail.**
-// `bill_status` is not exclusive to bills - betting writes it too, and betting
-// is Payvessel's alone. A Payvessel reference asked about on a bills rail would
-// at best waste a call and at worst settle a row against a stranger's
-// transaction. That is why the gateway test is a membership check against the
-// **named** bills adapters and never a wildcard, a truthiness test, or a
-// "not payvessel" exclusion: a gateway this file does not own is skipped, and
+// `bill_status` is not exclusive to bills - betting writes it too. A reference
+// asked about on the wrong rail would at best waste a call and at worst settle
+// a row against a stranger's transaction. That is why the gateway test is a
+// membership check against the **named** bills adapters and never a wildcard
+// or a truthiness test: a gateway this file does not own is skipped, and
 // anything added later is skipped by default rather than swept up.
+//
+// Betting is also excluded by `remark`, on top of the gateway test. Today that
+// is belt and braces - betting is Payvessel's, which is not a bills gateway -
+// but betting has already been moved onto a bills provider once, and a row on a
+// shared gateway would otherwise be settled here as well as by its own
+// `settleOrder` (betting.controller), which marks a failure `refunded` rather
+// than `failed`. Two settlements writing two vocabularies onto one row is how a
+// receipt ends up saying both.
 const prisma = require('../../database/prisma');
 const bills = require('../funding/billsProvider');
 const settlement = require('./billSettlement.helper');
 const alerts = require('../services/alerts.service');
 
-// Providers allow ~60 calls a minute across the whole key, shared with every
-// catalogue read and every vend. A receipt screen polling every few seconds must
-// not be able to spend that budget, so each transaction is requeried at most
-// once per window no matter how often the poll asks.
-const RECHECK_MS = Number(process.env.BILLS_RECHECK_MS || process.env.PAIRGATE_RECHECK_MS || 15_000);
+// A provider's rate budget is shared by the whole key - every catalogue read and
+// every vend. A receipt screen polling every few seconds must not be able to
+// spend it, so each transaction is requeried at most once per window no matter
+// how often the poll asks.
+const RECHECK_MS = Number(process.env.BILLS_RECHECK_MS || 15_000);
+
+// Rows on a bills gateway that belong to another rail. See the header.
+const NOT_BILLS_REMARKS = ['betting'];
+
+// The states a provider can still be asked about.
+const OPEN_STATES = ['processing', settlement.AWAITING_TOKEN];
 
 const lastChecked = new Map();
 
@@ -76,7 +93,8 @@ async function reconcile(row, { minAgeMs = 20_000, maxAgeMs = 24 * 60 * 60_000 }
   const gateway = String(meta.gateway || '');
 
   if (!isBillsGateway(gateway)) return { checked: false, reason: 'other_gateway' };
-  if (String(meta.bill_status || '') !== 'processing') return { checked: false, reason: 'not_processing' };
+  if (NOT_BILLS_REMARKS.includes(String(row?.remark || ''))) return { checked: false, reason: 'other_rail' };
+  if (!OPEN_STATES.includes(String(meta.bill_status || ''))) return { checked: false, reason: 'not_processing' };
 
   const upstream = bills.adapterFor(gateway);
 
@@ -112,9 +130,9 @@ async function reconcile(row, { minAgeMs = 20_000, maxAgeMs = 24 * 60 * 60_000 }
   const result = await settlement.applyOutcome({
     trx: row.trx,
     status: remote.status,
-    // One rail returns a prepaid token on requery where the other only ever
-    // sends it on the webhook. Passing them through costs nothing when they are
-    // absent and rescues a receipt when they are not.
+    // A requery can carry the prepaid token. Passing it through costs nothing
+    // when it is absent and rescues a receipt whose webhook was lost when it is
+    // not.
     token: remote.token,
     units: remote.units,
     reason: 'Provider reported failure on requery',
@@ -131,7 +149,7 @@ async function reconcile(row, { minAgeMs = 20_000, maxAgeMs = 24 * 60 * 60_000 }
       .catch(() => null);
   }
 
-  return { checked: true, status: remote.status, applied: result.applied };
+  return { checked: true, status: remote.status, applied: result.applied, reason: result.reason };
 }
 
 /**
@@ -143,42 +161,65 @@ async function reconcile(row, { minAgeMs = 20_000, maxAgeMs = 24 * 60 * 60_000 }
  * server, on a schedule (wired in server.js).
  *
  * `limit` is small on purpose. Twenty requeries every five minutes is four calls
- * a minute against a budget of sixty that live traffic is also spending. It is
- * not multiplied per provider: the rails share the sweep, and only one of them
- * is usually taking traffic at a time.
+ * a minute against a rate budget that live traffic is also spending. It is not
+ * multiplied per provider: the rails share the sweep. `tokenLimit` more go to
+ * bills awaiting a token, which are asked about in a pass of their own.
  */
-async function sweepProcessingBills({ limit = 20, olderThanMs = 3 * 60_000, windowMs = 24 * 60 * 60_000 } = {}) {
+async function sweepProcessingBills({
+  limit = 20,
+  tokenLimit = 5,
+  olderThanMs = 3 * 60_000,
+  windowMs = 24 * 60 * 60_000,
+} = {}) {
   const now = Date.now();
 
-  // One OR arm per bills gateway, generated from the registry so a third
+  // One OR arm per bills gateway, generated from the registry so another
   // provider needs no edit here. Deliberately an allowlist of names: a bare
-  // `bill_status: processing` filter would also pull in betting's Payvessel
-  // rows, which this file has no business asking anyone about.
+  // `bill_status: processing` filter would also pull in rows from rails this
+  // file has no business asking anyone about. Betting is excluded by remark on
+  // top - see the header.
   const gatewayFilter = Object.keys(bills.ADAPTERS).map(name => ({
     meta: { path: ['gateway'], equals: name },
   }));
 
-  const rows = await prisma.walletTransaction.findMany({
-    where: {
-      trx_type: '-',
-      created_at: { lt: new Date(now - olderThanMs), gt: new Date(now - windowMs) },
-      AND: [{ OR: gatewayFilter }, { meta: { path: ['bill_status'], equals: 'processing' } }],
-    },
-    orderBy: { created_at: 'asc' },
-    take: limit,
-  });
+  const rowsIn = (status, order, take) =>
+    prisma.walletTransaction.findMany({
+      where: {
+        trx_type: '-',
+        remark: { notIn: NOT_BILLS_REMARKS },
+        created_at: { lt: new Date(now - olderThanMs), gt: new Date(now - windowMs) },
+        AND: [{ OR: gatewayFilter }, { meta: { path: ['bill_status'], equals: status } }],
+      },
+      orderBy: { created_at: order },
+      take,
+    });
+
+  const rows = await rowsIn('processing', 'asc', limit);
+  // Delivered prepaid bills still waiting for their token. They are not in
+  // flight - the provider has said yes - so they must never hold the slots a
+  // failed bill needs to reach its refund. Newest first: a token that is coming
+  // at all tends to come early, and one that has been asked about all afternoon
+  // was raised to a person when it was parked.
+  const tokenRows = await rowsIn(settlement.AWAITING_TOKEN, 'desc', tokenLimit);
+  const swept = [...rows, ...tokenRows];
 
   let settled = 0;
   // Counted per gateway, because "which upstream is stuck" is the first thing
   // the responder needs and the whole reason the switch exists.
   const stuck = {};
 
-  for (const row of rows) {
+  for (const row of swept) {
     try {
       const outcome = await reconcile(row, { minAgeMs: olderThanMs, maxAgeMs: windowMs });
       if (outcome.applied) {
         settled += 1;
-      } else if (outcome.checked && now - new Date(row.created_at).getTime() > 60 * 60_000) {
+      } else if (
+        outcome.checked &&
+        // Waiting on a token is not a stuck biller, and parking it raised its
+        // own alert already.
+        outcome.reason !== settlement.AWAITING_TOKEN &&
+        now - new Date(row.created_at).getTime() > 60 * 60_000
+      ) {
         // Still processing after an hour is not a slow biller any more.
         const gateway = String(row.meta?.gateway || 'unknown');
         stuck[gateway] = (stuck[gateway] || 0) + 1;
@@ -193,12 +234,12 @@ async function sweepProcessingBills({ limit = 20, olderThanMs = 3 * 60_000, wind
       provider: gateway,
       action: 'stuck_bills',
       message: `${count} ${bills.PROVIDER_LABELS[gateway] || gateway} bill(s) still processing after an hour`,
-      context: { checked: rows.length, settled },
+      context: { checked: swept.length, settled },
     });
   }
 
   const stuckTotal = Object.values(stuck).reduce((a, b) => a + b, 0);
-  return { checked: rows.length, settled, stuck: stuckTotal, stuck_by_gateway: stuck };
+  return { checked: swept.length, settled, stuck: stuckTotal, stuck_by_gateway: stuck };
 }
 
-module.exports = { reconcile, sweepProcessingBills, isBillsGateway, __test: { throttled } };
+module.exports = { reconcile, sweepProcessingBills, isBillsGateway, __test: { throttled, NOT_BILLS_REMARKS } };

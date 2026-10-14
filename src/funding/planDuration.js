@@ -1,20 +1,16 @@
 // How long a data bundle lasts, read once and in one place.
 //
-// Two rails say it two different ways, and neither is going to change for our
-// convenience:
+// Providers say it however they like, and none of them is going to change for
+// our convenience. MySubWallet has no duration field: the validity is a phrase
+// in the middle of the plan name, after the price - "750MB GIFTING = ₦194.00
+// 1 Day Special", "5GB SME = ₦1,480.00 incl. 3GB Night Data 30 Days". Earlier
+// rails stated it as an integer field (PairGate's `duration`) or as a delimited
+// suffix ("500 MB - Monthly (SME)"), and a future one will do something else
+// again.
 //
-//   PairGate    states it as its own integer field, `duration`, in days - and
-//               having done so, took it back *out* of the description. A plan
-//               that used to arrive as "1GB (AWOOF Special) - 30 Days" now
-//               arrives as "1GB (AWOOF Special)" plus `duration: 30`. Anything
-//               still reading the validity out of the name loses it silently.
-//   ClubKonnect has no duration field and no plans to add one. Its validity is
-//               only ever a phrase inside PRODUCT_NAME: "500 MB - Monthly
-//               (SME)", "1GB - 30 days".
-//
-// Both end up as the same two values on a shaped plan - `duration_days` for
-// sorting and bucketing, `validity` for a customer to read - so the picker looks
-// the same whichever upstream the admin switch has data pointed at today.
+// Every shape ends up as the same two values on a shaped plan - `duration_days`
+// for sorting and bucketing, `validity` for a customer to read - so the picker
+// looks the same whichever upstream is answering.
 //
 // **The rule this file exists to keep: never print a duration the provider did
 // not state.** A plan whose validity cannot be read carries no label and no
@@ -25,7 +21,7 @@
 
 /* ------------------------------------------------------------------ parsing */
 
-// The units the two providers actually write. An hour-scale bundle rounds up to
+// The units providers actually write. An hour-scale bundle rounds up to
 // one day so it lands on the "Daily" shelf; its own label still says "2 hours",
 // so rounding the bucket never rounds the promise.
 const UNIT_DAYS = {
@@ -62,9 +58,9 @@ const UNITS = 'day|dy|week|wk|month|mth|year|yr|hour|hr';
 // A number and a unit: "30 Days", "30days", "7-day", "24 hrs", "1 Month".
 //
 // The unit is mandatory, which is what keeps "1GB" and "3 mins" from parsing as
-// a validity. First match wins rather than largest: both providers put the
-// validity at the end as the only duration in the string, and taking the largest
-// would read "1GB for 7 days + 2GB night valid 30 days" as a 30-day bundle.
+// a validity. First match wins rather than largest: providers state the validity
+// once, as the only duration in the string, and taking the largest would read
+// "1GB for 7 days + 2GB night valid 30 days" as a 30-day bundle.
 const NUMERIC_RE = new RegExp(String.raw`(\d+(?:\.\d+)?)\s*-?\s*(${UNITS})s?\b`, 'i');
 
 // The word forms, for a provider that names the tier instead of the count.
@@ -92,18 +88,9 @@ function pluralise(count, word) {
   return `${n} ${word}${n === 1 ? '' : 's'}`;
 }
 
-/**
- * The validity stated inside a plan name, or null when none is.
- *
- * Returns the provider's own wording as `label`, tidied but not converted:
- * ClubKonnect's "Monthly" stays "Monthly" rather than becoming "30 days". The
- * 30 is ours - a bucketing convenience - and printing it back as though the
- * provider had said it is the exact thing the header warns about. `days` is the
- * number, for sorting and for which shelf the plan sits on.
- */
-function readDuration(text) {
-  const s = String(text || '');
-
+// The first stated validity and where it sits in the string. One matcher for
+// both readers below, so "what counts as a duration" is decided in one place.
+function matchDuration(s) {
   const numeric = NUMERIC_RE.exec(s);
   if (numeric) {
     const count = Number(numeric[1]);
@@ -112,6 +99,8 @@ function readDuration(text) {
       return {
         days: Math.max(1, Math.round(count * UNIT_DAYS[unit])),
         label: pluralise(count, UNIT_WORD[unit]),
+        index: numeric.index,
+        length: numeric[0].length,
       };
     }
   }
@@ -119,10 +108,50 @@ function readDuration(text) {
   const word = WORD_RE.exec(s);
   if (word) {
     const key = word[1].toLowerCase();
-    return { days: WORD_DAYS[key], label: key.charAt(0).toUpperCase() + key.slice(1) };
+    return {
+      days: WORD_DAYS[key],
+      label: key.charAt(0).toUpperCase() + key.slice(1),
+      index: word.index,
+      length: word[0].length,
+    };
   }
 
   return null;
+}
+
+/**
+ * The validity stated inside a plan name, or null when none is.
+ *
+ * Returns the provider's own wording as `label`, tidied but not converted: a
+ * provider's "Monthly" stays "Monthly" rather than becoming "30 days". The 30
+ * is ours - a bucketing convenience - and printing it back as though the
+ * provider had said it is the exact thing the header warns about. `days` is the
+ * number, for sorting and for which shelf the plan sits on.
+ */
+function readDuration(text) {
+  const found = matchDuration(String(text || ''));
+  return found ? { days: found.days, label: found.label } : null;
+}
+
+/**
+ * readDuration, plus the text with that duration cut out of it.
+ *
+ * For a provider that writes the validity mid-sentence - "1 Day Special",
+ * "incl. 3GB Night Data 30 Days" - where stripDuration's delimiter guard would
+ * rightly leave it alone. The caller is the one asserting that the first
+ * duration in this text *is* the validity; this only does the cutting. With no
+ * duration found, the text comes back whole and `duration` is null, so nothing
+ * is ever removed on a guess.
+ */
+function splitDuration(text) {
+  const s = String(text || '');
+  const found = matchDuration(s);
+  if (!found) return { duration: null, rest: s.replace(/\s{2,}/g, ' ').trim() };
+
+  const rest = `${s.slice(0, found.index)} ${s.slice(found.index + found.length)}`
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+  return { duration: { days: found.days, label: found.label }, rest };
 }
 
 /** A provider-supplied day count, or 0 when there is not a usable one. */
@@ -190,11 +219,11 @@ const DASH_DURATION_RE = new RegExp(String.raw`\s*[-–—]\s*${DURATION_TOKEN}\
  * "1GB (AWOOF Special) - 30 Days" -> "1GB (AWOOF Special)"
  * "500 MB - Monthly (SME)"        -> "500 MB (SME)"
  *
- * Without this the two rails read differently for the same product - PairGate
- * has already removed the duration from its descriptions, ClubKonnect has not -
- * and the ClubKonnect tile would print "Monthly" twice. Falls back to the
- * original whenever stripping would leave nothing, because a nameless plan in
- * the grid is worse than a repeated word.
+ * The last line of defence against a tile that prints "Monthly" twice: the
+ * provider module should already have taken the validity out of the name it
+ * hands over, and this catches any that still carry it delimited. Falls back to
+ * the original whenever stripping would leave nothing, because a nameless plan
+ * in the grid is worse than a repeated word.
  */
 function stripDuration(name) {
   const original = String(name || '').trim();
@@ -209,6 +238,7 @@ function stripDuration(name) {
 
 module.exports = {
   readDuration,
+  splitDuration,
   durationLabel,
   durationBucket,
   stripDuration,

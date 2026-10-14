@@ -40,7 +40,7 @@ function modelAvailable() {
 }
 
 // A kind is the thing that happened, in dotted form: velocity.limit,
-// login.lockout, payment.pairgate.float. It becomes the action column, so it is
+// login.lockout, payment.mysubwallet.float. It becomes the action column, so it is
 // what an admin filters on, and it must not carry a value that varies per
 // victim - "velocity.limit.08031234567" would make the filter useless and put a
 // phone number in an indexed column.
@@ -134,7 +134,7 @@ function dateRange(from, to) {
 
 /**
  * Page through one feed. `kind` matches a prefix, so `velocity` brings back
- * every velocity.* event and `payment.pairgate` narrows to one provider.
+ * every velocity.* event and `payment.mysubwallet` narrows to one provider.
  */
 async function listEvents({ feed = SECURITY, page = 1, perPage = 50, kind = '', userId = null, severity = '', from = '', to = '' } = {}) {
   const take = Math.min(Math.max(Number(perPage) || 50, 1), 100);

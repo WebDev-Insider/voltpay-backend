@@ -3,7 +3,7 @@
 //
 // Asked in two places on the KYC path, against two very different inputs:
 //
-//   - the bank account name BudPay resolves ("SAMUEL OWOLABI BLESSING"),
+//   - the bank account name the bank lookup resolves ("SAMUEL OWOLABI BLESSING"),
 //     compared against the profile name ("Samuel Owolabi")
 //   - the name the user typed for the BVN check, compared against the same
 //     profile name, *before* a paid provider call is spent on it

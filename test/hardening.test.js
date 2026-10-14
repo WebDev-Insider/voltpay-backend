@@ -117,8 +117,8 @@ assert.strictEqual(isTransient(null), false);
   {
     alertTest.throttle.clear();
 
-    const a = alertTest.throttleKey('payment.budpay.airtime', 'Insufficient funds for 08031234567');
-    const b = alertTest.throttleKey('payment.budpay.airtime', 'Insufficient funds for 09098765432');
+    const a = alertTest.throttleKey('payment.mysubwallet.airtime', 'Insufficient funds for 08031234567');
+    const b = alertTest.throttleKey('payment.mysubwallet.airtime', 'Insufficient funds for 09098765432');
     assert.strictEqual(a, b, 'the same failure for two customers shares one bucket');
     assert.strictEqual(a.includes('0803'), false, 'no phone number in the throttle key');
 

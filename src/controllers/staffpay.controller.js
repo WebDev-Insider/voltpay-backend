@@ -36,6 +36,8 @@ const {
   publicPayrollRun,
 } = require('../helpers/staffpayPii.helper');
 const { logStaffPayEvent } = require('../services/staffpayAudit.service');
+const { handleTransferEvent: handleAirtimeCashTransferEvent } = require('../services/airtimeCash.service');
+const { settlePaystack: settleCacPayment } = require('../services/cac.service');
 const { getAccessState } = require('../helpers/staffpayAccess.helper');
 const { nextDueAtUtc, listDueStaff } = require('../helpers/staffpayDue.helper');
 
@@ -262,6 +264,11 @@ async function creditMissingCharges({ company, lookbackDays = 7, maxVerify = 30 
     if (String(t?.customer?.customer_code || '') !== customerCode) continue;
     // Subscription fees ride the same customer. They are not wallet funding.
     if (String(t?.reference || '').startsWith('SPSUB-')) continue;
+    // Nor are CAC Registration checkouts: Paystack keeps one customer per email,
+    // so the owner's CAC payment sits on this customer too. It already paid for
+    // an application (cac.service settles it); crediting it here would count
+    // the same money twice.
+    if (String(t?.reference || '').startsWith('CACPAY-')) continue;
 
     const already = await withDirectFallback(db => db.staffPayFundingTransaction.findFirst({ where: { provider_tx_id: providerTxId } }));
     if (already) continue;
@@ -1750,11 +1757,20 @@ async function initiateWalletFunding(req, res) {
   }
 }
 
+// Every query value below is the caller's, so it is escaped before it touches
+// HTML. Interpolated raw, this public page reflected script onto the API's own
+// origin for anyone who could get a user to open a crafted link.
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch]);
+}
+
 async function walletFundingCallback(req, res) {
   try {
-    const status = String(req.query?.status || '').toLowerCase();
-    const tx_ref = String(req.query?.tx_ref || '');
-    const transaction_id = String(req.query?.transaction_id || req.query?.reference || req.query?.trxref || '');
+    const status = escapeHtml(String(req.query?.status || '').toLowerCase().slice(0, 32));
+    const tx_ref = escapeHtml(String(req.query?.tx_ref || '').slice(0, 120));
+    const transaction_id = escapeHtml(
+      String(req.query?.transaction_id || req.query?.reference || req.query?.trxref || '').slice(0, 120),
+    );
 
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     return res.status(200).send(`<!doctype html>
@@ -2007,7 +2023,11 @@ async function walletWebhook(req, res) {
 
     if (event.startsWith('transfer.')) {
       try {
-        await handleTransferEvent({ event, data });
+        // Paystack takes one webhook URL per integration, so this one also
+        // carries Airtime to Cash payouts. Each handler claims only its own
+        // reference prefix and answers false for the other's.
+        const handled = await handleTransferEvent({ event, data });
+        if (!handled) await handleAirtimeCashTransferEvent({ event, data });
       } catch (e) {
         console.error('staffpay walletWebhook transfer error:', e?.message || e);
       }
@@ -2015,6 +2035,22 @@ async function walletWebhook(req, res) {
     }
 
     if (event !== 'charge.success') {
+      return res.status(200).json({ received: true });
+    }
+
+    // CAC Registration checkouts share this URL - Paystack takes one per
+    // integration. Routed BEFORE anything below, and that order is load-bearing:
+    // the dedicated-account fallback matches a company by Paystack customer
+    // code, and Paystack reuses one customer per email, so a StaffPay owner's
+    // CAC payment would otherwise be credited to their company wallet.
+    // settlePaystack re-reads the outcome from Paystack and is idempotent.
+    if (String(data?.reference || '').trim().startsWith('CACPAY-')) {
+      try {
+        await settleCacPayment(String(data.reference).trim(), { source: 'webhook' });
+      } catch (e) {
+        // Paystack unreachable for the re-read: the sweep settles it.
+        console.error('staffpay walletWebhook cac settle error:', e?.message || e);
+      }
       return res.status(200).json({ received: true });
     }
 

@@ -5,7 +5,7 @@ const assert = require('assert');
 
 process.env.PII_HASH_KEY = process.env.PII_HASH_KEY || 'a'.repeat(64);
 process.env.PII_ENC_KEY = process.env.PII_ENC_KEY || 'b'.repeat(64);
-process.env.PAIRGATE_API_KEY = process.env.PAIRGATE_API_KEY || 'pg_test';
+process.env.MYSUBWALLET_API_KEY = process.env.MYSUBWALLET_API_KEY || 'msw_test';
 
 const {
   pickBestDataPlan,
@@ -18,24 +18,29 @@ const {
 } = require('../src/controllers/billHero.controller');
 
 // --- network names -------------------------------------------------------
-// The label the app sends, normalised to something pairgate.networkSlug knows.
+// The label the app sends, normalised to something the provider module knows.
 assert.strictEqual(networkFromName('mtn'), 'MTN');
 assert.strictEqual(networkFromName('9 Mobile'), '9MOBILE');
 assert.strictEqual(networkFromName('Etisalat'), '9MOBILE');
 assert.strictEqual(networkFromName('Globacom'), 'GLO');
 assert.strictEqual(networkFromName('Vodafone'), '');
 
-// Whatever this returns has to survive the provider's own slug lookup, or the
-// reward vend fails at dispatch with "Unknown network".
-const { networkSlug } = require('../src/funding/pairgate.service');
+// Whatever this returns has to survive the provider's own network lookup, or
+// the reward vend fails at dispatch with "Unknown network".
+const { __test: msw } = require('../src/funding/mysubwallet.service');
 for (const label of ['mtn', '9 Mobile', 'Etisalat', 'Globacom', 'Airtel']) {
-  assert.ok(networkSlug(networkFromName(label)), `networkSlug rejected ${label}`);
+  assert.ok(msw.networkId(networkFromName(label)), `the provider rejected ${label}`);
 }
 
 // --- phone ---------------------------------------------------------------
 assert.strictEqual(normalizeNgLocal('2348031234567'), '08031234567');
 assert.strictEqual(normalizeNgLocal('+234 803 123 4567'), '08031234567');
 assert.strictEqual(normalizeNgLocal('06031234567'), '');
+
+// The reward path holds the local form; the provider module has to accept it
+// and send the form their live validator takes - 11 digits, not the 234...
+// their docs show.
+assert.strictEqual(msw.providerPhone(normalizeNgLocal('2348031234567')), '08031234567');
 
 // --- plan picking --------------------------------------------------------
 const catalogue = [

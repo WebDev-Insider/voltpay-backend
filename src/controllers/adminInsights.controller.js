@@ -39,7 +39,7 @@ function daysAgo(days) {
 const REQUIRED_ENV = [
   { group: 'Security', keys: ['PII_HASH_KEY', 'PII_ENC_KEY', 'JWT_SECRET'] },
   { group: 'Database', keys: ['DATABASE_URL', 'DIRECT_URL'] },
-  { group: 'Payments', keys: ['PAYSTACK_SECRET_KEY', 'PAIRGATE_API_KEY', 'PAYMENTPOINT_API_KEY'] },
+  { group: 'Payments', keys: ['PAYSTACK_SECRET_KEY', 'MYSUBWALLET_API_KEY', 'PAYMENTPOINT_API_KEY'] },
   { group: 'Messaging', keys: ['BREVO_API_KEY', 'FIREBASE_PROJECT_ID'] },
   { group: 'Cache', keys: ['UPSTASH_REDIS_REST_URL', 'UPSTASH_REDIS_REST_TOKEN'] },
 ];

@@ -21,7 +21,7 @@ for (const short of ['VP1A2B3C4D', 'staffpay_payout_1048576']) {
 }
 
 // Longer than any column can hold: cut, and visibly cut.
-for (const long of ['budpay_trf_9f3c2a77e1b04d5a8c6e2f1908', 'x'.repeat(200)]) {
+for (const long of ['paympt_trf_9f3c2a77e1b04d5a8c6e2f1908', 'x'.repeat(200)]) {
   const cut = fitText(doc, long, inner);
   assert.ok(doc.widthOfString(cut) <= inner, `"${long}" still overflows the Reference column`);
   assert.ok(cut.endsWith('...'), `"${long}" must show it was truncated`);

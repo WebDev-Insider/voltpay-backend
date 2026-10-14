@@ -129,8 +129,8 @@ function captureError(scope, error, context = {}) {
  * the README's "monitor failed payments" line is asking for.
  *
  * @param {object} p
- * @param {string} p.provider  pairgate | paystack | paymentpoint | payvessel
- * @param {string} p.action    airtime | data | electricity | transfer | funding
+ * @param {string} p.provider  mysubwallet | paystack | paymentpoint | payvessel
+ * @param {string} p.action    airtime | data | electricity | transfer | funding | float | config
  * @param {string} p.reference our reference, never the customer identifier
  */
 function paymentFailure({ provider, action, reference, userId, amount, message, context }) {

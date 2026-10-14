@@ -24,6 +24,7 @@ function lagosDateParts(date) {
     month: shifted.getUTCMonth() + 1,
     day: shifted.getUTCDate(),
     hour: shifted.getUTCHours(),
+    minute: shifted.getUTCMinutes(),
     weekday: shifted.getUTCDay(), // 0 = Sunday
   };
 }

@@ -36,7 +36,7 @@ const HEADER_ROW_HEIGHT = 17;
 // Widths add up to 523pt, the printable width of A4 at a 36pt margin. They are
 // sized to the content they actually hold: the description is the only cell
 // that wraps, so it keeps the slack, and Reference is wide enough for a
-// provider reference (`staffpay_payout_...`, a BudPay ref) rather than only for
+// provider reference (`staffpay_payout_...`, a PaymentPoint ref) rather than only for
 // a 10-character in-house trx.
 const COLUMNS = [
   { key: 'date', label: 'Date', width: 58 },

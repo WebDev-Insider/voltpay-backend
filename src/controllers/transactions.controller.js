@@ -323,6 +323,7 @@ const REMARK_LABELS = {
   requested_money_fund_added: 'Requested Money Received',
   microfinance: 'Microfinance',
   virtual_card_add_fund: 'Virtual Card',
+  virtual_card: 'USD Virtual Card',
   top_up: 'Top Up',
   cashback: 'Cash Back',
   air_time: 'Airtime',
