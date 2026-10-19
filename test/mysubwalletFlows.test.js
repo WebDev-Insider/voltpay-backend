@@ -49,6 +49,13 @@ const fakePrisma = {
       Object.assign(row, clone(data));
       return clone(row);
     },
+    // The guarded write reconcile stamps a found order's reference with: by
+    // trx, and only while the row's status is still the one it read.
+    async updateMany({ where, data }) {
+      const hits = db.ledger.filter(r => r.trx === where.trx && (!where.meta || r.meta?.[where.meta.path[0]] === where.meta.equals));
+      hits.forEach(r => Object.assign(r, clone(data)));
+      return { count: hits.length };
+    },
     async findMany(args) {
       sweepQueries.push(args);
       return clone(sweepRows[args?.where?.AND?.[1]?.meta?.equals] || []);

@@ -716,7 +716,12 @@ async function claim(req, res) {
     // the other - is what would leave a webhook unable to tell whose reference
     // this is. `provider` above is the customer's NETWORK; `gateway` is the
     // upstream we buy from.
-    const { name: gateway, provider: upstream } = await bills.resolve(reward_type === 'airtime' ? 'airtime' : 'data');
+    //
+    // resolveForRewards, not resolve: a reward cut off mid-send is asked about by
+    // the reference minted below, so it may only go to an upstream that receives
+    // that reference. A rail switched to one that does not (CashBuddy) sends
+    // rewards through the default instead.
+    const { name: gateway, provider: upstream } = await bills.resolveForRewards(reward_type === 'airtime' ? 'airtime' : 'data');
 
     // The reference is minted before anything is sent and written with the row.
     // A send that is cut off - a crash, a timeout the provider module could not
@@ -1082,8 +1087,9 @@ async function resendReward(claim) {
   }
 
   // Through the switch as it stands now, as a fresh claim would go: a re-send
-  // is a new purchase, and the rail the first one left on may have moved.
-  const { name: gateway, provider: upstream } = await bills.resolve(claim.reward_type === 'airtime' ? 'airtime' : 'data');
+  // is a new purchase, and the rail the first one left on may have moved. Same
+  // rule as the claim about which upstreams a reward may use.
+  const { name: gateway, provider: upstream } = await bills.resolveForRewards(claim.reward_type === 'airtime' ? 'airtime' : 'data');
   const reference = newRewardReference(claim.reward_type);
   const sending = { ...payload, delivery: 'sending', attempts, reference, next_attempt_at: null };
 

@@ -675,6 +675,19 @@ async function readFloat(name) {
     };
   }
 
+  // CashBuddy publishes no balance for the wallet its bills are paid from. Said
+  // plainly rather than shown as "unreachable", which would send the responder
+  // looking for an outage that is not there.
+  if (adapter.FLOAT_READABLE === false) {
+    return {
+      ...base,
+      reachable: false,
+      balance: null,
+      verdict: 'unknown',
+      error: `${label} does not publish this balance over its API. Check it on the ${label} dashboard.`,
+    };
+  }
+
   try {
     const wallet = await adapter.getWalletBalance();
 
@@ -742,7 +755,9 @@ async function getBillsFloats(req, res) {
  *
  * Four independent switches - airtime, data, TV, electricity - because the
  * reason to move is usually per-rail: one provider's data plans are cheaper
- * while the other's electricity is more reliable.
+ * while the other's electricity is more reliable. Each rail lists every
+ * provider with whether it may serve it and why not, and every provider its
+ * credential status by env var name (never a value).
  */
 async function getBillsProviders(req, res) {
   try {
@@ -791,9 +806,16 @@ async function updateBillsProvider(req, res) {
       message: `${bills.SERVICES[result.service]} now vends through ${label}`,
     });
   } catch (e) {
-    // All three are an admin choosing something that cannot work, not a fault:
-    // an unknown rail, an unknown provider, or one whose keys are absent.
-    if (e?.code === 'UNKNOWN_SERVICE' || e?.code === 'UNKNOWN_PROVIDER' || e?.code === 'PROVIDER_NOT_CONFIGURED') {
+    // All four are an admin choosing something that cannot work, not a fault:
+    // an unknown rail, an unknown provider, one this rail may not use (the
+    // electricity ban on ClubKonnect, CashBuddy anywhere but airtime), or one
+    // whose keys are absent.
+    if (
+      e?.code === 'UNKNOWN_SERVICE' ||
+      e?.code === 'UNKNOWN_PROVIDER' ||
+      e?.code === 'PROVIDER_NOT_ALLOWED' ||
+      e?.code === 'PROVIDER_NOT_CONFIGURED'
+    ) {
       return fail(res, 400, e.message);
     }
     console.error('adminOps.updateBillsProvider error', e);

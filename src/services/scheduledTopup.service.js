@@ -86,6 +86,7 @@ const MESSAGES = {
   provider_rejected: 'The network refused this number or amount. Your wallet was refunded.',
   plan_unavailable: 'This data plan is no longer sold.',
   price_changed: 'The price of this data plan went up.',
+  plan_moved: 'Our data plans changed, so this plan needs picking again.',
   amount_below_minimum: 'This amount is below the current minimum.',
   invalid_number: 'The recipient number on this schedule is not valid.',
   kyc_required: 'Your account verification is incomplete.',
@@ -102,6 +103,7 @@ const MESSAGES = {
 const PAUSE_MESSAGES = {
   plan_unavailable: 'Paused: this data plan is no longer sold. Edit the schedule to pick another.',
   price_changed: 'Paused: this plan costs more than you approved. Edit the schedule to accept the new price.',
+  plan_moved: 'Paused: our data plans changed. Edit the schedule to pick your plan again.',
   amount_below_minimum: 'Paused: the amount is below the current minimum. Edit the schedule to change it.',
   invalid_number: 'Paused: the recipient number is not valid. Edit the schedule to fix it.',
   provider_rejected: 'Paused: the network refused this top-up. Check the number and network, then resume.',
@@ -205,6 +207,15 @@ async function priceRun(schedule) {
     pending.amount = amount;
     pending.item_name = 'Airtime';
   } else {
+    // A plan id belongs to the provider that issued it. If the data rail has
+    // moved since this schedule was saved, the same id on the new provider is
+    // at best a missing plan and at worst a different bundle at a price under
+    // the approved one - which the price check below would let through. So the
+    // customer picks again. (Null is a schedule saved before providers were
+    // recorded, when MySubWallet was the only one.)
+    const planGateway = schedule.plan_gateway || bills.DEFAULT_PROVIDER;
+    if (planGateway !== gateway) return { ok: false, code: 'plan_moved', action: 'pause' };
+
     let plans;
     try {
       plans = await upstream.listDataPlansCached(schedule.provider);

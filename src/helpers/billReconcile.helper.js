@@ -35,16 +35,43 @@
 // `settleOrder` (betting.controller), which marks a failure `refunded` rather
 // than `failed`. Two settlements writing two vocabularies onto one row is how a
 // receipt ends up saying both.
+//
+// **One upstream cannot be asked about our own reference at all.** CashBuddy's
+// purchase call carries no reference of ours, and its lookup takes only its
+// own - so a purchase whose answer was lost has no key to look up by. Such a
+// row is written `unconfirmed` and found here by what it was instead (see
+// reconcileUnconfirmed): the account's own bill history, matched on amount,
+// recipient and time, never guessing between two. It is refunded only after
+// repeated complete looks have found nothing for half an hour.
 const prisma = require('../../database/prisma');
 const bills = require('../funding/billsProvider');
 const settlement = require('./billSettlement.helper');
 const alerts = require('../services/alerts.service');
+const { blindIndex } = require('./pii.helper');
+const { normalizeNgPhone } = require('./phone.helper');
 
 // A provider's rate budget is shared by the whole key - every catalogue read and
 // every vend. A receipt screen polling every few seconds must not be able to
 // spend it, so each transaction is requeried at most once per window no matter
 // how often the poll asks.
 const RECHECK_MS = Number(process.env.BILLS_RECHECK_MS || 15_000);
+
+// An unconfirmed purchase is refunded only when BOTH hold: this many complete
+// looks through the provider's history found nothing, and it is at least this
+// old. Airtime lands in seconds, so half an hour of absence is not a slow
+// biller; the count stops one empty read made in the first minute - before the
+// order was written on their side - from deciding anything.
+const UNCONFIRMED_REFUND_AFTER_MS = Number(process.env.BILLS_UNCONFIRMED_REFUND_AFTER_MS || 30 * 60_000);
+const UNCONFIRMED_MIN_MISSES = Number(process.env.BILLS_UNCONFIRMED_MIN_MISSES || 3);
+
+// How an order in their history is placed against our row: their clock may run
+// behind ours, and an order can only appear after we sent it.
+const MATCH_SKEW_MS = 5 * 60_000;
+const MATCH_WINDOW_MS = 30 * 60_000;
+
+// `meta.unconfirmed` while a refund is being made: claimed first, so nothing
+// can adopt an order for a row that is already being refunded.
+const REFUNDING = 'refunding';
 
 // Rows on a bills gateway that belong to another rail. See the header.
 const NOT_BILLS_REMARKS = ['betting'];
@@ -70,6 +97,26 @@ function throttled(key) {
 /** The bills gateways this file owns. Everything else is somebody else's row. */
 function isBillsGateway(gateway) {
   return bills.isKnownProvider(gateway);
+}
+
+/**
+ * A recipient in the one form both sides can be compared in, as a keyed blind
+ * index - so the row never holds the number itself (`meta` is not encrypted),
+ * and their history row and ours meet without either being logged.
+ *
+ * Phones go through the local 11-digit form, so 0803..., 234803... and +234...
+ * all agree; meters and smartcards are compared on their digits.
+ */
+function recipientIndex(service, value) {
+  const raw = String(value ?? '').trim();
+  if (!raw) return null;
+  const normalized =
+    service === 'airtime' || service === 'data' ? normalizeNgPhone(raw)?.local || '' : raw.replace(/\D/g, '');
+  return normalized ? blindIndex(normalized, 'bill_recipient') : null;
+}
+
+function isUnconfirmed(meta) {
+  return meta.unconfirmed === true || meta.unconfirmed === REFUNDING;
 }
 
 /**
@@ -102,7 +149,15 @@ async function reconcile(row, { minAgeMs = 20_000, maxAgeMs = 24 * 60 * 60_000 }
   let reference = String(meta.provider_reference || '').trim();
   let byRequestId = false;
 
-  if (!reference) {
+  // No reference of ours ever reached this upstream, and none of theirs reached
+  // us: the purchase can only be found by what it was.
+  const byHistory =
+    !reference &&
+    !upstream.SUPPORTS_REQUEST_ID_LOOKUP &&
+    typeof upstream.listRecentOrders === 'function' &&
+    isUnconfirmed(meta);
+
+  if (!reference && !byHistory) {
     // No order id means the vend's response never reached us. On an upstream
     // that can be queried by the reference *we* generated, that is recoverable:
     // the order may well exist on their side under our trx. On one that can
@@ -119,12 +174,33 @@ async function reconcile(row, { minAgeMs = 20_000, maxAgeMs = 24 * 60 * 60_000 }
   if (age > maxAgeMs) return { checked: false, reason: 'too_old' };
   if (throttled(row.trx)) return { checked: false, reason: 'throttled' };
 
+  if (byHistory) return reconcileUnconfirmed(row, meta, upstream, gateway, age);
+
   let remote;
   try {
     remote = await upstream.getTransactionStatus(reference, { byRequestId });
   } catch (e) {
     console.error('bills.reconcile error:', { trx: row.trx, gateway, error: e?.message });
     return { checked: false, reason: 'provider_error' };
+  }
+
+  // A vend whose response we lost, found alive under our own reference. Stamp
+  // the upstream's order id so the next requery is a normal one.
+  //
+  // **Before settling, not after.** Settlement re-reads the row and writes its
+  // outcome - status, token - into `meta`. This write replaces `meta` from the
+  // copy read before any of that, so made afterwards it put a settled row back
+  // to `processing` and dropped its token; a refunded one then stayed
+  // "Processing" for good, since its next settlement found the refund already
+  // made and changed nothing. Guarded on the status that copy was read with,
+  // so it can never overwrite a row that has moved on.
+  if (byRequestId && remote.reference_code && remote.status !== 'not_found') {
+    await prisma.walletTransaction
+      .updateMany({
+        where: { trx: row.trx, meta: { path: ['bill_status'], equals: String(meta.bill_status || '') } },
+        data: { meta: { ...meta, provider_reference: String(remote.reference_code) } },
+      })
+      .catch(() => null);
   }
 
   const result = await settlement.applyOutcome({
@@ -138,18 +214,144 @@ async function reconcile(row, { minAgeMs = 20_000, maxAgeMs = 24 * 60 * 60_000 }
     reason: 'Provider reported failure on requery',
   });
 
-  // A vend whose response we lost, found alive under our own reference. Stamp
-  // the upstream's order id so the next requery is a normal one.
-  if (byRequestId && remote.reference_code) {
-    await prisma.walletTransaction
-      .update({
-        where: { trx: row.trx },
-        data: { meta: { ...meta, provider_reference: String(remote.reference_code) } },
-      })
-      .catch(() => null);
+  return { checked: true, status: remote.status, applied: result.applied, reason: result.reason };
+}
+
+/**
+ * Move an unconfirmed row on, guarded on it still being unconfirmed.
+ *
+ * Every transition out of "unconfirmed" goes through here: adopting an order,
+ * counting an empty look, claiming the refund. The guard is what lets the sweep
+ * and a receipt poll race - once one of them has adopted an order or claimed
+ * the refund, the other's write matches nothing.
+ */
+async function moveUnconfirmed(row, meta, patch) {
+  const moved = await prisma.walletTransaction.updateMany({
+    where: {
+      trx: row.trx,
+      AND: [
+        { meta: { path: ['bill_status'], equals: 'processing' } },
+        { meta: { path: ['unconfirmed'], equals: true } },
+      ],
+    },
+    data: { meta: { ...meta, ...patch } },
+  });
+  return moved.count > 0;
+}
+
+/**
+ * Other rows of ours that could own the same order: same provider, same
+ * recipient, same amount, also unconfirmed, near in time. If there is one, an
+ * order in their history could be either row's, and it is not guessed.
+ */
+async function rivalsOf(row, meta, gateway) {
+  const created = new Date(row.created_at).getTime();
+  return prisma.walletTransaction.count({
+    where: {
+      trx: { not: row.trx },
+      trx_type: '-',
+      created_at: { gt: new Date(created - MATCH_WINDOW_MS), lt: new Date(created + MATCH_WINDOW_MS) },
+      AND: [
+        { meta: { path: ['gateway'], equals: gateway } },
+        { meta: { path: ['service'], equals: String(meta.service || '') } },
+        { meta: { path: ['unconfirmed'], equals: true } },
+        { meta: { path: ['recipient_idx'], equals: String(meta.recipient_idx || '') } },
+        { meta: { path: ['vend_amount'], equals: Number(meta.vend_amount) } },
+      ],
+    },
+  });
+}
+
+async function refundUnconfirmed(row) {
+  const result = await settlement.settleFailure({ trx: row.trx, reason: 'Provider has no record of this purchase' });
+  return { checked: true, status: 'failed', applied: result.applied, reason: result.reason || 'refunded_unconfirmed' };
+}
+
+/**
+ * Find a purchase whose answer was lost, on an upstream that cannot be asked
+ * about our own reference - or give the money back once it plainly never
+ * happened.
+ *
+ *   one match, nobody else's   adopt its reference, then settle on its status
+ *   two or more, or a rival    leave it: the hour-old alert hands it to a person
+ *   none, on a complete read   count it; refund after enough looks and time
+ *   none, on a partial read    proves nothing - not counted
+ */
+async function reconcileUnconfirmed(row, meta, upstream, gateway, age) {
+  // A refund already claimed is finished, whatever a listing would say now.
+  if (meta.unconfirmed === REFUNDING) return refundUnconfirmed(row);
+
+  const want = String(meta.recipient_idx || '');
+  const amount = Number(meta.vend_amount);
+  // Written by executePurchase on the first ledger write. Without them a match
+  // is a guess, so the row waits for a person instead.
+  if (!want || !Number.isFinite(amount)) return { checked: true, reason: 'unmatchable' };
+
+  const created = new Date(row.created_at).getTime();
+
+  let listing;
+  try {
+    listing = await upstream.listRecentOrders({ since: new Date(created - MATCH_SKEW_MS) });
+  } catch (e) {
+    // A failed read is not evidence of anything.
+    console.error('bills.reconcile history lookup error:', { trx: row.trx, gateway, error: e?.message });
+    return { checked: false, reason: 'provider_error' };
   }
 
-  return { checked: true, status: remote.status, applied: result.applied, reason: result.reason };
+  const matches = (listing?.orders || []).filter(
+    order =>
+      order.service === meta.service &&
+      Math.abs(Number(order.amount) - amount) < 0.005 &&
+      Number.isFinite(order.created_ms) &&
+      order.created_ms >= created - MATCH_SKEW_MS &&
+      order.created_ms <= created + MATCH_WINDOW_MS &&
+      order.reference &&
+      recipientIndex(meta.service, order.recipient) === want
+  );
+
+  // An order another of our rows already holds is that row's.
+  const free = [];
+  for (const order of matches) {
+    const owner = await settlement.findByProviderReference(order.reference, gateway);
+    if (!owner || owner.trx === row.trx) free.push(order);
+  }
+
+  if (free.length > 1) return { checked: true, reason: 'ambiguous_match' };
+
+  if (free.length === 1) {
+    if ((await rivalsOf(row, meta, gateway)) > 0) return { checked: true, reason: 'ambiguous_match' };
+
+    const [order] = free;
+    const adopted = await moveUnconfirmed(row, meta, {
+      unconfirmed: false,
+      provider_reference: order.reference,
+      found_by: 'history_match',
+    });
+    if (!adopted) return { checked: true, reason: 'raced' };
+
+    const result = await settlement.applyOutcome({
+      trx: row.trx,
+      status: order.status,
+      token: order.token,
+      reason: 'Provider reported failure on lookup',
+    });
+    return { checked: true, status: order.status, applied: result.applied, reason: result.reason, adopted: true };
+  }
+
+  // Nothing there. Only a read that covered the whole window counts as a look.
+  if (!listing?.complete) return { checked: true, reason: 'incomplete_listing' };
+
+  const misses = (Number(meta.lookup_misses) || 0) + 1;
+  if (misses >= UNCONFIRMED_MIN_MISSES && age >= UNCONFIRMED_REFUND_AFTER_MS) {
+    // Claimed before it is paid, so a late match cannot also adopt an order for
+    // a row that is being refunded.
+    const claimed = await moveUnconfirmed(row, meta, { unconfirmed: REFUNDING, lookup_misses: misses });
+    if (!claimed) return { checked: true, reason: 'raced' };
+    return refundUnconfirmed(row);
+  }
+
+  await moveUnconfirmed(row, meta, { lookup_misses: misses });
+  return { checked: true, reason: 'not_found_yet' };
 }
 
 /**
@@ -242,4 +444,10 @@ async function sweepProcessingBills({
   return { checked: swept.length, settled, stuck: stuckTotal, stuck_by_gateway: stuck };
 }
 
-module.exports = { reconcile, sweepProcessingBills, isBillsGateway, __test: { throttled, NOT_BILLS_REMARKS } };
+module.exports = {
+  reconcile,
+  sweepProcessingBills,
+  isBillsGateway,
+  recipientIndex,
+  __test: { throttled, NOT_BILLS_REMARKS, REFUNDING, lastChecked },
+};

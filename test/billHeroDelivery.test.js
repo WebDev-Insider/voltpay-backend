@@ -176,6 +176,7 @@ stub('../database/prisma', fakePrisma);
 stub('../src/funding/billsProvider', {
   ADAPTERS: { mysubwallet: adapter },
   resolve: async () => ({ name: 'mysubwallet', provider: adapter }),
+  resolveForRewards: async () => ({ name: 'mysubwallet', provider: adapter }),
   adapterFor: () => adapter,
 });
 stub('../src/services/notify.service', {
@@ -332,7 +333,9 @@ const refused = () => Object.assign(new Error('That phone number was not accepte
   assert.strictEqual(out.status, 400);
   assert.strictEqual(only().status, 'failed');
   assert.strictEqual(payload().delivery, 'refused');
-  assert.strictEqual(JSON.stringify(payload()).includes('0803'), false, 'no phone number in the stored failure');
+  // The number itself, in any of its forms - not just "0803", which the minted
+  // reference's timestamp and random digits can contain by chance.
+  assert.strictEqual(JSON.stringify(payload()).includes('8031234567'), false, 'no phone number in the stored failure');
 
   // Two taps: the second never sends.
   reset();

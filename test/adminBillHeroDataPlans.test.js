@@ -64,10 +64,12 @@ const adapters = {
 
 // The rail switch, stubbed at `resolve` rather than at the settings row: this
 // suite is about the screen, and `billsProvider` has its own coverage. Patching
-// the export is enough because the controller calls `bills.resolve(...)`.
+// the export is enough because the controller calls `bills.resolveForRewards(...)`
+// - the switch the reward claim path reads.
 let activeGateway = 'mysubwallet';
 
 bills.resolve = async () => ({ name: activeGateway, provider: adapters[activeGateway] });
+bills.resolveForRewards = bills.resolve;
 
 const store = new Map();
 

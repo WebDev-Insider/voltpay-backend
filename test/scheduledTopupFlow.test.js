@@ -304,6 +304,7 @@ stub('../src/funding/billsProvider', {
   getProviderName: async () => 'mysubwallet',
   adapterFor: () => upstream,
   isKnownProvider: name => name === 'mysubwallet',
+  isAllowed: (service, name) => name === 'mysubwallet',
   PROVIDER_LABELS: { mysubwallet: 'MySubWallet' },
   DEFAULT_PROVIDER: 'mysubwallet',
   ADAPTERS: { mysubwallet: upstream },

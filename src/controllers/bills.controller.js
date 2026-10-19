@@ -13,11 +13,11 @@
 // price would let anyone buy a 20,000 naira bundle for 100.
 //
 // **The four rails are served through the provider registry** - see
-// funding/billsProvider.js. MySubWallet is the only upstream registered today,
-// but nothing below knows which one answered: every provider module exports the
-// same surface, and this file goes through `bills.resolve(service)` rather than
-// importing one directly. Three rules keep that honest, and they matter the day
-// a second provider is registered again:
+// funding/billsProvider.js. Three upstreams are registered (MySubWallet,
+// ClubKonnect, CashBuddy), each allowed on only some rails, and nothing below
+// knows which one answered: every provider module exports the same surface,
+// and this file goes through `bills.resolve(service)` rather than importing one
+// directly. Three rules keep that honest:
 //
 //   1. **Resolve once per request, then carry it.** A quote and its confirm can
 //      straddle an admin switch, so re-resolving mid-flow would price against
@@ -48,7 +48,7 @@ const { logMoneyEvent } = require('../services/userAudit.service');
 const { checkVelocity } = require('../helpers/velocity.helper');
 const alerts = require('../services/alerts.service');
 const settlement = require('../helpers/billSettlement.helper');
-const { reconcile } = require('../helpers/billReconcile.helper');
+const { reconcile, recipientIndex } = require('../helpers/billReconcile.helper');
 const { durationBucket, stripDuration, BUCKET_ORDER, BUCKET_LABELS } = require('../funding/planDuration');
 
 // VoltPay's own floors. They sit above the provider's where we want them to and
@@ -139,9 +139,10 @@ function providerFail(res, e, fallbackMessage, gateway = bills.DEFAULT_PROVIDER)
     return fail(res, 503, 'provider_unavailable', 'This service is briefly unavailable. Please try again shortly.');
   }
   // The adapter names its payload after itself so a log line says which
-  // provider spoke. It is trimmed to status and message in the adapter: the
-  // raw body can carry our float balance, which no customer needs to see.
-  const payload = e?.mysubwallet ?? null;
+  // provider spoke - `e.mysubwallet`, `e.clubkonnect`, `e.cashbuddy`. It is
+  // trimmed to status and message in the adapter: the raw body can carry our
+  // float balance, which no customer needs to see.
+  const payload = e?.[gateway] ?? e?.mysubwallet ?? null;
   return fail(res, e?.statusCode || 502, 'provider_error', e?.message || fallbackMessage, payload);
 }
 
@@ -674,6 +675,9 @@ async function dispatch(upstream, pending, reference) {
       number: pending.smartcard,
       code: pending.code,
       customerName: pending.customer_name,
+      // ClubKonnect's purchase names the subscriber's phone; MySubWallet's has
+      // no field for it and ignores it.
+      phone: pending.phone_local,
       reference,
     });
   }
@@ -701,6 +705,30 @@ function detailsFor(pending) {
   }
   if (pending.service === 'tv') return `${pending.provider} - ${pending.item_name} - ${pending.smartcard}`;
   return `${pending.provider} ${pending.meter_type} - ${pending.meter_number}`;
+}
+
+// Who or what the purchase is for: the number a history match is made on.
+function recipientFor(pending) {
+  if (pending.service === 'tv') return pending.smartcard;
+  if (pending.service === 'electricity') return pending.meter_number;
+  return pending.phone_local;
+}
+
+/**
+ * The fields that let a purchase be found without a reference.
+ *
+ * Only for an upstream that cannot be asked about our own reference
+ * (CashBuddy): until it hands one back the row is `unconfirmed`, and
+ * billReconcile finds it in the provider's history by recipient and amount.
+ * The recipient is a blind index - `meta` is not encrypted.
+ */
+function matchFields(upstream, pending, amount, { unconfirmed }) {
+  if (upstream.SUPPORTS_REQUEST_ID_LOOKUP) return {};
+  return {
+    unconfirmed,
+    recipient_idx: recipientIndex(pending.service, recipientFor(pending)),
+    vend_amount: amount,
+  };
 }
 
 /**
@@ -745,6 +773,14 @@ async function executePurchase({
   auditExtra = null,
   withinReserve = null,
 }) {
+  // The last lock on the allow-list, before any money moves. Every caller
+  // resolved `gateway` through billsProvider, so this cannot fire on a path
+  // that works - it is here so that a path that does not (electricity on
+  // ClubKonnect, say) fails loudly with nothing reserved.
+  if (!bills.isAllowed(pending.service, gateway)) {
+    throw Object.assign(new Error(`${gateway} may not serve ${pending.service}`), { code: 'PROVIDER_NOT_ALLOWED' });
+  }
+
   const amount = Number(pending.amount);
   const total = Number(pending.total ?? amount);
   const trx = generateTrx(service.trxPrefix);
@@ -808,6 +844,10 @@ async function executePurchase({
             // how it knows the bill is prepaid - even on a row whose request
             // died before the post-vend update below.
             meter_type: pending.service === 'electricity' ? pending.meter_type : undefined,
+            // Unconfirmed from the start on an upstream with no lookup by our
+            // reference, for the same reason: a request that dies mid-vend
+            // must still leave a row the sweep can find the order for.
+            ...matchFields(upstream, pending, amount, { unconfirmed: true }),
             ...extra,
           },
         },
@@ -916,6 +956,9 @@ async function executePurchase({
         price_drift: priceDrift ?? undefined,
         token,
         units,
+        // Still unconfirmed when their answer was lost or carried no
+        // reference - billReconcile then finds the order in their history.
+        ...matchFields(upstream, pending, amount, { unconfirmed: processing && (vend.unconfirmed === true || !providerRef) }),
         ...extra,
       },
     },
@@ -931,6 +974,7 @@ async function executePurchase({
     amount: total,
     extra: {
       provider: pending.provider || null,
+      gateway,
       provider_reference: providerRef || null,
       status: processing ? 'processing' : 'successful',
       ...(auditExtra && typeof auditExtra === 'object' ? auditExtra : {}),
@@ -1043,7 +1087,9 @@ async function confirm(req, res) {
       res,
       `${service.key}_success`,
       result.processing
-        ? 'Payment is processing. Your token will appear shortly.'
+        ? service.key === 'electricity'
+          ? 'Payment is processing. Your token will appear shortly.'
+          : 'Payment is processing. We will confirm it shortly.'
         : `${service.title} purchase successful`,
       {
         service: service.key,
