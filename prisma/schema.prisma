@@ -1639,3 +1639,48 @@ model AdminUser {
   @@index([role, status])
   @@map("admin_users")
 }
+
+// Admin fingerprint sign-in (WebAuthn passkeys): the public half of each key.
+// The private half never leaves the admin's device. Deliberately no Prisma
+// relation on AdminUser, so admin_users queries never depend on this table
+// existing - the FK (ON DELETE CASCADE) lives in the DDL.
+// See scripts/apply-admin-webauthn-ddl.js and helpers/webauthn.helper.js.
+model AdminWebauthnCredential {
+  id            Int       @id @default(autoincrement())
+  admin_id      Int
+  // base64url of the id the device presents at sign-in.
+  credential_id String    @unique
+  // SPKI DER, base64url - a public key, not a secret.
+  public_key    String
+  // COSE algorithm: -7 ES256, -8 EdDSA, -257 RS256.
+  algorithm     Int
+  sign_count    BigInt    @default(0)
+  // The opaque account id the passkey was made for (WebAuthn user.id).
+  user_handle   String
+  // A synced passkey (iCloud Keychain, Google Password Manager).
+  backed_up     Boolean   @default(false)
+  // The admin's own name for the device, encrypted like any free text.
+  label_enc     String?
+  last_used_at  DateTime?
+  created_at    DateTime  @default(now())
+
+  @@index([admin_id])
+  @@map("admin_webauthn_credentials")
+}
+
+// One row per fingerprint prompt: spent on first use, dead after two minutes.
+model AdminWebauthnChallenge {
+  id         String    @id
+  // 'login' | 'register'
+  purpose    String
+  admin_id    Int?
+  challenge   String
+  // Setup only: the account id it offered the device.
+  user_handle String?
+  expires_at  DateTime
+  used_at     DateTime?
+  created_at  DateTime  @default(now())
+
+  @@index([expires_at])
+  @@map("admin_webauthn_challenges")
+}

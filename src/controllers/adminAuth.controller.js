@@ -10,7 +10,7 @@
 // hashSecret/verifySecret, email encrypted + blind-indexed, per-account lockout
 // after three failures, and never a bare row in a response.
 
-const { randomUUID } = require('crypto');
+const { randomBytes, randomUUID } = require('crypto');
 const prisma = require('../../database/prisma');
 const { hashSecret, verifySecret, blindIndex, encryptValue, decryptValue } = require('../helpers/pii.helper');
 const {
@@ -30,6 +30,7 @@ const {
   consumeRecoveryCode,
 } = require('../helpers/adminAccount.helper');
 const totp = require('../helpers/totp.helper');
+const webauthn = require('../helpers/webauthn.helper');
 const { getLockRemainingSeconds, registerFailure, clearFailures } = require('../helpers/loginLockout.helper');
 const { logAdminAction, clientIp } = require('../services/audit.service');
 
@@ -70,14 +71,14 @@ function audit(req, admin, action, statusCode, metadata = null) {
   }).catch(() => null);
 }
 
-async function issueSession(req, res, admin, remark = 'login_success') {
+async function issueSession(req, res, admin, remark = 'login_success', method = 'password') {
   const sid = randomUUID();
   const updated = await prisma.adminUser.update({
     where: { id: admin.id },
     data: { active_session_id: sid, last_login_at: new Date(), last_login_ip: clientIp(req) },
   });
 
-  audit(req, admin, 'admin.login', 200, { role: admin.role, totp: !!admin.totp_enabled });
+  audit(req, admin, 'admin.login', 200, { role: admin.role, totp: !!admin.totp_enabled, method });
 
   return ok(res, remark, 'Login successful', {
     access_token: signAdminToken(admin, sid),
@@ -254,12 +255,14 @@ async function changePassword(req, res) {
         active_session_id: sid,
       },
     });
+    const passkeysRevoked = await revokePasskeys(req.admin.id);
 
-    audit(req, req.admin, 'admin.password.changed', 200, null);
+    audit(req, req.admin, 'admin.password.changed', 200, passkeysRevoked ? { passkeys_revoked: passkeysRevoked } : null);
     return ok(res, 'password_changed', 'Password updated', {
       access_token: signAdminToken(updated, sid),
       token_type: 'Bearer',
       admin: publicAdmin(updated),
+      passkeys_revoked: passkeysRevoked,
     });
   } catch (e) {
     console.error('adminAuth.changePassword error:', e?.message || e);
@@ -330,6 +333,340 @@ async function disableTwoFactor(req, res) {
   } catch (e) {
     console.error('adminAuth.disableTwoFactor error:', e?.message || e);
     return fail(res, 500, 'error', 'Could not disable two-factor');
+  }
+}
+
+// ------------------------------------------------------------ passkeys
+//
+// Fingerprint sign-in (WebAuthn - see helpers/webauthn.helper.js). A passkey
+// signs in on its own, without the password or the 6-digit code: it is
+// already two factors - the device that holds the key, and the fingerprint
+// that unlocks it - and it cannot be phished, because the device will only
+// use it on the dashboard's own domain. Password + code stays as the way in
+// from anywhere else.
+
+// The browser prompt gives up after 60s; a little slack on top of that.
+const PASSKEY_CHALLENGE_TTL_MS = 2 * 60 * 1000;
+const MAX_PASSKEYS = 10;
+
+const PASSKEY_UNAVAILABLE = 'Fingerprint sign-in is not available on this server yet';
+
+// The tables come from a DDL script the owner runs; until then Prisma answers
+// P2021/P2022, and the passkey routes say "not available" rather than 500.
+const schemaBehind = e => e?.code === 'P2021' || e?.code === 'P2022';
+
+function passkeyReady(res) {
+  const bad = configured(res);
+  if (bad) return { bad };
+  const rp = webauthn.relyingParty();
+  if (!rp || !prisma.adminWebauthnCredential) return { bad: fail(res, 503, 'passkey_unavailable', PASSKEY_UNAVAILABLE) };
+  return { rp };
+}
+
+function publicPasskey(row) {
+  let label = '';
+  try {
+    label = row.label_enc ? decryptValue(row.label_enc) : '';
+  } catch (e) {
+    label = '';
+  }
+  return {
+    id: row.id,
+    label: label || 'Fingerprint device',
+    synced: !!row.backed_up,
+    created_at: row.created_at,
+    last_used_at: row.last_used_at,
+  };
+}
+
+async function newChallenge(purpose, { adminId = null, userHandle = null } = {}) {
+  // Old rows are only ever read by id; clear them out as new ones are made.
+  await prisma.adminWebauthnChallenge
+    .deleteMany({ where: { expires_at: { lt: new Date(Date.now() - 60 * 60 * 1000) } } })
+    .catch(() => null);
+
+  return prisma.adminWebauthnChallenge.create({
+    data: {
+      id: randomUUID(),
+      purpose,
+      admin_id: adminId,
+      user_handle: userHandle,
+      challenge: webauthn.generateChallenge(),
+      expires_at: new Date(Date.now() + PASSKEY_CHALLENGE_TTL_MS),
+    },
+  });
+}
+
+/**
+ * Spends a challenge and returns its row, or null. Single use is what stops
+ * one signed answer being replayed, so the claim is a guarded update - two
+ * requests carrying the same answer cannot both spend it.
+ */
+async function spendChallenge(id, purpose, adminId = null) {
+  if (!id) return null;
+  const row = await prisma.adminWebauthnChallenge.findUnique({ where: { id: String(id) } });
+  if (!row || row.purpose !== purpose || row.used_at || row.expires_at < new Date()) return null;
+  if (adminId !== null && row.admin_id !== adminId) return null;
+
+  const claimed = await prisma.adminWebauthnChallenge.updateMany({
+    where: { id: row.id, used_at: null },
+    data: { used_at: new Date() },
+  });
+  return claimed.count === 1 ? row : null;
+}
+
+/**
+ * Wherever the password changes or is reset. Setting up a passkey costs the
+ * password, so a passkey stands on it - and a password changed because it
+ * leaked must not leave behind a passkey somebody added with it. The same
+ * rule the customer biometric credential follows. Fails quietly: a revoke
+ * must never sink the password change that triggered it.
+ */
+async function revokePasskeys(adminId) {
+  try {
+    const gone = await prisma.adminWebauthnCredential.deleteMany({ where: { admin_id: adminId } });
+    return gone.count;
+  } catch (e) {
+    if (!schemaBehind(e)) console.warn('adminAuth: could not revoke passkeys', { admin_id: adminId, reason: e?.message });
+    return 0;
+  }
+}
+
+async function passkeyLoginOptions(req, res) {
+  try {
+    const { bad, rp } = passkeyReady(res);
+    if (bad) return bad;
+
+    const challenge = await newChallenge('login');
+
+    // No allowCredentials: the device offers whichever of its passkeys belong
+    // to this dashboard, so no email is typed and none is revealed. No rpId
+    // unless one is pinned: the browser then uses the page's own hostname
+    // (see webauthn.relyingParty).
+    return ok(res, 'passkey_options', 'Use your fingerprint', {
+      challenge_id: challenge.id,
+      options: {
+        challenge: challenge.challenge,
+        ...(rp.rpId ? { rpId: rp.rpId } : {}),
+        timeout: 60000,
+        userVerification: 'required',
+      },
+    });
+  } catch (e) {
+    if (schemaBehind(e)) return fail(res, 503, 'passkey_unavailable', PASSKEY_UNAVAILABLE);
+    console.error('adminAuth.passkeyLoginOptions error:', e?.message || e);
+    return fail(res, 500, 'error', 'Could not start fingerprint sign-in');
+  }
+}
+
+async function passkeyLogin(req, res) {
+  try {
+    const { bad, rp } = passkeyReady(res);
+    if (bad) return bad;
+
+    const challenge = await spendChallenge(req.body?.challenge_id, 'login');
+    if (!challenge) return fail(res, 401, 'invalid_challenge', 'This sign-in attempt expired. Please try again.');
+
+    // One answer for every way this can fail, like the password route: which
+    // part was wrong is the attacker's question, not the admin's.
+    const rejected = () =>
+      fail(res, 401, 'passkey_rejected', 'Fingerprint sign-in did not work. Sign in with your password instead.');
+
+    const credential = req.body?.credential;
+    const credentialId = String(credential?.id || '');
+    const stored = credentialId
+      ? await prisma.adminWebauthnCredential.findUnique({ where: { credential_id: credentialId } })
+      : null;
+    if (!stored) return rejected();
+
+    const admin = await prisma.adminUser.findUnique({ where: { id: stored.admin_id } });
+    if (!admin || admin.status !== 1) {
+      if (admin) audit(req, admin, 'admin.login.failed', 401, { method: 'passkey', reason: 'disabled' });
+      return rejected();
+    }
+
+    // A fingerprint must not walk around a lockout earned by wrong passwords:
+    // same freeze, same key. A bad signature does not add to it - it cannot be
+    // guessed, and passkey ids are not secret, so counting it would only hand
+    // a stranger a way to lock an admin out.
+    const locked = await getLockRemainingSeconds(lockoutKey(admin.email_idx));
+    if (locked > 0) {
+      return fail(res, 429, 'account_locked', `Too many failed attempts. Try again in ${Math.ceil(locked / 60)} minute(s).`);
+    }
+
+    let result;
+    try {
+      result = webauthn.verifyAuthentication({
+        credential,
+        expectedChallenge: challenge.challenge,
+        rpId: rp.rpId,
+        origins: rp.origins,
+        stored: {
+          publicKey: stored.public_key,
+          algorithm: stored.algorithm,
+          signCount: Number(stored.sign_count),
+          userHandle: stored.user_handle,
+        },
+      });
+    } catch (e) {
+      if (!(e instanceof webauthn.WebAuthnError)) throw e;
+      audit(req, admin, 'admin.login.failed', 401, { method: 'passkey', reason: e.code });
+      return rejected();
+    }
+
+    await prisma.adminWebauthnCredential.update({
+      where: { id: stored.id },
+      data: { sign_count: BigInt(result.signCount), backed_up: result.backedUp, last_used_at: new Date() },
+    });
+
+    return issueSession(req, res, admin, 'login_success', 'passkey');
+  } catch (e) {
+    if (schemaBehind(e)) return fail(res, 503, 'passkey_unavailable', PASSKEY_UNAVAILABLE);
+    console.error('adminAuth.passkeyLogin error:', e?.message || e);
+    return fail(res, 500, 'error', 'Fingerprint sign-in failed');
+  }
+}
+
+async function listPasskeys(req, res) {
+  try {
+    if (req.admin?.source !== 'session') return fail(res, 400, 'not_supported', 'Static admin keys cannot use passkeys');
+
+    const available = Boolean(webauthn.relyingParty() && prisma.adminWebauthnCredential);
+    const rows = available
+      ? await prisma.adminWebauthnCredential.findMany({ where: { admin_id: req.admin.id }, orderBy: { created_at: 'desc' } })
+      : [];
+
+    return ok(res, 'passkeys', 'Fingerprint devices', { available, passkeys: rows.map(publicPasskey) });
+  } catch (e) {
+    if (schemaBehind(e)) return ok(res, 'passkeys', 'Fingerprint devices', { available: false, passkeys: [] });
+    console.error('adminAuth.listPasskeys error:', e?.message || e);
+    return fail(res, 500, 'error', 'Could not load fingerprint devices');
+  }
+}
+
+async function passkeyRegisterOptions(req, res) {
+  try {
+    if (req.admin?.source !== 'session') return fail(res, 400, 'not_supported', 'Static admin keys cannot use passkeys');
+    const { bad, rp } = passkeyReady(res);
+    if (bad) return bad;
+
+    // Adding a new way in is the first thing a stolen, unlocked session would
+    // do - so, like turning two-factor off, it costs the password.
+    const verified = await verifySecret(String(req.body?.password || ''), req.admin.row.password, PASSWORD_DOMAIN);
+    if (!verified.ok) return fail(res, 401, 'unauthorized', 'Password is incorrect');
+
+    const existing = await prisma.adminWebauthnCredential.findMany({
+      where: { admin_id: req.admin.id },
+      select: { credential_id: true, user_handle: true },
+    });
+    if (existing.length >= MAX_PASSKEYS) {
+      return fail(res, 400, 'limit_reached', `You can have up to ${MAX_PASSKEYS} fingerprint devices. Remove one first.`);
+    }
+
+    // One opaque id per admin across all their devices, so setting up the
+    // same phone again replaces its passkey instead of adding a second. Kept
+    // on the challenge, so the passkey is saved under exactly what the device
+    // was told - never under something the browser sends back.
+    const userHandle = existing[0]?.user_handle || randomBytes(32).toString('base64url');
+    const challenge = await newChallenge('register', { adminId: req.admin.id, userHandle });
+
+    return ok(res, 'passkey_register_options', 'Touch the fingerprint sensor', {
+      challenge_id: challenge.id,
+      options: {
+        challenge: challenge.challenge,
+        rp: rp.rpId ? { id: rp.rpId, name: 'VoltPay Admin' } : { name: 'VoltPay Admin' },
+        // The handle, not the email: this is stored in the phone's password
+        // manager and synced to Apple or Google, which have no need of it.
+        user: { id: userHandle, name: req.admin.row.name, displayName: req.admin.row.name },
+        pubKeyCredParams: webauthn.ALGORITHMS.map(alg => ({ type: 'public-key', alg })),
+        authenticatorSelection: {
+          authenticatorAttachment: 'platform',
+          residentKey: 'required',
+          requireResidentKey: true,
+          userVerification: 'required',
+        },
+        attestation: 'none',
+        timeout: 60000,
+        excludeCredentials: existing.map(c => ({ type: 'public-key', id: c.credential_id })),
+      },
+    });
+  } catch (e) {
+    if (schemaBehind(e)) return fail(res, 503, 'passkey_unavailable', PASSKEY_UNAVAILABLE);
+    console.error('adminAuth.passkeyRegisterOptions error:', e?.message || e);
+    return fail(res, 500, 'error', 'Could not start fingerprint setup');
+  }
+}
+
+async function passkeyRegister(req, res) {
+  try {
+    if (req.admin?.source !== 'session') return fail(res, 400, 'not_supported', 'Static admin keys cannot use passkeys');
+    const { bad, rp } = passkeyReady(res);
+    if (bad) return bad;
+
+    const challenge = await spendChallenge(req.body?.challenge_id, 'register', req.admin.id);
+    if (!challenge?.user_handle) return fail(res, 400, 'invalid_challenge', 'This setup expired. Please start again.');
+
+    let result;
+    try {
+      result = webauthn.verifyRegistration({
+        credential: req.body?.credential,
+        expectedChallenge: challenge.challenge,
+        rpId: rp.rpId,
+        origins: rp.origins,
+      });
+    } catch (e) {
+      if (!(e instanceof webauthn.WebAuthnError)) throw e;
+      audit(req, req.admin, 'admin.passkey.rejected', 400, { reason: e.code });
+      return fail(res, 400, 'passkey_rejected', 'This device could not be set up for fingerprint sign-in.');
+    }
+
+    const label = String(req.body?.label || '').trim().slice(0, 60);
+
+    let created;
+    try {
+      created = await prisma.adminWebauthnCredential.create({
+        data: {
+          admin_id: req.admin.id,
+          credential_id: result.credentialId,
+          public_key: result.publicKey,
+          algorithm: result.algorithm,
+          sign_count: BigInt(result.signCount),
+          user_handle: challenge.user_handle,
+          backed_up: result.backedUp,
+          label_enc: label ? encryptValue(label) : null,
+        },
+      });
+    } catch (e) {
+      if (e?.code === 'P2002') return fail(res, 409, 'duplicate', 'This device is already set up for fingerprint sign-in.');
+      throw e;
+    }
+
+    audit(req, req.admin, 'admin.passkey.added', 200, { passkey_id: created.id, synced: result.backedUp });
+    return ok(res, 'passkey_added', 'Fingerprint sign-in is on for this device', { passkey: publicPasskey(created) });
+  } catch (e) {
+    if (schemaBehind(e)) return fail(res, 503, 'passkey_unavailable', PASSKEY_UNAVAILABLE);
+    console.error('adminAuth.passkeyRegister error:', e?.message || e);
+    return fail(res, 500, 'error', 'Could not save fingerprint sign-in');
+  }
+}
+
+async function removePasskey(req, res) {
+  try {
+    if (req.admin?.source !== 'session') return fail(res, 400, 'not_supported', 'Static admin keys cannot use passkeys');
+
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) return fail(res, 400, 'validation_error', 'Invalid passkey id');
+
+    // Scoped to the caller: one admin can never remove another's device here.
+    const gone = await prisma.adminWebauthnCredential.deleteMany({ where: { id, admin_id: req.admin.id } });
+    if (!gone.count) return fail(res, 404, 'not_found', 'Fingerprint device not found');
+
+    audit(req, req.admin, 'admin.passkey.removed', 200, { passkey_id: id });
+    return ok(res, 'passkey_removed', 'Fingerprint sign-in removed from that device');
+  } catch (e) {
+    if (schemaBehind(e)) return fail(res, 503, 'passkey_unavailable', PASSKEY_UNAVAILABLE);
+    console.error('adminAuth.removePasskey error:', e?.message || e);
+    return fail(res, 500, 'error', 'Could not remove fingerprint device');
   }
 }
 
@@ -453,6 +790,9 @@ async function resetAdminPassword(req, res) {
         active_session_id: null,
       },
     });
+    // A reset is what happens when an admin has lost control of their account,
+    // so their fingerprint devices go with the old password.
+    await revokePasskeys(id);
 
     return ok(res, 'password_reset', 'Temporary password issued', { temporary_password: password });
   } catch (e) {
@@ -512,12 +852,18 @@ async function deleteAdmin(req, res) {
 module.exports = {
   login,
   verifyTwoFactor,
+  passkeyLoginOptions,
+  passkeyLogin,
   me,
   logout,
   changePassword,
   setupTwoFactor,
   enableTwoFactor,
   disableTwoFactor,
+  listPasskeys,
+  passkeyRegisterOptions,
+  passkeyRegister,
+  removePasskey,
   listAdmins,
   createAdmin,
   updateAdmin,

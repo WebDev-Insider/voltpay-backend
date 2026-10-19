@@ -29,6 +29,21 @@ publicRoutes.post(
   AdminAuthController.verifyTwoFactor,
 );
 
+// Fingerprint sign-in (passkeys). There is no email to bucket on - the device
+// picks the account - so both limit by IP. `options` writes a challenge row,
+// which is the reason it is limited at all.
+publicRoutes.post(
+  '/auth/passkey/options',
+  rateLimit({ windowMs: 15 * 60 * 1000, max: 30, name: 'admin-passkey-options' }),
+  AdminAuthController.passkeyLoginOptions,
+);
+
+publicRoutes.post(
+  '/auth/passkey/login',
+  rateLimit({ windowMs: 15 * 60 * 1000, max: 15, name: 'admin-passkey-login' }),
+  AdminAuthController.passkeyLogin,
+);
+
 const sessionRoutes = express.Router();
 
 sessionRoutes.get('/auth/me', AdminAuthController.me);
@@ -37,6 +52,12 @@ sessionRoutes.post('/auth/password', AdminAuthController.changePassword);
 sessionRoutes.post('/auth/2fa/setup', AdminAuthController.setupTwoFactor);
 sessionRoutes.post('/auth/2fa/enable', AdminAuthController.enableTwoFactor);
 sessionRoutes.post('/auth/2fa/disable', AdminAuthController.disableTwoFactor);
+
+// The signed-in admin's own fingerprint devices. Setup costs the password.
+sessionRoutes.get('/auth/passkeys', AdminAuthController.listPasskeys);
+sessionRoutes.post('/auth/passkeys/options', AdminAuthController.passkeyRegisterOptions);
+sessionRoutes.post('/auth/passkeys', AdminAuthController.passkeyRegister);
+sessionRoutes.delete('/auth/passkeys/:id', AdminAuthController.removePasskey);
 
 // Creating admins is creating access. Superadmin only, every call audited by
 // adminAudit because these are POST/PATCH/DELETE under /admin.

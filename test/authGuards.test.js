@@ -190,6 +190,22 @@ async function main() {
     assert.ok(layer.names.includes('rateLimitMiddleware'), `POST ${path} must carry a rate limiter`);
   }
 
+  // The admin console's public half: password, code and fingerprint. Each one
+  // ends in an admin session, so each one is limited - and a route added here
+  // later has to be listed (and limited) to get past the count.
+  const adminPublicLayers = layersOf(require('../src/routes/adminAuth.routes').publicRoutes);
+  const adminPublicPaths = ['/auth/login', '/auth/2fa/verify', '/auth/passkey/options', '/auth/passkey/login'];
+  assert.strictEqual(
+    adminPublicLayers.length,
+    adminPublicPaths.length,
+    'adminAuth public routes gained or lost a route - check it is limited'
+  );
+  for (const path of adminPublicPaths) {
+    const layer = adminPublicLayers.find(l => l.path === path && l.methods.includes('post'));
+    assert.ok(layer, `admin POST ${path} is missing from adminAuth.routes`);
+    assert.ok(layer.names.includes('rateLimitMiddleware'), `admin POST ${path} must carry a rate limiter`);
+  }
+
   // --- 5. /authorization must not hand out a session for nothing ---------
   // The old code fell through to a `console.log` when firebase_token was absent
   // and then signed a real access token, so knowing a phone number was enough
