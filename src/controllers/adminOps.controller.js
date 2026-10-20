@@ -4,6 +4,8 @@
 // that exists because reading is not enough - a customer whose transfer landed
 // at the provider but never reached their wallet needs somebody to be able to
 // finish it. That path is superadmin-only, idempotent, and audited.
+// (clearProviderFailures writes too, but only the Bills / VTU screen's "cleared
+// through" mark in app_settings - never a ledger, funding or audit row.)
 //
 // Four questions, four sections:
 //   reconciliation - money that arrived at a provider and stopped
@@ -23,7 +25,12 @@ const { Prisma } = require('@prisma/client');
 const bills = require('../funding/billsProvider');
 const { applyBalanceDelta, isBalanceIntact } = require('../helpers/balance.helper');
 const { logAdminAction } = require('../services/audit.service');
-const { listEvents, summary: eventSummary } = require('../services/securityEvents.service');
+const {
+  listEvents,
+  summary: eventSummary,
+  getAlertClearMark,
+  clearAlertFeed,
+} = require('../services/securityEvents.service');
 
 // ---------------------------------------------------------------------------
 // shared
@@ -322,19 +329,29 @@ async function creditFunding(req, res) {
  * money coming IN and nothing about a failed airtime vend; the persisted alert
  * feed knows about every failed provider call but only the failures. Reported
  * side by side rather than merged into one misleading "success rate".
+ *
+ * Every failure figure counts from the last clear (clearProviderFailures), so
+ * the card shows what nobody has dealt with yet. `include_cleared=1` is the
+ * screen's "Show cleared" view: the whole feed, as if nobody had cleared it.
+ * The funding side never reads the mark - a stuck credit is a work queue, and
+ * clearing an alert must not hide one.
  */
 async function getProviderHealth(req, res) {
   try {
     const hours = Math.min(Math.max(parseInt(req.query.hours || '24', 10), 1), 24 * 30);
     const since = hoursAgo(hours);
+    const includeCleared = String(req.query.include_cleared || '') === '1';
+
+    const cleared = await getAlertClearMark();
+    const afterId = includeCleared ? null : cleared?.through_id ?? null;
 
     const [fundingRows, alerts, alertSummary] = await Promise.all([
       prisma.fundingTransaction.findMany({
         where: { created_at: { gte: since }, status: { not: REGISTRATION_STATUS } },
         select: { tx_ref: true, status: true, amount: true, credited_at: true, created_at: true },
       }),
-      listEvents({ feed: 'alert', perPage: 100, from: '', to: '' }),
-      eventSummary({ feed: 'alert', hours }),
+      listEvents({ feed: 'alert', perPage: 100, from: '', to: '', afterId }),
+      eventSummary({ feed: 'alert', hours, afterId }),
     ]);
 
     // Fold the funding rows into one bucket per rail.
@@ -388,10 +405,35 @@ async function getProviderHealth(req, res) {
       providers,
       recent_failures: (alerts.items || []).slice(0, 25),
       total_failures: alertSummary.total,
+      cleared,
+      include_cleared: includeCleared,
     });
   } catch (e) {
     console.error('adminOps.getProviderHealth error', e);
     return fail(res, 500, 'Failed to load provider health');
+  }
+}
+
+/**
+ * Clear the Recent failures card on Bills / VTU.
+ *
+ * A mark the screen counts from, never a delete - see clearAlertFeed. The rows
+ * stay in admin_audit_log and "Show cleared" still lists them, so any admin may
+ * do it: the superadmin gate on this router is kept for actions that cannot be
+ * undone from the dashboard. Audited by the middleware, `through_id` included.
+ */
+async function clearProviderFailures(req, res) {
+  try {
+    const result = await clearAlertFeed({
+      throughId: req.body?.through_id ?? null,
+      actor: req.admin?.name || 'admin',
+    });
+
+    return ok(res, 'admin_provider_failures_cleared', result);
+  } catch (e) {
+    if (e?.code === 'INVALID_EVENT') return fail(res, 400, e.message);
+    console.error('adminOps.clearProviderFailures error', e);
+    return fail(res, 500, 'Failed to clear the failures');
   }
 }
 
@@ -805,6 +847,7 @@ module.exports = {
   getReconciliation,
   creditFunding,
   getProviderHealth,
+  clearProviderFailures,
   getBillsFloats,
   getBillsProviders,
   updateBillsProvider,

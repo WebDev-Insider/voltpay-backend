@@ -37,6 +37,9 @@ const SAFE_BODY_KEYS = new Set([
   'refund',
   'processing_time',
   'registration_type',
+  // The alert id a Bills / VTU "clear failures" went up to, so the trail says
+  // how far the feed was cleared, not only that somebody cleared it.
+  'through_id',
 ]);
 
 function safeBody(body) {

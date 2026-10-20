@@ -74,6 +74,7 @@
     "insights:dry": "node scripts/send-spending-insights.js --dry",
     "insights:send": "node scripts/send-spending-insights.js",
     "test:transactions": "node test/adminTransactions.test.js",
+    "test:provider-failures": "node test/providerFailuresClear.test.js",
     "test:recovery-admin": "node test/adminRecovery.test.js",
     "test:app-update": "node test/appUpdate.helper.test.js",
     "test:version-gate": "node test/appVersionGate.middleware.test.js",

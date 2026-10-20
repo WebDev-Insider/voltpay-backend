@@ -164,6 +164,11 @@ router.post('/reconciliation/:ref/credit', superadmin, manualCreditLimit, AdminO
 // persisted alert feed side by side - neither is complete on its own.
 router.get('/providers', AdminOpsController.getProviderHealth)
 
+// Clear the Recent failures card. A mark the screen counts from, never a
+// delete - the rows are part of the audit trail and "Show cleared" still lists
+// them - so it is not superadmin-gated. Audited by the middleware.
+router.post('/providers/failures/clear', AdminOpsController.clearProviderFailures)
+
 // Vending capacity. Bills are prepaid from a float held with the provider, so
 // this is the number that decides whether airtime, data, TV and electricity
 // work at all - independent of how well funded any customer wallet is.
