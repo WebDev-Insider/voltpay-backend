@@ -33,6 +33,30 @@ const SECRETS = {
 Object.assign(process.env, SECRETS);
 delete process.env.CASHBUDDY_USER_EMAIL;
 delete process.env.CASHBUDDY_USER_PHONE;
+process.env.PROVIDER_MAX_RETRIES = '0';
+
+/* ---------------------------------------------- the credential checks */
+
+// A switch to ClubKonnect or CashBuddy makes one authenticated read first.
+// `answers` decides what each provider says to it.
+const answers = { clubkonnect: 'ok', cashbuddy: 'ok' };
+const checks = [];
+
+globalThis.fetch = async url => {
+  const u = new URL(url);
+  const reply = (status, body) => ({ status, headers: { get: () => null }, text: async () => JSON.stringify(body) });
+  const provider = u.host.includes('nellobytesystems') ? 'clubkonnect' : u.host.includes('supabase') ? 'cashbuddy' : 'other';
+  checks.push(provider);
+  const answer = answers[provider];
+  if (answer === 'down') throw Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNRESET' } });
+  if (provider === 'clubkonnect') return reply(200, answer === 'refused' ? { status: 'INVALID_CREDENTIALS' } : { balance: '5000' });
+  if (provider === 'cashbuddy') {
+    return answer === 'refused'
+      ? reply(401, { error: 'Unauthorized. Invalid API key.' })
+      : reply(200, { success: true, transactions: [], pagination: { page: 1, limit: 1, total: 0 } });
+  }
+  throw new Error(`unexpected call to ${u.host}`);
+};
 
 /* ---------------------------------------------------------- fake settings */
 
@@ -170,6 +194,35 @@ async function rejects(promise, code, pattern) {
   assert.strictEqual(bills.isProviderConfigured('cashbuddy'), true, 'the account email works too');
   delete process.env.CASHBUDDY_USER_EMAIL;
   process.env.CASHBUDDY_USER_ID = SECRETS.CASHBUDDY_USER_ID;
+
+  // Set is not accepted. The live switch that showed an empty data page
+  // (2026-10-20): the keys were present, but ClubKonnect refused them - a wrong
+  // key or a server IP it has not whitelisted, which it reports the same way.
+  // The switch now asks first, and says which thing to fix.
+  await bills.setProvider('data', 'mysubwallet');
+  answers.clubkonnect = 'refused';
+  const refused = await rejects(bills.setProvider('data', 'clubkonnect'), 'PROVIDER_REJECTED_CREDENTIALS', /INVALID_CREDENTIALS/);
+  assert.ok(/whitelisted/.test(refused.message), 'names the IP whitelist as a cause');
+  assert.ok(!refused.message.includes(SECRETS.CLUBKONNECT_API_KEY), 'never echoes the key');
+  assert.strictEqual(await bills.getProviderName('data'), 'mysubwallet', 'nothing was switched');
+
+  answers.cashbuddy = 'refused';
+  await rejects(bills.setProvider('airtime', 'cashbuddy'), 'PROVIDER_REJECTED_CREDENTIALS', /CASHBUDDY_USER_ID/);
+
+  // Only a definite refusal blocks: a provider having a bad minute can still be
+  // chosen, because the switch is what you reach for in an incident.
+  answers.clubkonnect = 'down';
+  assert.deepStrictEqual(await bills.setProvider('data', 'clubkonnect'), { service: 'data', provider: 'clubkonnect' });
+
+  // The default is where every failure falls back to: never asked.
+  checks.length = 0;
+  await bills.setProvider('data', 'mysubwallet');
+  assert.deepStrictEqual(checks, [], 'switching back to MySubWallet calls nobody');
+
+  answers.clubkonnect = 'ok';
+  answers.cashbuddy = 'ok';
+  await bills.setProvider('data', 'clubkonnect');
+  await bills.setProvider('airtime', 'cashbuddy');
 
   // An unreadable setting is the incumbent, never a guess.
   readFails = true;

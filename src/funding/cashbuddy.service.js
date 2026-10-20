@@ -624,6 +624,25 @@ async function listRecentOrders({ since, pageSize = HISTORY_PAGE_SIZE, maxPages 
 
 /* ------------------------------------------------------------------- account */
 
+/**
+ * Do they accept our key AND know the paying account? One authenticated read.
+ *
+ * billsProvider asks before letting an admin switch a rail here. The bill
+ * history is read because it checks both at once: a bad key answers 401, an
+ * unknown CASHBUDDY_USER_ID is refused as a missing profile - either of which
+ * would fail every purchase. The single row it may return names a recipient,
+ * so it is dropped unread.
+ */
+async function verifyCredentials() {
+  const who = payer();
+  if (!who) throw outage('Missing required env: CASHBUDDY_USER_ID', { misconfigured: true });
+  await cbRequest('GET', '/bills', { query: { ...who, page: 1, limit: 1 } });
+  return { ok: true };
+}
+
+// What a superadmin checks when the read above is refused.
+const CREDENTIAL_HINT = 'Check CASHBUDDY_API_KEY, and that CASHBUDDY_USER_ID names VoltPay’s own CashBuddy account.';
+
 // There is no balance for the wallet bills draw on - see the header. Never
 // called by the float screen, which reads FLOAT_READABLE first; it exists so
 // the adapter surface is complete and an accidental call says why.
@@ -676,6 +695,8 @@ module.exports = {
   FLOAT_READABLE: false,
   isConfigured,
   configStatus,
+  verifyCredentials,
+  CREDENTIAL_HINT,
   // account
   getWalletBalance,
   getFundingAccount,

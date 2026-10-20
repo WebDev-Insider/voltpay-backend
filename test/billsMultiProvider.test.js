@@ -313,6 +313,23 @@ async function settle(r) {
   return reconcile(clone(row(r.trx)), { minAgeMs: 0 });
 }
 
+// A controller handler, answered into a promise.
+function call(handler, req) {
+  return new Promise(resolve => {
+    const res = {
+      statusCode: 200,
+      status(code) {
+        this.statusCode = code;
+        return this;
+      },
+      json(body) {
+        resolve({ status: this.statusCode, body });
+      },
+    };
+    handler(req, res);
+  });
+}
+
 (async () => {
   /* ============================================== ClubKonnect: delivered */
 
@@ -568,6 +585,35 @@ async function settle(r) {
   const swept = await sweepProcessingBills();
   assert.strictEqual(swept.checked, 3);
   assert.deepStrictEqual(new Set(calls.map(c => c.host)), new Set([MSW, CK, CB]));
+
+  /* ============================== the data screen on a refused ClubKonnect */
+
+  // The live report (2026-10-20): data switched to ClubKonnect, and the app's
+  // data page said "Sorry! there are no data to show". ClubKonnect had refused
+  // our key / IP with HTTP 200 {"status":"INVALID_CREDENTIALS"}, and that was
+  // served as an empty plan list - and cached. Now the screen gets an outage
+  // (the app shows "briefly unavailable"), ops are paged naming the provider,
+  // and nothing is cached.
+  resetDb();
+  routes = {};
+  spy.alerts = [];
+  db.appSetting.push({ setting_key: 'bills_provider_data', setting_value: 'clubkonnect' });
+  route(CK, 'GET', '/APIDatabundlePlansV2.asp', { body: { status: 'INVALID_CREDENTIALS' } });
+  let screen = await call(billsController.dataPlans, { params: { provider: 'MTN' } });
+  assert.strictEqual(screen.status, 503);
+  assert.strictEqual(screen.body.remark, 'provider_unavailable');
+  assert.ok(
+    spy.alerts.some(a => a.provider === 'clubkonnect' && a.action === 'config' && /INVALID_CREDENTIALS/.test(a.context?.provider_message)),
+    'ops are told which provider refused, and with what'
+  );
+
+  route(CK, 'GET', '/APIDatabundlePlansV2.asp', {
+    body: { MOBILE_NETWORK: { MTN: [{ ID: '01', PRODUCT: [{ PRODUCT_ID: '500', PRODUCT_NAME: '500 MB - Weekly (SME)', PRODUCT_AMOUNT: '297' }] }] } },
+  });
+  screen = await call(billsController.dataPlans, { params: { provider: 'MTN' } });
+  assert.strictEqual(screen.status, 200);
+  assert.strictEqual(screen.body.data.plans.length, 1, 'once they accept us, the plans appear at once - nothing was cached');
+  assert.ok(screen.body.data.tab_order.includes('weekly'));
 
   /* ======================================== electricity never via ClubKonnect */
 

@@ -315,6 +315,52 @@ async function throws(promise) {
     RequestID: 'tv_1',
   });
 
+  /* ===================================== a refused catalogue is not "no plans" */
+
+  // The bug a live switch hit (2026-10-20): with a key they do not accept - or
+  // from an IP they have not whitelisted - the plan list answers HTTP 200
+  // {"status":"INVALID_CREDENTIALS"}. It was read as a catalogue with nothing
+  // in it, cached, and every network showed "no data". It is an outage now,
+  // flagged for ops, and nothing is cached.
+  await ck.dropCatalogue('clubkonnect:data:plans');
+  reset();
+  route('/APIDatabundlePlansV2.asp', { body: { status: 'INVALID_CREDENTIALS' } });
+  err = await throws(ck.listDataPlansCached('MTN'));
+  assert.ok(err.misconfigured, 'our key or our IP, not an empty catalogue');
+  assert.strictEqual(err.providerMessage, 'INVALID_CREDENTIALS', 'their word reaches the alert');
+
+  route('/APIDatabundlePlansV2.asp', {
+    body: { MOBILE_NETWORK: { MTN: [{ ID: '01', PRODUCT: [{ PRODUCT_ID: '500', PRODUCT_NAME: '500 MB - Weekly (SME)', PRODUCT_AMOUNT: '297' }] }] } },
+  });
+  assert.strictEqual((await ck.listDataPlansCached('MTN')).length, 1, 'the refusal was not cached');
+
+  // A catalogue we cannot sell anything from is refused too, not cached.
+  await ck.dropCatalogue('clubkonnect:data:plans');
+  route('/APIDatabundlePlansV2.asp', { body: { MOBILE_NETWORK: { MTN: [{ ID: '01', PRODUCT: [] }] } } });
+  err = await throws(ck.listDataPlansCached('MTN'));
+  assert.strictEqual(err.kind, 'outage');
+
+  // An HTML page or a shape we do not know: an outage, never an empty list.
+  route('/APIDatabundlePlansV2.asp', { body: { something: 'else' } });
+  err = await throws(ck.listDataPlansCached('MTN'));
+  assert.strictEqual(err.kind, 'outage');
+
+  // The bouquets fail the same way.
+  await ck.dropCatalogue('clubkonnect:tv:bouquets');
+  reset();
+  route('/APICableTVPackagesV2.asp', { body: 'INVALID_CREDENTIALS' });
+  err = await throws(ck.listTvProvidersCached());
+  assert.ok(err.misconfigured);
+
+  // The switch-time check: one authenticated read, refused the same way.
+  reset();
+  route('/APIWalletBalanceV1.asp', { body: { status: 'INVALID_CREDENTIALS' } });
+  err = await throws(ck.verifyCredentials());
+  assert.ok(err.misconfigured);
+  route('/APIWalletBalanceV1.asp', { body: { balance: '1000' } });
+  assert.deepStrictEqual(await ck.verifyCredentials(), { ok: true });
+  assert.ok(/whitelisted/.test(ck.CREDENTIAL_HINT));
+
   /* ============================================================== account */
 
   reset();

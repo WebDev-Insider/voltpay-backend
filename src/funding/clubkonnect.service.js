@@ -317,6 +317,37 @@ function trimmedPayload(json) {
   return { status: answer.word || null, statuscode: answer.code || null };
 }
 
+/**
+ * The catalogue a list endpoint answered with, or the error its answer
+ * amounts to.
+ *
+ * Their list endpoints refuse on HTTP 200 too: with a key they do not accept -
+ * or from a server IP they have not whitelisted, which they report the same way
+ * - the plan list answers `{"status":"INVALID_CREDENTIALS"}` instead of the
+ * catalogue. Read as a catalogue, that was every network with nothing in it:
+ * cached for half an hour and shown to customers as "no data", with nobody
+ * told why. An answer without the catalogue's root is a refusal, never an
+ * empty catalogue.
+ */
+function catalogueRoot(json, root) {
+  const groups = json?.[root];
+  if (groups && typeof groups === 'object') return groups;
+
+  const answer = answerOf(json);
+  if (answer.word && isErrorWord(answer.word)) {
+    throw declined(answer, { statusCode: 503, payload: trimmedPayload(json) });
+  }
+  throw outage(`ClubKonnect answered without a ${root} catalogue`, { payload: trimmedPayload(json) });
+}
+
+// A catalogue that parsed to nothing is not one to cache and sell from: no
+// network ever has zero plans, so it is a format we did not understand.
+function nonEmpty(byKey, what) {
+  const count = Object.values(byKey).reduce((n, list) => n + list.length, 0);
+  if (!count) throw outage(`ClubKonnect ${what} catalogue had nothing we could sell`);
+  return byKey;
+}
+
 // Amounts arrive as strings, not always tidy ones - an Airtel plan once cost
 // "484.912717854786". Rounded to kobo.
 function toAmount(value) {
@@ -604,6 +635,24 @@ async function getWalletBalance() {
   };
 }
 
+/**
+ * Do they accept our credentials from this server? One authenticated read.
+ *
+ * billsProvider asks before letting an admin switch a rail here. Present
+ * credentials are not accepted ones: a wrong key and an IP missing from their
+ * whitelist both answer INVALID_CREDENTIALS, and a rail switched anyway would
+ * fail every catalogue and every purchase until somebody noticed. Throws the
+ * error the read produced - `misconfigured` when they refused us.
+ */
+async function verifyCredentials() {
+  await getWalletBalance();
+  return { ok: true };
+}
+
+// What a superadmin checks when the read above is refused.
+const CREDENTIAL_HINT =
+  "Check CLUBKONNECT_USER_ID and CLUBKONNECT_API_KEY, and that this server's IP address is whitelisted on ClubKonnect (Developer's API).";
+
 // Where the float is topped up from - deployment config, read from the
 // environment so it is on the screen even while their API is down.
 function getFundingAccount() {
@@ -810,10 +859,13 @@ async function listDataProvidersCached() {
  */
 async function loadAllDataPlans({ ttlMs = CATALOGUE_TTL_MS, force = false } = {}) {
   return cached(
-    'clubkonnect:data:all',
+    // Not the first build's 'clubkonnect:data:all': that key can hold the empty
+    // catalogue a refused read was cached as (see catalogueRoot), for up to an
+    // hour in Redis. A new name is never served it.
+    'clubkonnect:data:plans',
     async () => {
       const json = await ckCatalogue('/APIDatabundlePlansV2.asp');
-      const groups = unwrapGroups(json?.MOBILE_NETWORK);
+      const groups = unwrapGroups(catalogueRoot(json, 'MOBILE_NETWORK'));
 
       const byNetwork = {};
       for (const group of groups) {
@@ -842,7 +894,7 @@ async function loadAllDataPlans({ ttlMs = CATALOGUE_TTL_MS, force = false } = {}
       }
 
       for (const plans of Object.values(byNetwork)) plans.sort((a, b) => a.amount - b.amount);
-      return byNetwork;
+      return nonEmpty(byNetwork, 'data');
     },
     ttlMs,
     { force }
@@ -887,10 +939,11 @@ async function buyData({ provider, planId, number, reference }) {
  */
 async function loadAllTvPackages({ ttlMs = CATALOGUE_TTL_MS, force = false } = {}) {
   return cached(
-    'clubkonnect:tv:packages',
+    // Renamed from the first build's key for the same reason as the data plans.
+    'clubkonnect:tv:bouquets',
     async () => {
       const json = await ckCatalogue('/APICableTVPackagesV2.asp');
-      const groups = unwrapGroups(json?.TV_ID);
+      const groups = unwrapGroups(catalogueRoot(json, 'TV_ID'));
 
       const byCode = {};
       for (const group of groups) {
@@ -908,7 +961,7 @@ async function loadAllTvPackages({ ttlMs = CATALOGUE_TTL_MS, force = false } = {
       }
 
       for (const packages of Object.values(byCode)) packages.sort((a, b) => a.amount - b.amount);
-      return byCode;
+      return nonEmpty(byCode, 'cable TV');
     },
     ttlMs,
     { force }
@@ -1026,6 +1079,8 @@ module.exports = {
   SUPPORTS_REQUEST_ID_LOOKUP: true,
   isConfigured,
   configStatus,
+  verifyCredentials,
+  CREDENTIAL_HINT,
   // account
   getWalletBalance,
   getFundingAccount,

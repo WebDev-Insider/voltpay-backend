@@ -268,6 +268,27 @@ const buy = (over = {}) => cb.buyAirtime({ provider: 'MTN', number: '+2348031234
   assert.ok(listing.orders.some(o => o.reference === 'vt_60'), 'the newest bill was read');
   assert.deepStrictEqual(calls.map(c => c.query.page), ['1', '3', '2']);
 
+  /* ============================================== the switch-time check */
+
+  // One read checks the key and the paying account at once.
+  reset();
+  route('GET', '/bills', ({ query }) => {
+    assert.strictEqual(query.user_id, 'f7a1c3b2-0001-4e8d-bcf1-aabbccddeeff');
+    assert.strictEqual(query.limit, '1');
+    return { body: { success: true, transactions: [bill(1)], pagination: { page: 1, limit: 1, total: 9 } } };
+  });
+  assert.deepStrictEqual(await cb.verifyCredentials(), { ok: true }, 'the row it returns is dropped');
+
+  reset();
+  route('GET', '/bills', { status: 401, body: { error: 'Unauthorized. Invalid API key.' } });
+  err = await throws(cb.verifyCredentials());
+  assert.ok(err.misconfigured);
+
+  reset();
+  route('GET', '/bills', { status: 404, body: { success: false, error: 'NOT_FOUND', message: 'User profile not found' } });
+  err = await throws(cb.verifyCredentials());
+  assert.ok(err.misconfigured, 'an unknown paying account is ours to fix');
+
   /* ================================================================ shape */
 
   assert.deepStrictEqual(cb.SERVICES, ['airtime']);

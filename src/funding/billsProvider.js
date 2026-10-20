@@ -290,6 +290,40 @@ async function resolveForRewards(service) {
 }
 
 /**
+ * Refuse a provider that refuses us.
+ *
+ * Set is not the same as accepted. ClubKonnect answers a wrong key - and a
+ * server IP missing from its whitelist - with INVALID_CREDENTIALS, and a rail
+ * switched to it anyway showed customers an empty plan list while every read
+ * and purchase on it failed. So one authenticated read is made first, and a
+ * definite rejection (`misconfigured`) stops the switch with the provider's own
+ * word for it. Anything else - slow, down, unreachable - does not: the switch
+ * exists for incidents, and a provider having a bad minute is no reason to
+ * forbid one. The default is never asked; it is where every failure already
+ * falls back to.
+ */
+async function assertCredentialsAccepted(name) {
+  const adapter = ADAPTERS[name];
+  if (name === DEFAULT_PROVIDER || typeof adapter.verifyCredentials !== 'function') return;
+
+  try {
+    await adapter.verifyCredentials();
+  } catch (e) {
+    if (!e?.misconfigured) return;
+    // Their wording names the refusal ("INVALID_CREDENTIALS"); it carries no
+    // secret, and a superadmin needs it to know which thing to fix.
+    const said = String(e.providerMessage || '').trim().slice(0, 160);
+    const err = new Error(
+      [`${PROVIDER_LABELS[name]} refused our credentials${said ? ` (${said})` : ''}.`, adapter.CREDENTIAL_HINT]
+        .filter(Boolean)
+        .join(' ')
+    );
+    err.code = 'PROVIDER_REJECTED_CREDENTIALS';
+    throw err;
+  }
+}
+
+/**
  * Point a rail at a provider.
  *
  * Refuses a provider the rail may not use, and an unconfigured one. The read
@@ -325,6 +359,8 @@ async function setProvider(service, name) {
     err.code = 'PROVIDER_NOT_CONFIGURED';
     throw err;
   }
+
+  await assertCredentialsAccepted(chosen);
 
   await prisma.appSetting.upsert({
     where: { setting_key: settingKey(service) },

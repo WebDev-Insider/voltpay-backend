@@ -806,15 +806,17 @@ async function updateBillsProvider(req, res) {
       message: `${bills.SERVICES[result.service]} now vends through ${label}`,
     });
   } catch (e) {
-    // All four are an admin choosing something that cannot work, not a fault:
+    // All five are an admin choosing something that cannot work, not a fault:
     // an unknown rail, an unknown provider, one this rail may not use (the
-    // electricity ban on ClubKonnect, CashBuddy anywhere but airtime), or one
-    // whose keys are absent.
+    // electricity ban on ClubKonnect, CashBuddy anywhere but airtime), one
+    // whose keys are absent, or one that refused the keys it was sent (a wrong
+    // key, or this server's IP not whitelisted with them).
     if (
       e?.code === 'UNKNOWN_SERVICE' ||
       e?.code === 'UNKNOWN_PROVIDER' ||
       e?.code === 'PROVIDER_NOT_ALLOWED' ||
-      e?.code === 'PROVIDER_NOT_CONFIGURED'
+      e?.code === 'PROVIDER_NOT_CONFIGURED' ||
+      e?.code === 'PROVIDER_REJECTED_CREDENTIALS'
     ) {
       return fail(res, 400, e.message);
     }
