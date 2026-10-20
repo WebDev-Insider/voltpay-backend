@@ -293,6 +293,25 @@ function unconfirmedRow(trx, { minutes = 5, phone = '08031234567', amount = 500,
   return clone(r);
 }
 
+// A ClubKonnect airtime row whose purchase came back without an order id:
+// our own trx stands in as its reference.
+function seedCk(trx, minutes, extra = {}) {
+  const r = {
+    trx,
+    user_id: USER_ID,
+    trx_type: '-',
+    remark: 'mobile_recharge',
+    amount: 100,
+    total_amount: 100,
+    details: '',
+    other_data: { title: 'Airtime', feedback: 'Processing' },
+    meta: { gateway: 'clubkonnect', service: 'airtime', provider: 'AIRTEL', reference: trx, provider_reference: trx, bill_status: 'processing', ...extra },
+    created_at: ago(minutes),
+  };
+  db.walletTransaction.push(r);
+  return clone(r);
+}
+
 function history(orders) {
   route(CB, 'GET', '/bills', { body: { success: true, transactions: orders, pagination: { page: 1, limit: 50, total: orders.length } } });
 }
@@ -345,8 +364,8 @@ function call(handler, req) {
   assert.strictEqual(meta.provider_reference, '777', 'their reference is recorded');
   assert.strictEqual(meta.reference, result.trx, 'and our own');
   assert.strictEqual(meta.bill_status, 'successful');
-  assert.strictEqual(meta.unconfirmed, undefined, 'lookup-by-history fields only where they are needed');
-  assert.strictEqual(meta.recipient_idx, undefined);
+  assert.strictEqual(meta.unconfirmed, false, 'their order id arrived, so it is confirmed');
+  assert.strictEqual(meta.recipient_idx, undefined, 'lookup-by-history fields only where they are needed');
   assert.strictEqual(balance(), 9_500, 'debited once');
   assert.deepStrictEqual(calls.map(c => `${c.host}${c.path}`), [`${CK}/APIAirtimeV1.asp`]);
   assert.strictEqual(calls[0].query.RequestID, result.trx, 'our trx went out as their RequestID');
@@ -374,6 +393,95 @@ function call(handler, req) {
   assert.strictEqual(result.outcome, 'provider_failed');
   assert.ok(result.error.floatExhausted);
   assert.strictEqual(balance(), 10_000);
+
+  /* ================== ClubKonnect: accepted, but no order id of theirs */
+
+  // The live report (2026-10-20): an Airtel purchase on ClubKonnect sat at
+  // "Processing" while their wallet was never charged. Their answer had no
+  // order id - every order they hold has one - and nothing would ever have
+  // closed the bill. Now it is unconfirmed, paged if it was a float hold, and
+  // settled on evidence by our RequestID.
+  resetDb();
+  routes = {};
+  calls = [];
+  spy.alerts = [];
+  route(CK, 'GET', '/APIAirtimeV1.asp', { body: { status: 'INSUFFICIENT_APIAMOUNT' } });
+  result = await buy('clubkonnect', { provider: 'AIRTEL' });
+  assert.strictEqual(result.outcome, 'delivered', 'not refused: they say it is parked, not declined');
+  assert.strictEqual(result.processing, true);
+  let held = row(result.trx);
+  assert.strictEqual(held.meta.unconfirmed, true, 'no order id of theirs: not proof of an order');
+  assert.strictEqual(held.meta.provider_reference, result.trx);
+  assert.strictEqual(balance(), 9_500);
+  assert.ok(spy.alerts.some(a => a.provider === 'clubkonnect' && a.action === 'float'), 'whoever tops up the float is paged now');
+
+  // They never place an order under our RequestID: refunded, once, after the
+  // same evidence as a lost CashBuddy purchase - enough looks AND enough time.
+  // A "not found" and an answer with no order in it are both a look.
+  held.created_at = ago(40);
+  let ckLooks = 0;
+  route(CK, 'GET', '/APIQueryV1.asp', ({ query }) => {
+    assert.strictEqual(query.RequestID, held.trx, 'asked by OUR reference');
+    ckLooks += 1;
+    return { body: ckLooks % 2 ? { status: 'ORDER_NOT_FOUND' } : {} };
+  });
+  let ckOutcome = await settle(held);
+  assert.strictEqual(ckOutcome.reason, 'not_found_yet');
+  await settle(held);
+  assert.strictEqual(balance(), 9_500, 'two looks are not enough');
+  ckOutcome = await settle(held);
+  assert.strictEqual(ckOutcome.applied, true);
+  assert.strictEqual(balance(), 10_000, 'refunded');
+  assert.strictEqual(row(held.trx).meta.bill_status, 'failed');
+  await settle(held);
+  assert.strictEqual(db.walletTransaction.filter(r => r.trx === `${held.trx}_r`).length, 1, 'once');
+
+  // Their query fails: proves nothing, not counted.
+  resetDb({ balance: 9_500 });
+  routes = {};
+  const flaky = seedCk('air_ck_flaky', 40, { unconfirmed: true, lookup_misses: 2 });
+  route(CK, 'GET', '/APIQueryV1.asp', { status: 503, body: 'Service Unavailable' });
+  ckOutcome = await settle(flaky);
+  assert.strictEqual(ckOutcome.reason, 'provider_error');
+  assert.strictEqual(row(flaky.trx).meta.lookup_misses, 2);
+  assert.strictEqual(balance(), 9_500);
+
+  // The order does turn up under our RequestID: its id is adopted, and it
+  // settles on its own status.
+  routes = {};
+  route(CK, 'GET', '/APIQueryV1.asp', ({ query }) =>
+    query.RequestID ? { body: { orderid: '7001', statuscode: '200', status: 'ORDER_COMPLETED' } } : { body: { status: 'ORDER_NOT_FOUND' } }
+  );
+  ckOutcome = await settle(flaky);
+  assert.strictEqual(ckOutcome.adopted, true);
+  assert.strictEqual(row(flaky.trx).meta.provider_reference, '7001');
+  assert.strictEqual(row(flaky.trx).meta.unconfirmed, false);
+  assert.strictEqual(row(flaky.trx).meta.bill_status, 'successful');
+  assert.strictEqual(balance(), 9_500, 'delivered: kept');
+
+  // The row as the first build left it - no flag, our trx as its "reference" -
+  // is taken into the same flow, so the stuck purchase finishes itself.
+  resetDb({ balance: 9_900 });
+  routes = {};
+  const legacy = seedCk('air_1792456509276_7loggt', 120, {});
+  delete row(legacy.trx).meta.unconfirmed;
+  route(CK, 'GET', '/APIQueryV1.asp', { body: { status: 'ORDER_NOT_FOUND' } });
+  for (let i = 0; i < 3; i += 1) await settle(legacy);
+  assert.strictEqual(row(legacy.trx).meta.bill_status, 'failed');
+  assert.strictEqual(balance(), 10_000, 'the stuck purchase was refunded');
+
+  // A lost answer whose RequestID lookup recognised nothing is not refunded on
+  // the spot - it may yet appear - but it is unconfirmed, so it cannot hang.
+  resetDb();
+  routes = {};
+  route(CK, 'GET', '/APIAirtimeV1.asp', () => {
+    throw networkError();
+  });
+  route(CK, 'GET', '/APIQueryV1.asp', { body: {} });
+  result = await buy('clubkonnect');
+  assert.strictEqual(result.processing, true);
+  assert.strictEqual(row(result.trx).meta.unconfirmed, true);
+  assert.strictEqual(balance(), 9_500);
 
   /* ============================================ CashBuddy: delivered */
 

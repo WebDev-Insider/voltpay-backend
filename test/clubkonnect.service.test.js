@@ -120,6 +120,22 @@ async function throws(promise) {
   assert.ok(!/unspecified/i.test(unknown.message), 'their wording stays on providerMessage');
   assert.ok(isErrorWord('INVALID_SMARTCARDNO') && !isErrorWord('BALOGUN SUNDAY'));
 
+  /* ====================================== accepted without an order id */
+
+  // Every order they hold has an all-digit id. An acceptance without one is
+  // not proof of an order, and says so - billReconcile then works it by our
+  // RequestID instead of waiting forever.
+  assert.ok(ck.isOrderId('6716176945'));
+  assert.ok(!ck.isOrderId('air_1792456509276_7loggt') && !ck.isOrderId('') && !ck.isOrderId(null));
+  let parsed = ck.parseVendResult({ orderid: '6716176945', statuscode: '100', status: 'ORDER_RECEIVED' });
+  assert.deepStrictEqual([parsed.status, parsed.unconfirmed, parsed.float_hold], ['processing', false, false]);
+  parsed = ck.parseVendResult({ status: 'INSUFFICIENT_APIAMOUNT', requestid: 'air_x' });
+  assert.deepStrictEqual([parsed.status, parsed.unconfirmed, parsed.float_hold, parsed.reference], ['processing', true, true, 'air_x']);
+  parsed = ck.parseVendResult({ orderid: '88', statuscode: '412', status: 'ORDER_ERROR' });
+  assert.deepStrictEqual([parsed.unconfirmed, parsed.float_hold], [false, true], 'parked with an order id: tracked by it, still paged');
+  parsed = ck.parseVendResult({ statuscode: '200', status: 'ORDER_COMPLETED' });
+  assert.strictEqual(parsed.unconfirmed, false, 'delivered needs no tracking');
+
   /* ============================================================== airtime */
 
   reset();

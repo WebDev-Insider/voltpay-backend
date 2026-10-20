@@ -157,7 +157,16 @@ async function reconcile(row, { minAgeMs = 20_000, maxAgeMs = 24 * 60 * 60_000 }
     typeof upstream.listRecentOrders === 'function' &&
     isUnconfirmed(meta);
 
-  if (!reference && !byHistory) {
+  // An upstream that hands back an order id of its own for every order it
+  // holds (ClubKonnect), on a bill that never got one: asked about by our
+  // RequestID until an order turns up - or, on evidence, refunded.
+  const awaitingOrder =
+    !byHistory &&
+    upstream.SUPPORTS_REQUEST_ID_LOOKUP &&
+    typeof upstream.isOrderId === 'function' &&
+    !upstream.isOrderId(reference);
+
+  if (!reference && !byHistory && !awaitingOrder) {
     // No order id means the vend's response never reached us. On an upstream
     // that can be queried by the reference *we* generated, that is recoverable:
     // the order may well exist on their side under our trx. On one that can
@@ -175,6 +184,7 @@ async function reconcile(row, { minAgeMs = 20_000, maxAgeMs = 24 * 60 * 60_000 }
   if (throttled(row.trx)) return { checked: false, reason: 'throttled' };
 
   if (byHistory) return reconcileUnconfirmed(row, meta, upstream, gateway, age);
+  if (awaitingOrder) return reconcileAwaitingOrder(row, meta, upstream, gateway, age);
 
   let remote;
   try {
@@ -341,6 +351,15 @@ async function reconcileUnconfirmed(row, meta, upstream, gateway, age) {
   // Nothing there. Only a read that covered the whole window counts as a look.
   if (!listing?.complete) return { checked: true, reason: 'incomplete_listing' };
 
+  return recordAbsence(row, meta, age);
+}
+
+/**
+ * One more look that found no order. Counted, and refunded once there have
+ * been enough of them over enough time - the same rule for every upstream that
+ * cannot confirm a purchase by our own reference.
+ */
+async function recordAbsence(row, meta, age) {
   const misses = (Number(meta.lookup_misses) || 0) + 1;
   if (misses >= UNCONFIRMED_MIN_MISSES && age >= UNCONFIRMED_REFUND_AFTER_MS) {
     // Claimed before it is paid, so a late match cannot also adopt an order for
@@ -352,6 +371,70 @@ async function reconcileUnconfirmed(row, meta, upstream, gateway, age) {
 
   await moveUnconfirmed(row, meta, { lookup_misses: misses });
   return { checked: true, reason: 'not_found_yet' };
+}
+
+/**
+ * A bill on an upstream that gives every order it holds an id of its own
+ * (ClubKonnect), which never got one.
+ *
+ * Accepted without an order id is not proof of an order: it was a status word
+ * with nothing behind it (INSUFFICIENT_APIAMOUNT on its own), or a lost answer
+ * our RequestID could not place. On 2026-10-20 one such airtime purchase sat at
+ * "Processing" with ClubKonnect's wallet untouched, and nothing would ever have
+ * closed it - outside vend(), "not found" was never a reason to refund.
+ *
+ *   an order turns up under our RequestID   its id is stamped, and it settles
+ *                                           on its own status like any other
+ *   no order, look after look               refunded on the same evidence as a
+ *                                           lost CashBuddy purchase: enough
+ *                                           complete looks AND enough time
+ *   their query fails                       proves nothing, not counted
+ */
+async function reconcileAwaitingOrder(row, meta, upstream, gateway, age) {
+  // Written before this rule existed, a bill carries no flag to guard the
+  // transitions on. Given one first - guarded on still being open.
+  if (meta.unconfirmed !== true && meta.unconfirmed !== REFUNDING) {
+    const flagged = await prisma.walletTransaction.updateMany({
+      where: { trx: row.trx, meta: { path: ['bill_status'], equals: 'processing' } },
+      data: { meta: { ...meta, unconfirmed: true } },
+    });
+    if (!flagged.count) return { checked: false, reason: 'raced' };
+    meta = { ...meta, unconfirmed: true };
+  }
+
+  if (meta.unconfirmed === REFUNDING) return refundUnconfirmed(row);
+
+  let remote;
+  try {
+    remote = await upstream.getTransactionStatus(row.trx, { byRequestId: true });
+  } catch (e) {
+    console.error('bills.reconcile request-id lookup error:', { trx: row.trx, gateway, error: e?.message });
+    return { checked: false, reason: 'provider_error' };
+  }
+
+  // An order they hold carries their id or, at the least, a status code. A
+  // "not found", or an answer with neither, is no order at all.
+  const orderId = upstream.isOrderId(remote.reference_code) ? String(remote.reference_code) : '';
+  const holdsOrder = remote.status !== 'not_found' && Boolean(orderId || remote.status_code);
+  if (!holdsOrder) return recordAbsence(row, meta, age);
+
+  if (orderId) {
+    const adopted = await moveUnconfirmed(row, meta, {
+      unconfirmed: false,
+      provider_reference: orderId,
+      found_by: 'request_id',
+    });
+    if (!adopted) return { checked: true, reason: 'raced' };
+  }
+
+  const result = await settlement.applyOutcome({
+    trx: row.trx,
+    status: remote.status,
+    token: remote.token,
+    units: remote.units,
+    reason: 'Provider reported failure on requery',
+  });
+  return { checked: true, status: remote.status, applied: result.applied, reason: result.reason, adopted: Boolean(orderId) };
 }
 
 /**

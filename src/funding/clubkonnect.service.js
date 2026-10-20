@@ -597,21 +597,45 @@ function shapeTvName(rawName) {
 }
 
 /**
+ * Is this one of THEIR order ids? All digits ("6716176945"). Ours always carry
+ * letters, so the two can never be mistaken for each other.
+ */
+function isOrderId(value) {
+  return /^\d+$/.test(String(value ?? '').trim());
+}
+
+// A float shortfall they park rather than refuse: status 412 /
+// INSUFFICIENT_APIAMOUNT, "put on hold, retried before cancellation".
+function isFloatHold(answer) {
+  return answer.code === '412' || wordKey(answer.word) === 'INSUFFICIENT_APIAMOUNT' || wordKey(answer.remark) === 'INSUFFICIENT_APIAMOUNT';
+}
+
+/**
  * One shape for every purchase response, matching the other adapters', so the
  * controller reads the same fields whichever upstream answered.
  *
  * A declined vend never reaches here - vend() throws it - so this only has to
  * tell "delivered" from "accepted, still going".
+ *
+ * `unconfirmed`: accepted, but with no order id of theirs. Every order they
+ * actually hold has one, so this is not proof that one exists - a word with no
+ * order behind it (INSUFFICIENT_APIAMOUNT on its own), or a lost answer our
+ * RequestID could not place. The bill stays open and billReconcile settles it
+ * on evidence: the order turns up under our RequestID, or never does.
  */
 function parseVendResult(json) {
   const data = json && typeof json === 'object' ? json : {};
   const answer = answerOf(data);
+  const delivered = answer.state === 'successful';
   return {
     // Their order id when they gave one: the query endpoint is keyed on it, and
     // it is what their dashboard shows. Our RequestID otherwise.
     reference: answer.orderid || String(data.requestid || '').trim(),
     order_no: answer.orderid,
-    status: answer.state === 'successful' ? 'successful' : 'processing',
+    status: delivered ? 'successful' : 'processing',
+    unconfirmed: !delivered && !isOrderId(answer.orderid),
+    // Parked for want of float: the bill waits, and whoever tops it up is paged.
+    float_hold: !delivered && isFloatHold(answer),
     token: '',
     units: '',
     message: answer.remark || answer.word,
@@ -1101,6 +1125,9 @@ module.exports = {
   payTv,
   // shared
   parseVendResult,
+  // Their order ids, told apart from ours - billReconcile treats a bill
+  // without one as unconfirmed.
+  isOrderId,
   isFloatError,
   dropCatalogue,
   warmCatalogues,

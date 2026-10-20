@@ -715,20 +715,30 @@ function recipientFor(pending) {
 }
 
 /**
- * The fields that let a purchase be found without a reference.
+ * The fields that let a purchase the provider has not confirmed be settled on
+ * evidence. `unconfirmed` stays true until the provider hands back a reference
+ * of its own, and billReconcile works the row until it does or plainly never
+ * will:
  *
- * Only for an upstream that cannot be asked about our own reference
- * (CashBuddy): until it hands one back the row is `unconfirmed`, and
- * billReconcile finds it in the provider's history by recipient and amount.
- * The recipient is a blind index - `meta` is not encrypted.
+ *   - an upstream that cannot be asked about our reference at all (CashBuddy)
+ *     is searched by what the purchase was - recipient (a blind index: `meta`
+ *     is not encrypted) and amount;
+ *   - one that names every order it holds (ClubKonnect, `isOrderId`) is asked
+ *     by our RequestID until an order turns up.
+ *
+ * Every other upstream (MySubWallet) is keyed on our own reference throughout
+ * and needs none of this.
  */
-function matchFields(upstream, pending, amount, { unconfirmed }) {
-  if (upstream.SUPPORTS_REQUEST_ID_LOOKUP) return {};
-  return {
-    unconfirmed,
-    recipient_idx: recipientIndex(pending.service, recipientFor(pending)),
-    vend_amount: amount,
-  };
+function trackingFields(upstream, pending, amount, { unconfirmed }) {
+  if (!upstream.SUPPORTS_REQUEST_ID_LOOKUP) {
+    return {
+      unconfirmed,
+      recipient_idx: recipientIndex(pending.service, recipientFor(pending)),
+      vend_amount: amount,
+    };
+  }
+  if (typeof upstream.isOrderId === 'function') return { unconfirmed };
+  return {};
 }
 
 /**
@@ -844,10 +854,10 @@ async function executePurchase({
             // how it knows the bill is prepaid - even on a row whose request
             // died before the post-vend update below.
             meter_type: pending.service === 'electricity' ? pending.meter_type : undefined,
-            // Unconfirmed from the start on an upstream with no lookup by our
-            // reference, for the same reason: a request that dies mid-vend
-            // must still leave a row the sweep can find the order for.
-            ...matchFields(upstream, pending, amount, { unconfirmed: true }),
+            // Unconfirmed from the start wherever that applies, for the same
+            // reason: a request that dies mid-vend must still leave a row the
+            // sweep can find the order for.
+            ...trackingFields(upstream, pending, amount, { unconfirmed: true }),
             ...extra,
           },
         },
@@ -872,6 +882,20 @@ async function executePurchase({
   // differences between purchase responses stay there.
   const vend = upstream.parseVendResult(providerResponse);
   const providerRef = vend.reference || vend.order_no;
+
+  // Accepted but parked for want of float (ClubKonnect's 412,
+  // INSUFFICIENT_APIAMOUNT). The bill waits on it, so whoever tops the float up
+  // is paged now - not an hour later by the stuck-bills sweep.
+  if (vend.float_hold) {
+    alerts.paymentFailure({
+      provider: gateway,
+      action: 'float',
+      reference: trx,
+      userId,
+      amount: total,
+      message: `${bills.PROVIDER_LABELS[gateway] || gateway} put a purchase on hold for float - top it up`,
+    });
+  }
   // Normally here for prepaid electricity, but not on a vend the provider
   // accepted as pending - that one fills in later. Either way the receipt
   // shape is the same before and after.
@@ -957,8 +981,8 @@ async function executePurchase({
         token,
         units,
         // Still unconfirmed when their answer was lost or carried no
-        // reference - billReconcile then finds the order in their history.
-        ...matchFields(upstream, pending, amount, { unconfirmed: processing && (vend.unconfirmed === true || !providerRef) }),
+        // reference of theirs - billReconcile then settles it on evidence.
+        ...trackingFields(upstream, pending, amount, { unconfirmed: processing && (vend.unconfirmed === true || !providerRef) }),
         ...extra,
       },
     },
