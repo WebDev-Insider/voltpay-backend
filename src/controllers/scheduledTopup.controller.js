@@ -147,7 +147,7 @@ async function buildSchedule(body) {
   if (!checked.ok) return { error: { status: 400, remark: 'validation_error', message: checked.message } };
   const value = checked.value;
 
-  const { name: gateway, provider: upstream } = await bills.resolve(value.service);
+  const { provider: upstream } = await bills.resolve(value.service);
 
   // The network has to be one this rail sells. A typo saved here would be
   // refused on every run, so it is refused once, now.
@@ -190,13 +190,10 @@ async function buildSchedule(body) {
     value.amount = price;
     value.plan_name = shown.name;
     value.plan_validity = shown.validity || null;
-    // Whose plan id this is. The worker refuses to spend it anywhere else.
-    value.plan_gateway = gateway;
   } else {
     value.plan_id = null;
     value.plan_name = null;
     value.plan_validity = null;
-    value.plan_gateway = null;
   }
 
   return { value };
@@ -222,7 +219,6 @@ function columnsFor(value) {
     plan_id: value.plan_id,
     plan_name: value.plan_name,
     plan_validity: value.plan_validity,
-    plan_gateway: value.plan_gateway ?? null,
     frequency: value.frequency,
     day_of_week: value.day_of_week,
     day_of_month: value.day_of_month,

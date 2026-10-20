@@ -905,9 +905,8 @@ async function listDataPlanOptions(req, res) {
     // first and its key is per rail. The claim path reads this same switch, so
     // the sizes an admin picks from are the sizes that will be vendable -
     // showing one provider's catalogue while the other does the vending is how
-    // an admin promises a bundle nobody sells. resolveForRewards for the same
-    // reason: it is the switch the claim path actually reads.
-    const { name: gateway, provider: upstream } = await bills.resolveForRewards('data');
+    // an admin promises a bundle nobody sells.
+    const { name: gateway, provider: upstream } = await bills.resolve('data');
     const cacheKey = plansCacheKey(gateway);
     const lastGoodKey = plansLastGoodKey(gateway);
 

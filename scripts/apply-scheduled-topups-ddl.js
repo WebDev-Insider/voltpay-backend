@@ -9,12 +9,6 @@
 // Additive only: two new tables, nothing existing is touched. Prisma CLI
 // cannot reach Neon from this machine, so the DDL goes over pg on DIRECT_URL
 // like every other script here. Re-running is a no-op.
-//
-// Later columns are added with ALTER ... IF NOT EXISTS at the end of the list,
-// because CREATE TABLE IF NOT EXISTS skips a table that is already there whole:
-//   plan_gateway (2026-10-19) - which bills provider issued plan_id. Run this
-//                 before deploying the multi-provider bills release, or the
-//                 scheduled top-up reads fail on the missing column.
 require('dotenv').config();
 const { Client } = require('pg');
 const dns = require('dns');
@@ -76,7 +70,6 @@ const STATEMENTS = [
      ON scheduled_topup_runs (status, next_retry_at)`,
   `CREATE INDEX IF NOT EXISTS scheduled_topup_runs_schedule_id_created_at_idx
      ON scheduled_topup_runs (schedule_id, created_at)`,
-  `ALTER TABLE scheduled_topups ADD COLUMN IF NOT EXISTS plan_gateway text`,
 ];
 
 /**

@@ -27,7 +27,7 @@
     "test:upload": "node test/upload.helper.test.js",
     "test:redis": "node test/redis.service.test.js",
     "test:cache": "node test/cache.service.test.js",
-    "test:bills": "node test/planDuration.test.js && node test/bills.controller.test.js && node test/billSettlement.test.js && node test/mysubwallet.service.test.js && node test/mysubwalletFlows.test.js && node test/betting.test.js && node test/bettingFlow.test.js && node test/billsProvider.test.js && node test/clubkonnect.service.test.js && node test/cashbuddy.service.test.js && node test/billsMultiProvider.test.js",
+    "test:bills": "node test/planDuration.test.js && node test/bills.controller.test.js && node test/billSettlement.test.js && node test/mysubwallet.service.test.js && node test/mysubwalletFlows.test.js && node test/betting.test.js && node test/bettingFlow.test.js",
     "test:account": "node test/accountStatus.helper.test.js && node test/accountDeletion.test.js",
     "ddl:account-deletion": "node scripts/apply-account-deletion-ddl.js",
     "test:credit-alert": "node test/creditAlert.test.js",

@@ -617,11 +617,6 @@ model ScheduledTopup {
   plan_id        String?
   plan_name      String?
   plan_validity  String?
-  /// The bills provider that issued plan_id (mysubwallet | clubkonnect). A
-  /// plan id means nothing to any other provider, so a run whose data rail has
-  /// moved pauses rather than buy whatever that id names there. Null = written
-  /// before this column existed, when MySubWallet was the only provider.
-  plan_gateway   String?
   /// weekly | monthly
   frequency      String
   /// 0 = Sunday ... 6 = Saturday. Weekly only.

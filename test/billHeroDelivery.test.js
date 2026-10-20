@@ -176,7 +176,6 @@ stub('../database/prisma', fakePrisma);
 stub('../src/funding/billsProvider', {
   ADAPTERS: { mysubwallet: adapter },
   resolve: async () => ({ name: 'mysubwallet', provider: adapter }),
-  resolveForRewards: async () => ({ name: 'mysubwallet', provider: adapter }),
   adapterFor: () => adapter,
 });
 stub('../src/services/notify.service', {

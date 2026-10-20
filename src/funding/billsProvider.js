@@ -1,34 +1,20 @@
 // Which provider serves which bill, switchable from the admin dashboard.
 //
-// Three upstreams are registered: MySubWallet (the default, and the only one
-// that can serve every rail), ClubKonnect and CashBuddy. Every caller - the
-// controller, Bill Hero, the scheduled top-up worker, the sweep, the ops screen
-// - goes through here rather than importing a provider directly, and an admin
-// flips a rail between providers without a deploy, **per service**, so a broken
-// data upstream does not drag airtime with it.
+// VoltPay buys airtime, data, cable TV and electricity from MySubWallet, which
+// is the only registered upstream today. PairGate and ClubKonnect were removed
+// in October 2026; ClubKonnect and CashBuddy were tried again on 2026-10-19 and
+// removed for good the next day, by the owner's decision - do not re-add either
+// unless asked. The registry and the per-rail switch are kept anyway,
+// because the provider has changed four times: a second upstream is one
+// adapter exporting the same surface plus one line in ADAPTERS below, and every
+// caller - the controller, Bill Hero, the sweep, the ops screen - already goes
+// through here rather than importing a provider directly. With two registered,
+// an admin flips a broken rail over without a deploy, **per service**, so a
+// broken data upstream does not drag airtime with it.
 //
-// Not every provider may serve every rail, for two different kinds of reason,
-// and the dashboard says which one applies:
-//
-//   - **Policy.** Electricity is never routed through ClubKonnect - the owner's
-//     rule (October 2026), kept in BARRED below and enforced three times over:
-//     BARRED, ALLOWED, and the ClubKonnect adapter itself, which has no
-//     electricity code to call.
-//   - **Capability.** CashBuddy's partner API publishes no data-plan list, no
-//     bouquet list and no meter or smartcard lookup (checked against the live
-//     API, 2026-10-19), so it can price and verify nothing but airtime. Those
-//     rails are left off ALLOWED until it does; adding them back is an adapter
-//     function plus a line below.
-//
-//   Airtime      MySubWallet | CashBuddy | ClubKonnect
-//   Data         MySubWallet | ClubKonnect
-//   Cable TV     MySubWallet | ClubKonnect
-//   Electricity  MySubWallet
-//
-// A stored setting that names a provider no longer registered (old
-// `bills_provider_*` rows can still say "pairgate"), or one this rail may not
-// use, reads as unknown and resolves to the default - no data migration is
-// needed for a switchover.
+// A stored setting that names a provider no longer registered (the live
+// `bills_provider_*` rows still say "pairgate") reads as unknown and resolves
+// to the default below - no data migration is needed for the switchover.
 //
 // Four settings rows, one per rail:
 //   bills_provider_airtime | bills_provider_data
@@ -52,16 +38,10 @@
 // so re-sending it to the other upstream risks paying for two. A failure
 // refunds the customer and raises the ops alert, as it always has, and an admin
 // decides whether the rail moves.
-//
-// **The switch decides new purchases only.** A bill already sold is settled by
-// the provider named in its own row (`meta.gateway`, read through adapterFor),
-// whatever the switch says now - so a rail can move with bills in flight.
 const prisma = require('../../database/prisma');
 const redis = require('../services/redis.service');
 
 const mysubwallet = require('./mysubwallet.service');
-const clubkonnect = require('./clubkonnect.service');
-const cashbuddy = require('./cashbuddy.service');
 
 const TTL = Number(process.env.BILLS_PROVIDER_TTL_SECONDS || 30);
 
@@ -76,7 +56,7 @@ const SERVICES = {
 
 // The adapters. Every one exports the same surface - see the header of
 // mysubwallet.service.js - which is what lets bills.controller stay ignorant of
-// which is answering. Each also declares the rails it implements (`SERVICES`).
+// which is answering.
 //
 // **A name in here is also a gateway the sweep asks about.** billReconcile
 // settles only rows whose `meta.gateway` is a key of this object, so removing a
@@ -84,46 +64,15 @@ const SERVICES = {
 // settled, never refunded. Check for open rows before removing one.
 const ADAPTERS = {
   mysubwallet,
-  clubkonnect,
-  cashbuddy,
 };
 
 const PROVIDER_LABELS = {
   mysubwallet: 'MySubWallet',
-  clubkonnect: 'ClubKonnect',
-  cashbuddy: 'CashBuddy',
 };
 
 // The answer when a setting is missing, unreadable, or names a provider that is
 // no longer usable - including one that has since been removed from ADAPTERS.
 const DEFAULT_PROVIDER = 'mysubwallet';
-
-// The owner's rule, kept apart from ALLOWED on purpose: ALLOWED is a list
-// someone extends when a provider gains a capability, and this must not be
-// extended along with it. "Do NOT offer or route Electricity through
-// ClubKonnect."
-const BARRED = {
-  electricity: ['clubkonnect'],
-};
-
-// Who may serve each rail, in the order the dashboard offers them.
-const ALLOWED = {
-  airtime: ['mysubwallet', 'cashbuddy', 'clubkonnect'],
-  data: ['mysubwallet', 'clubkonnect'],
-  tv: ['mysubwallet', 'clubkonnect'],
-  electricity: ['mysubwallet'],
-};
-
-// Why a registered provider is missing from a rail. Shown beside the switch so
-// a gap reads as a decision with a reason, not as a bug.
-const NOT_OFFERED = {
-  data: { cashbuddy: 'CashBuddy publishes no data-plan list, so a bundle cannot be priced' },
-  tv: { cashbuddy: 'CashBuddy publishes no bouquet list or smartcard lookup' },
-  electricity: {
-    clubkonnect: 'Barred: electricity is never routed through ClubKonnect',
-    cashbuddy: 'CashBuddy publishes no meter lookup, so the meter owner cannot be confirmed',
-  },
-};
 
 function settingKey(service) {
   return `bills_provider_${service}`;
@@ -138,50 +87,6 @@ function isKnownProvider(name) {
 }
 
 /**
- * May this provider serve this rail at all?
- *
- * Three locks, all of which must open: not barred by policy, on the rail's
- * allow-list, and actually implemented by the adapter. Credentials are a
- * separate question - see isProviderConfigured.
- */
-function isAllowed(service, name) {
-  const provider = String(name ?? '');
-  if (!isKnownService(service) || !isKnownProvider(provider)) return false;
-  if ((BARRED[service] || []).includes(provider)) return false;
-  if (!(ALLOWED[service] || []).includes(provider)) return false;
-  const implemented = ADAPTERS[provider].SERVICES;
-  return Array.isArray(implemented) && implemented.includes(service);
-}
-
-/** The reason a provider is not offered on a rail, or '' when it is. */
-function notOfferedReason(service, name) {
-  if (isAllowed(service, name)) return '';
-  const label = PROVIDER_LABELS[name] || name;
-  return NOT_OFFERED[service]?.[name] || `${label} does not serve ${SERVICES[service] || service}`;
-}
-
-/**
- * Which credentials a provider has, by env var NAME - never a value.
- *
- * `missing` is what a superadmin has to set; `problems` is anything set but
- * unusable, such as a sandbox key on production.
- */
-function configStatus(name) {
-  const adapter = ADAPTERS[name];
-  if (!adapter) return { configured: false, missing: [], problems: ['Not a registered provider'] };
-  if (typeof adapter.configStatus === 'function') {
-    const status = adapter.configStatus();
-    return {
-      configured: Boolean(status?.configured),
-      missing: Array.isArray(status?.missing) ? status.missing : [],
-      problems: Array.isArray(status?.problems) ? status.problems : [],
-    };
-  }
-  const configured = typeof adapter.isConfigured === 'function' ? adapter.isConfigured() : true;
-  return { configured, missing: [], problems: [] };
-}
-
-/**
  * Is this provider usable at all right now?
  *
  * Credentials only - it does not call anyone. A provider whose keys are absent
@@ -189,7 +94,12 @@ function configStatus(name) {
  * that rail into a refund.
  */
 function isProviderConfigured(name) {
-  return configStatus(name).configured;
+  const adapter = ADAPTERS[name];
+  if (!adapter) return false;
+  // Every adapter answers this. One added later without it is assumed
+  // usable rather than assumed broken - its own request path still throws on a
+  // missing key, so the failure surfaces either way.
+  return typeof adapter.isConfigured === 'function' ? adapter.isConfigured() : true;
 }
 
 function normalizeProvider(value) {
@@ -201,11 +111,11 @@ function normalizeProvider(value) {
  * The provider name for one rail.
  *
  * Cached, and every failure path lands on DEFAULT_PROVIDER: an unreadable
- * setting, an unknown name left behind by an older deploy, a provider this rail
- * may not use, or a provider whose credentials have since been removed. The
- * last one is the important one - an admin can switch to a provider and someone
- * can later rotate the key out of the environment, and this keeps the rail
- * selling rather than refunding every order until somebody notices.
+ * setting, an unknown name left behind by an older deploy, or a provider whose
+ * credentials have since been removed. The last one is the important one - an
+ * admin can switch to a provider and someone can later rotate the key out of
+ * the environment, and this keeps the rail selling rather than refunding every
+ * order until somebody notices.
  */
 async function getProviderName(service) {
   if (!isKnownService(service)) return DEFAULT_PROVIDER;
@@ -232,13 +142,6 @@ async function getProviderName(service) {
 
   if (!chosen) return DEFAULT_PROVIDER;
 
-  // A row written before an allow-list existed, or by hand. setProvider would
-  // never write it, so it is ignored rather than obeyed.
-  if (!isAllowed(service, chosen)) {
-    console.warn('billsProvider: selected provider may not serve this rail, using default', { service, chosen });
-    return DEFAULT_PROVIDER;
-  }
-
   if (!isProviderConfigured(chosen)) {
     console.warn('billsProvider: selected provider is not configured, using default', { service, chosen });
     return DEFAULT_PROVIDER;
@@ -247,13 +150,7 @@ async function getProviderName(service) {
   return chosen;
 }
 
-/**
- * The adapter for a provider name. Falls back rather than returning undefined.
- *
- * Deliberately not filtered by the allow-list: this is also how a bill already
- * sold is settled, and that must ask the provider that sold it - even one an
- * admin has since moved the rail away from.
- */
+/** The adapter for a provider name. Falls back rather than returning undefined. */
 function adapterFor(name) {
   return ADAPTERS[normalizeProvider(name) || DEFAULT_PROVIDER] || ADAPTERS[DEFAULT_PROVIDER];
 }
@@ -273,64 +170,13 @@ async function resolve(service) {
 }
 
 /**
- * Resolve a rail for a Bill Hero reward.
- *
- * A reward is sent under a reference we mint, and a send that is cut off is
- * later asked about by that reference - "not found" there means it never
- * arrived, and the reward is sent again. That reasoning only holds on an
- * upstream that receives our reference. CashBuddy does not (it has no field for
- * one), so "not found" from it proves nothing and a re-send could deliver a
- * reward twice. A rail switched to such a provider sends rewards through the
- * default instead.
- */
-async function resolveForRewards(service) {
-  const resolved = await resolve(service);
-  if (resolved.provider.SUPPORTS_REQUEST_ID_LOOKUP) return resolved;
-  return { name: DEFAULT_PROVIDER, provider: adapterFor(DEFAULT_PROVIDER) };
-}
-
-/**
- * Refuse a provider that refuses us.
- *
- * Set is not the same as accepted. ClubKonnect answers a wrong key - and a
- * server IP missing from its whitelist - with INVALID_CREDENTIALS, and a rail
- * switched to it anyway showed customers an empty plan list while every read
- * and purchase on it failed. So one authenticated read is made first, and a
- * definite rejection (`misconfigured`) stops the switch with the provider's own
- * word for it. Anything else - slow, down, unreachable - does not: the switch
- * exists for incidents, and a provider having a bad minute is no reason to
- * forbid one. The default is never asked; it is where every failure already
- * falls back to.
- */
-async function assertCredentialsAccepted(name) {
-  const adapter = ADAPTERS[name];
-  if (name === DEFAULT_PROVIDER || typeof adapter.verifyCredentials !== 'function') return;
-
-  try {
-    await adapter.verifyCredentials();
-  } catch (e) {
-    if (!e?.misconfigured) return;
-    // Their wording names the refusal ("INVALID_CREDENTIALS"); it carries no
-    // secret, and a superadmin needs it to know which thing to fix.
-    const said = String(e.providerMessage || '').trim().slice(0, 160);
-    const err = new Error(
-      [`${PROVIDER_LABELS[name]} refused our credentials${said ? ` (${said})` : ''}.`, adapter.CREDENTIAL_HINT]
-        .filter(Boolean)
-        .join(' ')
-    );
-    err.code = 'PROVIDER_REJECTED_CREDENTIALS';
-    throw err;
-  }
-}
-
-/**
  * Point a rail at a provider.
  *
- * Refuses a provider the rail may not use, and an unconfigured one. The read
- * path silently falls back for both, but that is a safety net for a row written
- * some other way or a key rotated out from under a working switch - at the
- * moment an admin is actually choosing, a rejection with a reason is far more
- * useful than a switch that appears to work and quietly does nothing.
+ * Refuses an unconfigured provider outright. The read path silently falls back
+ * for the same case, but that is a safety net for a key rotated out from under
+ * a working switch - at the moment an admin is actually choosing, a rejection
+ * with a reason is far more useful than a switch that appears to work and
+ * quietly does nothing.
  */
 async function setProvider(service, name) {
   if (!isKnownService(service)) {
@@ -346,21 +192,11 @@ async function setProvider(service, name) {
     throw err;
   }
 
-  if (!isAllowed(service, chosen)) {
-    const err = new Error(`${PROVIDER_LABELS[chosen]} cannot serve ${SERVICES[service]}: ${notOfferedReason(service, chosen)}`);
-    err.code = 'PROVIDER_NOT_ALLOWED';
-    throw err;
-  }
-
-  const status = configStatus(chosen);
-  if (!status.configured) {
-    const detail = [...status.missing.map(v => `${v} is not set`), ...status.problems].join('; ');
-    const err = new Error(`${PROVIDER_LABELS[chosen]} is not configured${detail ? ` (${detail})` : ''}`);
+  if (!isProviderConfigured(chosen)) {
+    const err = new Error(`${PROVIDER_LABELS[chosen]} has no API credentials configured`);
     err.code = 'PROVIDER_NOT_CONFIGURED';
     throw err;
   }
-
-  await assertCredentialsAccepted(chosen);
 
   await prisma.appSetting.upsert({
     where: { setting_key: settingKey(service) },
@@ -376,27 +212,11 @@ async function setProvider(service, name) {
   return { service, provider: chosen };
 }
 
-/** One provider as the dashboard shows it: label, credentials, rails, float. */
-function providerSummary(name) {
-  const status = configStatus(name);
-  return {
-    name,
-    label: PROVIDER_LABELS[name] || name,
-    configured: status.configured,
-    missing: status.missing,
-    problems: status.problems,
-    services: Object.keys(SERVICES).filter(service => isAllowed(service, name)),
-    float_readable: ADAPTERS[name].FLOAT_READABLE !== false,
-  };
-}
-
 /**
  * Every rail and its current provider, for the dashboard.
  *
- * Each rail lists every registered provider as an option, with whether it is
- * allowed there and, when it is not, why - so the dashboard can show a barred
- * or incapable provider as unavailable rather than hiding it. `available`
- * carries each provider's credential status by env var name.
+ * `configured` rides along so the UI can grey out a provider that cannot be
+ * selected instead of letting an admin pick it and read an error afterwards.
  */
 async function listProviders() {
   const services = Object.keys(SERVICES);
@@ -406,14 +226,16 @@ async function listProviders() {
   });
   const byKey = new Map(rows.map(r => [r.setting_key, r.setting_value]));
 
-  const available = Object.keys(ADAPTERS).map(providerSummary);
-  const byName = new Map(available.map(p => [p.name, p]));
+  const available = Object.keys(ADAPTERS).map(name => ({
+    name,
+    label: PROVIDER_LABELS[name] || name,
+    configured: isProviderConfigured(name),
+  }));
 
   return {
     services: services.map(service => {
       const stored = normalizeProvider(byKey.get(settingKey(service)));
-      const effective =
-        stored && isAllowed(service, stored) && isProviderConfigured(stored) ? stored : DEFAULT_PROVIDER;
+      const effective = stored && isProviderConfigured(stored) ? stored : DEFAULT_PROVIDER;
       return {
         service,
         label: SERVICES[service],
@@ -422,14 +244,6 @@ async function listProviders() {
         // it was set to, rather than silently showing the fallback as if it had
         // been chosen.
         fallback: Boolean(stored) && stored !== effective,
-        stored: stored || null,
-        options: Object.keys(ADAPTERS).map(name => ({
-          name,
-          label: PROVIDER_LABELS[name] || name,
-          allowed: isAllowed(service, name),
-          configured: byName.get(name).configured,
-          reason: notOfferedReason(service, name),
-        })),
       };
     }),
     available,
@@ -439,24 +253,16 @@ async function listProviders() {
 
 module.exports = {
   resolve,
-  // The name the multi-provider brief uses for the same thing.
-  resolveBillProvider: resolve,
-  resolveForRewards,
   getProviderName,
   adapterFor,
   setProvider,
   listProviders,
   isProviderConfigured,
-  configStatus,
-  isAllowed,
-  notOfferedReason,
   isKnownService,
   isKnownProvider,
   SERVICES,
   ADAPTERS,
   PROVIDER_LABELS,
   DEFAULT_PROVIDER,
-  ALLOWED,
-  BARRED,
   __test: { settingKey, normalizeProvider },
 };

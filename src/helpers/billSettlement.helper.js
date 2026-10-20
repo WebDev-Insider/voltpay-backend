@@ -41,23 +41,13 @@ function needsToken(meta) {
   return meta.service === 'electricity' && String(meta.meter_type || '').toLowerCase() === 'prepaid';
 }
 
-/**
- * The row a provider reference belongs to, or null.
- *
- * Pass `gateway` whenever it is known. References are each provider's own
- * namespace - a ClubKonnect order id and a CashBuddy reference can be the same
- * string - so an unscoped lookup could hand one provider's answer to another
- * provider's bill.
- */
-async function findByProviderReference(referenceCode, gateway = null) {
+/** The row a provider reference belongs to, or null. */
+async function findByProviderReference(referenceCode) {
   const ref = String(referenceCode || '').trim();
   if (!ref) return null;
 
-  const byReference = { meta: { path: ['provider_reference'], equals: ref } };
   return prisma.walletTransaction.findFirst({
-    where: gateway
-      ? { AND: [byReference, { meta: { path: ['gateway'], equals: String(gateway) } }] }
-      : byReference,
+    where: { meta: { path: ['provider_reference'], equals: ref } },
   });
 }
 

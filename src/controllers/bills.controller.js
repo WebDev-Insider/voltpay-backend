@@ -13,11 +13,11 @@
 // price would let anyone buy a 20,000 naira bundle for 100.
 //
 // **The four rails are served through the provider registry** - see
-// funding/billsProvider.js. Three upstreams are registered (MySubWallet,
-// ClubKonnect, CashBuddy), each allowed on only some rails, and nothing below
-// knows which one answered: every provider module exports the same surface,
-// and this file goes through `bills.resolve(service)` rather than importing one
-// directly. Three rules keep that honest:
+// funding/billsProvider.js. MySubWallet is the only upstream registered today,
+// but nothing below knows which one answered: every provider module exports the
+// same surface, and this file goes through `bills.resolve(service)` rather than
+// importing one directly. Three rules keep that honest, and they matter the day
+// a second provider is registered again:
 //
 //   1. **Resolve once per request, then carry it.** A quote and its confirm can
 //      straddle an admin switch, so re-resolving mid-flow would price against
@@ -48,7 +48,7 @@ const { logMoneyEvent } = require('../services/userAudit.service');
 const { checkVelocity } = require('../helpers/velocity.helper');
 const alerts = require('../services/alerts.service');
 const settlement = require('../helpers/billSettlement.helper');
-const { reconcile, recipientIndex } = require('../helpers/billReconcile.helper');
+const { reconcile } = require('../helpers/billReconcile.helper');
 const { durationBucket, stripDuration, BUCKET_ORDER, BUCKET_LABELS } = require('../funding/planDuration');
 
 // VoltPay's own floors. They sit above the provider's where we want them to and
@@ -139,10 +139,9 @@ function providerFail(res, e, fallbackMessage, gateway = bills.DEFAULT_PROVIDER)
     return fail(res, 503, 'provider_unavailable', 'This service is briefly unavailable. Please try again shortly.');
   }
   // The adapter names its payload after itself so a log line says which
-  // provider spoke - `e.mysubwallet`, `e.clubkonnect`, `e.cashbuddy`. It is
-  // trimmed to status and message in the adapter: the raw body can carry our
-  // float balance, which no customer needs to see.
-  const payload = e?.[gateway] ?? e?.mysubwallet ?? null;
+  // provider spoke. It is trimmed to status and message in the adapter: the
+  // raw body can carry our float balance, which no customer needs to see.
+  const payload = e?.mysubwallet ?? null;
   return fail(res, e?.statusCode || 502, 'provider_error', e?.message || fallbackMessage, payload);
 }
 
@@ -675,9 +674,6 @@ async function dispatch(upstream, pending, reference) {
       number: pending.smartcard,
       code: pending.code,
       customerName: pending.customer_name,
-      // ClubKonnect's purchase names the subscriber's phone; MySubWallet's has
-      // no field for it and ignores it.
-      phone: pending.phone_local,
       reference,
     });
   }
@@ -705,40 +701,6 @@ function detailsFor(pending) {
   }
   if (pending.service === 'tv') return `${pending.provider} - ${pending.item_name} - ${pending.smartcard}`;
   return `${pending.provider} ${pending.meter_type} - ${pending.meter_number}`;
-}
-
-// Who or what the purchase is for: the number a history match is made on.
-function recipientFor(pending) {
-  if (pending.service === 'tv') return pending.smartcard;
-  if (pending.service === 'electricity') return pending.meter_number;
-  return pending.phone_local;
-}
-
-/**
- * The fields that let a purchase the provider has not confirmed be settled on
- * evidence. `unconfirmed` stays true until the provider hands back a reference
- * of its own, and billReconcile works the row until it does or plainly never
- * will:
- *
- *   - an upstream that cannot be asked about our reference at all (CashBuddy)
- *     is searched by what the purchase was - recipient (a blind index: `meta`
- *     is not encrypted) and amount;
- *   - one that names every order it holds (ClubKonnect, `isOrderId`) is asked
- *     by our RequestID until an order turns up.
- *
- * Every other upstream (MySubWallet) is keyed on our own reference throughout
- * and needs none of this.
- */
-function trackingFields(upstream, pending, amount, { unconfirmed }) {
-  if (!upstream.SUPPORTS_REQUEST_ID_LOOKUP) {
-    return {
-      unconfirmed,
-      recipient_idx: recipientIndex(pending.service, recipientFor(pending)),
-      vend_amount: amount,
-    };
-  }
-  if (typeof upstream.isOrderId === 'function') return { unconfirmed };
-  return {};
 }
 
 /**
@@ -783,14 +745,6 @@ async function executePurchase({
   auditExtra = null,
   withinReserve = null,
 }) {
-  // The last lock on the allow-list, before any money moves. Every caller
-  // resolved `gateway` through billsProvider, so this cannot fire on a path
-  // that works - it is here so that a path that does not (electricity on
-  // ClubKonnect, say) fails loudly with nothing reserved.
-  if (!bills.isAllowed(pending.service, gateway)) {
-    throw Object.assign(new Error(`${gateway} may not serve ${pending.service}`), { code: 'PROVIDER_NOT_ALLOWED' });
-  }
-
   const amount = Number(pending.amount);
   const total = Number(pending.total ?? amount);
   const trx = generateTrx(service.trxPrefix);
@@ -854,10 +808,6 @@ async function executePurchase({
             // how it knows the bill is prepaid - even on a row whose request
             // died before the post-vend update below.
             meter_type: pending.service === 'electricity' ? pending.meter_type : undefined,
-            // Unconfirmed from the start wherever that applies, for the same
-            // reason: a request that dies mid-vend must still leave a row the
-            // sweep can find the order for.
-            ...trackingFields(upstream, pending, amount, { unconfirmed: true }),
             ...extra,
           },
         },
@@ -882,20 +832,6 @@ async function executePurchase({
   // differences between purchase responses stay there.
   const vend = upstream.parseVendResult(providerResponse);
   const providerRef = vend.reference || vend.order_no;
-
-  // Accepted but parked for want of float (ClubKonnect's 412,
-  // INSUFFICIENT_APIAMOUNT). The bill waits on it, so whoever tops the float up
-  // is paged now - not an hour later by the stuck-bills sweep.
-  if (vend.float_hold) {
-    alerts.paymentFailure({
-      provider: gateway,
-      action: 'float',
-      reference: trx,
-      userId,
-      amount: total,
-      message: `${bills.PROVIDER_LABELS[gateway] || gateway} put a purchase on hold for float - top it up`,
-    });
-  }
   // Normally here for prepaid electricity, but not on a vend the provider
   // accepted as pending - that one fills in later. Either way the receipt
   // shape is the same before and after.
@@ -980,9 +916,6 @@ async function executePurchase({
         price_drift: priceDrift ?? undefined,
         token,
         units,
-        // Still unconfirmed when their answer was lost or carried no
-        // reference of theirs - billReconcile then settles it on evidence.
-        ...trackingFields(upstream, pending, amount, { unconfirmed: processing && (vend.unconfirmed === true || !providerRef) }),
         ...extra,
       },
     },
@@ -998,7 +931,6 @@ async function executePurchase({
     amount: total,
     extra: {
       provider: pending.provider || null,
-      gateway,
       provider_reference: providerRef || null,
       status: processing ? 'processing' : 'successful',
       ...(auditExtra && typeof auditExtra === 'object' ? auditExtra : {}),
@@ -1111,9 +1043,7 @@ async function confirm(req, res) {
       res,
       `${service.key}_success`,
       result.processing
-        ? service.key === 'electricity'
-          ? 'Payment is processing. Your token will appear shortly.'
-          : 'Payment is processing. We will confirm it shortly.'
+        ? 'Payment is processing. Your token will appear shortly.'
         : `${service.title} purchase successful`,
       {
         service: service.key,

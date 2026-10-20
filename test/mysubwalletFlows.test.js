@@ -271,6 +271,25 @@ function seed() {
   assert.strictEqual(spy.outcomes[0].status, 'successful');
   assert.strictEqual(spy.outcomes[0].token, '1111-2222-3333-4444-5555', 'a requery can finish a receipt on its own');
 
+  // Found by our own request-id, the reference is stamped BEFORE settlement.
+  // Stamped after, from the copy read first, the write put a settled row back
+  // to "processing" and dropped its token - and a refunded one stayed
+  // "Processing" for good. Settlement writes to the row here, as the real one
+  // does, so the order of the two writes is what is under test.
+  db.ledger.push({ trx: 'ele_9', user_id: 7, trx_type: '-', remark: 'utility_bill', amount: '1000.00', meta: { gateway: 'mysubwallet', service: 'electricity', bill_status: 'processing' }, other_data: {} });
+  route('GET', '/api/requery/ele_9', requeryAnswer('success', { token: '9999-8888-7777-6666-5555' }));
+  spy.respond = args => {
+    const settled = db.ledger.find(r => r.trx === args.trx);
+    settled.meta = { ...settled.meta, bill_status: 'successful', token: args.token };
+    return { applied: true };
+  };
+  await reconcile(aged(db.ledger.find(r => r.trx === 'ele_9')), { minAgeMs: 0 });
+  spy.respond = null;
+  const settledRow = db.ledger.find(r => r.trx === 'ele_9');
+  assert.strictEqual(settledRow.meta.bill_status, 'successful', 'the stamp never undoes the settlement');
+  assert.strictEqual(settledRow.meta.token, '9999-8888-7777-6666-5555', 'nor drops the token');
+  assert.strictEqual(settledRow.meta.provider_reference, 'ele_9', 'and the reference is kept for the next requery');
+
   // A betting row is never the bills sweep's: Payvessel's is another gateway
   // outright, and one on a bills gateway is still excluded by remark.
   const bettingRow = aged(db.ledger.find(r => r.trx === 'bet_1'));

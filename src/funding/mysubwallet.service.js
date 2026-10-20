@@ -140,14 +140,6 @@ function isConfigured() {
   return Boolean(apiKey()) && !sandboxForbidden();
 }
 
-// The same answer, itemised for the dashboard: which env var is missing, and
-// what is set but unusable. Names only - never a value.
-function configStatus() {
-  const missing = apiKey() ? [] : ['MYSUBWALLET_API_KEY'];
-  const problems = sandboxForbidden() ? ['A sandbox key or host is set on a production deployment'] : [];
-  return { configured: isConfigured(), missing, problems };
-}
-
 /* -------------------------------------------------------------------- errors */
 
 const UNAVAILABLE = 'This service is briefly unavailable. Please try again shortly.';
@@ -1700,14 +1692,11 @@ async function warmCatalogues({ force = false, lockMs = REFRESH_LOCK_MS } = {}) 
 }
 
 module.exports = {
-  // Every rail. billsProvider routes a rail here only if it is listed.
-  SERVICES: ['airtime', 'data', 'tv', 'electricity'],
   MIN_AMOUNTS,
   // The requery is keyed on our own request-id, so a vend whose response was
   // lost in flight can still be asked about - see billReconcile.helper.
   SUPPORTS_REQUEST_ID_LOOKUP: true,
   isConfigured,
-  configStatus,
   isSandbox,
   // account
   getWalletBalance,
