@@ -578,6 +578,21 @@ initNotificationWs(server);
   if (virtualCardSweepTimer && typeof virtualCardSweepTimer.unref === 'function') virtualCardSweepTimer.unref();
 }
 
+// PalmPay accounts PaymentPoint is still opening, or opened after its create
+// call stopped waiting. PaymentPoint's webhook finishes most of them and the
+// customer's next tap the rest; this is the part that needs neither. It tells
+// a customer whose own retry would finish it (their NIN is never stored, so
+// only they can send it again) and pages ops about any attempt nothing has
+// resolved, once each. See sweepPendingAccounts() in funding.controller.
+{
+  const { sweepPendingAccounts } = require('./src/funding/funding.controller');
+  const fundingAccountSweepTimer = setInterval(
+    () => sweepPendingAccounts().catch(e => captureError('funding.va_sweep', e)),
+    Number(process.env.FUNDING_VA_SWEEP_INTERVAL_MS || 5 * 60_000)
+  );
+  if (fundingAccountSweepTimer && typeof fundingAccountSweepTimer.unref === 'function') fundingAccountSweepTimer.unref();
+}
+
 // Provider catalogues - data plans, TV bouquets, DISCO lists - are what the
 // bills screen renders, and the upstream's rate budget is shared with live
 // vending. Loading them on demand means the customer who arrives on a cold

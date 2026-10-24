@@ -82,16 +82,19 @@ function dateRange(from, to) {
 //   ppcust_ - a PaymentPoint virtual account REGISTRATION. One per user, status
 //             'virtual_account', credited_at null forever by design. Counting
 //             these as stuck credits would list every customer on the platform.
+//   ppreq_  - the same registration while PaymentPoint has not yet named a
+//             customer for it (a pending attempt). Renamed to ppcust_ later.
 //   spva_   - the StaffPay company equivalent, same story.
 //
 // Getting this wrong is the difference between a queue somebody works and a
 // screen nobody opens twice.
-const REGISTRATION_PREFIXES = ['ppcust_', 'spva_'];
+const REGISTRATION_PREFIXES = ['ppcust_', 'ppreq_', 'spva_'];
 const REGISTRATION_STATUS = 'virtual_account';
 
 const PROVIDER_BY_PREFIX = [
   { prefix: 'pp_', provider: 'paymentpoint' },
   { prefix: 'ppcust_', provider: 'paymentpoint' },
+  { prefix: 'ppreq_', provider: 'paymentpoint' },
   { prefix: 'spfund_', provider: 'paystack' },
   { prefix: 'spva_', provider: 'paystack' },
   { prefix: 'flw_', provider: 'flutterwave' },

@@ -1,11 +1,15 @@
+const crypto = require('crypto');
+
 const prisma = require('../../database/prisma');
 const { Prisma } = require('@prisma/client');
 
 const paymentpoint = require('./paymentpoint.service');
 const { applyBalanceDelta } = require('../helpers/balance.helper');
 const { revealUserFields, reveal, blindIndex, protectText, revealText } = require('../helpers/pii.helper');
+const { isDeleted } = require('../helpers/accountStatus.helper');
+const { normalizeNgPhone } = require('../helpers/phone.helper');
 const { notifyUser } = require('../services/notify.service');
-const { securityEvent } = require('../services/alerts.service');
+const { securityEvent, paymentFailure } = require('../services/alerts.service');
 const cache = require('../services/cache.service');
 const redis = require('../services/redis.service');
 
@@ -88,6 +92,42 @@ function normalizeAmountToDecimal(amount) {
   const n = Number(cleaned);
   if (!Number.isFinite(n) || n <= 0) return null;
   return new Prisma.Decimal(n.toFixed(2));
+}
+
+// Any of these makes a webhook a payment, whatever its amount. An account
+// event is read only from a body with none of them: a payment's envelope can
+// carry the SENDER's account number, and showing that as the customer's own
+// would send their transfers to a stranger.
+const PAYMENT_KEYS = [
+  'amount',
+  'amount_paid',
+  'amountPaid',
+  'settlement_amount',
+  'settlementAmount',
+  'transaction_amount',
+  'transactionAmount',
+  'transaction_id',
+  'transactionId',
+  'transaction',
+  'transaction_status',
+  'sender',
+];
+
+function looksLikePayment(body) {
+  return Boolean(body) && typeof body === 'object' && PAYMENT_KEYS.some(k => body[k] != null);
+}
+
+/** What the sender paid, or null. */
+function grossAmountOf(payload) {
+  return normalizeAmountToDecimal(
+    payload?.amount_paid ??
+      payload?.amountPaid ??
+      payload?.amount ??
+      payload?.transaction_amount ??
+      payload?.transactionAmount ??
+      payload?.transaction?.amount ??
+      payload?.transaction?.transaction_amount
+  );
 }
 
 /**
@@ -179,9 +219,33 @@ function cleanNin(value) {
 // Rows written now are normalised (`provider`, `account_number`,
 // `account_name_enc`, `nin_idx`); rows written before that hold PaymentPoint's
 // raw response, and are read as they are, never rewritten.
+//
+// The row is written BEFORE PaymentPoint is asked, as a pending attempt
+// (`raw_payload.state: 'pending'`, tx_ref `ppreq_...` until PaymentPoint names
+// a customer). Until 2026-10-24 it was written after, and only if the answer
+// parsed: an 8s timeout, a restart mid-call or an unfamiliar response shape
+// left PaymentPoint holding a permanent account that nothing here knew about.
+// Now every outcome lands on a row:
+//
+//   account in the answer      -> the same row becomes the registration
+//   accepted, no account yet   -> pending, keyed ppcust_<id> for the webhook
+//   timeout / 5xx / unreadable -> pending: it may exist; ask again after a hold
+//   "already exists"           -> pending, ops paged: it exists, we lack it
+//   a refusal of the request   -> a first attempt's row is deleted, the
+//                                 customer reads why; a repeat keeps the row
+//
+// A pending row is finished by PaymentPoint's webhook (an account event, or a
+// payment that names the customer), by the customer's next tap after the hold,
+// or by `npm run funding:reconcile` from PaymentPoint's own export. It keeps
+// the NIN claimed, and blind indexes of the email and phone that were sent -
+// what PaymentPoint echoes back - so a late event can be matched to it.
+// Every write to one of these rows is guarded on its updated_at: the request,
+// the webhook and the sweep can all reach the same row.
 
 const REGISTRATION_STATUS = 'virtual_account';
 const PROVIDER = 'paymentpoint';
+const PENDING = 'pending';
+const ATTEMPT_PREFIX = 'ppreq_';
 
 function paymentPointConfigured() {
   return ['PAYMENTPOINT_API_KEY', 'PAYMENTPOINT_SECRET_KEY', 'PAYMENTPOINT_BUSINESS_ID'].every(name =>
@@ -201,8 +265,13 @@ function httpError(statusCode, remark, message) {
  * `bankName` / `accountNumber` / `accountName` are the names every build of the
  * app already reads, so they keep their camelCase.
  */
+function payloadOf(row) {
+  const p = row?.raw_payload;
+  return p && typeof p === 'object' && !Array.isArray(p) ? p : {};
+}
+
 function accountView(row) {
-  const p = row?.raw_payload && typeof row.raw_payload === 'object' ? row.raw_payload : {};
+  const p = payloadOf(row);
 
   if (p.provider === PROVIDER) {
     const accountNumber = String(p.account_number ?? '').trim();
@@ -229,17 +298,238 @@ function accountView(row) {
   };
 }
 
-/** The user's account - the newest registration with a usable one - and its row, or null. */
-async function loadAccount(userId) {
+function isPendingRow(row) {
+  const p = payloadOf(row);
+  return p.provider === PROVIDER && p.state === PENDING && !accountView(row);
+}
+
+/**
+ * The user's registration: `account` - the newest row with a usable account,
+ * and its view - or else the newest `pending` attempt. Never both.
+ */
+async function loadRegistration(userId) {
   const rows = await prisma.fundingTransaction.findMany({
     where: { user_id: Number(userId), status: REGISTRATION_STATUS },
     orderBy: { id: 'desc' },
   });
+  let pending = null;
   for (const row of rows) {
     const view = accountView(row);
-    if (view) return { row, view };
+    if (view) return { account: { row, view }, pending: null };
+    if (!pending && isPendingRow(row)) pending = row;
   }
-  return null;
+  return { account: null, pending };
+}
+
+// ---- writing a registration row ---------------------------------------------
+
+/**
+ * Apply a write to the row as it is now. `plan(row)` returns the data, or
+ * null when the row no longer needs it (somebody else finished it). A lost
+ * race re-reads and re-plans; a write is never applied over one it did not
+ * see. Returns the row as stored afterwards, and whether this call wrote it.
+ */
+async function transition(row, plan) {
+  let current = row;
+  for (let i = 0; i < 4 && current; i += 1) {
+    const data = plan(current);
+    if (!data) return { row: current, changed: false };
+    const won = await prisma.fundingTransaction.updateMany({
+      where: { id: current.id, updated_at: current.updated_at },
+      data,
+    });
+    const fresh = await prisma.fundingTransaction.findUnique({ where: { id: current.id } });
+    if (won.count === 1) return { row: fresh, changed: true };
+    current = fresh;
+  }
+  return { row: current, changed: false };
+}
+
+/**
+ * transition(), moving the row onto `ppcust_<customerId>` - the key the
+ * webhook looks up - in the same write.
+ *
+ * When that key is taken: by the same user's account, this row is redundant
+ * and goes; by the same user's row with no account on it (a legacy
+ * placeholder), that row carries nothing this one lacks and makes way; by
+ * anyone else, it is a conflict for a human, and nothing is written.
+ */
+async function keyAndWrite(row, customerId, plan) {
+  const ref = customerId ? `ppcust_${customerId}` : '';
+  const keyed = r => {
+    const data = plan(r);
+    return data && ref && r.tx_ref !== ref ? { ...data, tx_ref: ref } : data;
+  };
+
+  for (let tries = 0; tries < 2; tries += 1) {
+    try {
+      return await transition(row, keyed);
+    } catch (e) {
+      if (e?.code !== 'P2002' || !ref) throw e;
+    }
+
+    const holder = await prisma.fundingTransaction.findUnique({ where: { tx_ref: ref } });
+    const sameUser = holder && Number(holder.user_id) === Number(row.user_id) && holder.status === REGISTRATION_STATUS;
+    if (sameUser && accountView(holder)) {
+      await dropAttempt(row);
+      return { row: holder, changed: false };
+    }
+    if (!sameUser || tries > 0) {
+      securityEvent('funding.va_conflict', 'Provider returned an account already registered to another user', {
+        user_id: Number(row.user_id),
+        existing_user_id: holder?.user_id ?? null,
+      });
+      return { row, changed: false, conflict: true };
+    }
+    await prisma.fundingTransaction.deleteMany({ where: { id: holder.id, updated_at: holder.updated_at } });
+  }
+  return { row, changed: false };
+}
+
+/** A pending attempt PaymentPoint provably did nothing with. Never a finished row. */
+function dropAttempt(row) {
+  return prisma.fundingTransaction.deleteMany({
+    where: { id: row.id, status: REGISTRATION_STATUS, raw_payload: { path: ['state'], equals: PENDING } },
+  });
+}
+
+function createAttempt(userId, fields) {
+  return prisma.fundingTransaction.create({
+    data: {
+      user_id: Number(userId),
+      tx_ref: `${ATTEMPT_PREFIX}${Number(userId)}_${Date.now().toString(36)}${crypto.randomBytes(3).toString('hex')}`,
+      amount: new Prisma.Decimal('0.00'),
+      currency: 'NGN',
+      status: REGISTRATION_STATUS,
+      raw_payload: { provider: PROVIDER, state: PENDING, customer_id: null, last_outcome: 'sending', ...fields },
+    },
+  });
+}
+
+/**
+ * Make `row` the user's registration for `account`. A row that already shows
+ * an account is left as it is. Returns keyAndWrite's { row, changed, conflict }.
+ */
+function attachAccount(row, { customerId, account }) {
+  const cid = customerId || payloadOf(row).customer_id || '';
+  return keyAndWrite(row, cid, r => {
+    if (accountView(r)) return null;
+    const p = payloadOf(r);
+    return {
+      status: REGISTRATION_STATUS,
+      // Normalised, never the raw response: PaymentPoint's answer carries the
+      // customer's name, email and phone in plain text.
+      raw_payload: {
+        provider: PROVIDER,
+        customer_id: cid || null,
+        bank_code: account.bankCode || parsePaymentPointBankCodes()[0] || '',
+        bank_name: account.bankName || 'PalmPay',
+        account_number: account.accountNumber,
+        account_name_enc: protectText(account.accountName || ''),
+        nin_idx: p.nin_idx ?? null,
+        email_idx: p.email_idx ?? null,
+        phone_idx: p.phone_idx ?? null,
+        requested_at: p.requested_at ?? null,
+        opened_at: new Date().toISOString(),
+      },
+    };
+  });
+}
+
+/**
+ * Record what a send (or an event) left a pending attempt in. `restore` puts
+ * back the binding a refused send overwrote: a send that opened nothing must
+ * not move the NIN claim off the one that might have.
+ */
+async function markPending(row, { outcome, customerId = '', shape = null, restore = null }) {
+  const plan = r => {
+    if (!isPendingRow(r)) return null;
+    const p = payloadOf(r);
+    return {
+      raw_payload: {
+        ...p,
+        ...(restore || {}),
+        customer_id: customerId || p.customer_id || null,
+        last_outcome: outcome,
+        ...(shape ? { shape } : {}),
+      },
+    };
+  };
+  const keyed = await keyAndWrite(row, customerId, plan);
+  // Somebody else's row holds that customer id - raised by keyAndWrite. The
+  // outcome is still this attempt's to record, under its own key.
+  return keyed.conflict ? transition(row, plan) : keyed;
+}
+
+/** Set a timestamp on a pending row, once. */
+function stampOnce(row, field) {
+  return transition(row, r => {
+    const p = payloadOf(r);
+    return isPendingRow(r) && !p[field] ? { raw_payload: { ...p, [field]: new Date().toISOString() } } : null;
+  });
+}
+
+// ---- what a pending attempt shows ------------------------------------------
+
+// How long after a send asking again is held back. Long enough for an account
+// PalmPay is still making to arrive, short enough that a customer whose send
+// truly failed is not left staring at a spinner.
+const retryAfterMs = () => Math.max(30_000, Number(process.env.FUNDING_VA_RETRY_AFTER_MS) || 2 * 60_000);
+// PaymentPoint said it is working on it, or that the account exists: a repeat
+// is unlikely to help, so it waits longer.
+const slowRetryAfterMs = () => Math.max(60_000, Number(process.env.FUNDING_VA_SLOW_RETRY_AFTER_MS) || 15 * 60_000);
+
+const WAITING_ON_PROVIDER = new Set(['provider_pending', 'exists_at_provider']);
+
+function msOf(value, fallback) {
+  const t = value instanceof Date ? value.getTime() : Date.parse(value || '');
+  return Number.isFinite(t) ? t : fallback;
+}
+
+function outcomeOf(row, now = Date.now()) {
+  const p = payloadOf(row);
+  const outcome = String(p.last_outcome || 'sending');
+  // A send nobody finished - the process restarted mid-call - is a timeout.
+  if (outcome === 'sending' && now - msOf(p.last_sent_at, msOf(row.created_at, now)) > ACCOUNT_LOCK_SECONDS * 1000) {
+    return 'timeout';
+  }
+  return outcome;
+}
+
+function holdMsFor(outcome) {
+  if (outcome === 'sending') return ACCOUNT_LOCK_SECONDS * 1000;
+  if (outcome === 'refused' || outcome === 'unavailable') return 0;
+  return WAITING_ON_PROVIDER.has(outcome) ? slowRetryAfterMs() : retryAfterMs();
+}
+
+function pendingMessage(outcome) {
+  switch (outcome) {
+    case 'sending':
+      return 'We are opening your PalmPay account. This usually takes under a minute.';
+    case 'provider_pending':
+      return 'PalmPay is still verifying your details. We will notify you as soon as your account number is ready.';
+    case 'exists_at_provider':
+      return 'Your PalmPay account has been opened and we are linking it to your wallet. We will notify you as soon as it is ready.';
+    case 'refused':
+    case 'unavailable':
+      return 'We could not confirm your PalmPay account yet. Please try again.';
+    default:
+      return 'PalmPay is still confirming your account. This can take a few minutes - we will notify you.';
+  }
+}
+
+/** What the screen draws for a pending attempt, and whether asking again is allowed yet. */
+function pendingView(row, now = Date.now()) {
+  const p = payloadOf(row);
+  const outcome = outcomeOf(row, now);
+  const created = msOf(row.created_at, now);
+  const remaining = Math.max(0, msOf(p.last_sent_at, created) + holdMsFor(outcome) - now);
+  return {
+    since: new Date(msOf(p.requested_at, created)).toISOString(),
+    message: pendingMessage(outcome),
+    can_retry: remaining === 0,
+    retry_in_seconds: Math.ceil(remaining / 1000),
+  };
 }
 
 /**
@@ -339,64 +629,185 @@ function customerIdentity(user) {
   };
 }
 
-async function openPaymentPointAccount(identity, nin) {
-  const bankCodes = parsePaymentPointBankCodes();
-  const { raw } = await paymentpoint.createVirtualAccount({
+function createRequest(identity, nin) {
+  return {
     ...identity,
-    bankCode: bankCodes,
+    bankCode: parsePaymentPointBankCodes(),
     businessId: getPaymentPointBusinessId(),
     idType: 'nin',
     idNumber: nin.nin,
-  });
-
-  const customerId = String(raw?.customer?.customer_id ?? '').trim();
-  const bank = onlyOneAccount(raw?.bankAccounts)[0];
-  const accountNumber = String(bank?.accountNumber ?? bank?.account_number ?? '').trim();
-  if (!customerId || !accountNumber) {
-    throw Object.assign(new Error('PaymentPoint did not return an account number'), { statusCode: 502 });
-  }
-
-  return {
-    tx_ref: `ppcust_${customerId}`,
-    // Normalised rather than the raw response, which carries the customer's
-    // name, email and phone in plain text.
-    payload: {
-      provider: PROVIDER,
-      customer_id: customerId,
-      bank_code: String(bank.bankCode ?? bank.bank_code ?? bankCodes[0] ?? ''),
-      bank_name: String(bank.bankName ?? bank.bank_name ?? 'PalmPay'),
-      account_number: accountNumber,
-      account_name_enc: protectText(String(bank.accountName ?? bank.account_name ?? '')),
-      nin_idx: nin.idx,
-      opened_at: new Date().toISOString(),
-    },
   };
 }
 
-async function saveRegistration(userId, { tx_ref, payload }) {
-  try {
-    await prisma.fundingTransaction.create({
-      data: {
-        user_id: Number(userId),
-        tx_ref,
-        amount: new Prisma.Decimal('0.00'),
-        currency: 'NGN',
-        status: REGISTRATION_STATUS,
-        raw_payload: payload,
-      },
-    });
-  } catch (e) {
-    if (e?.code !== 'P2002') throw e;
-    // PaymentPoint handed back a customer we already hold. Theirs to dedupe,
-    // and fine - unless it is recorded against somebody else.
-    const existing = await prisma.fundingTransaction.findUnique({ where: { tx_ref } });
-    if (existing && Number(existing.user_id) === Number(userId)) return;
-    securityEvent('funding.va_conflict', 'Provider returned an account already registered to another user', {
-      user_id: Number(userId),
-      existing_user_id: existing?.user_id ?? null,
-    });
-    throw httpError(409, 'conflict', 'We could not finish setting up your account. Please contact support.');
+/**
+ * Blind indexes of what this send told PaymentPoint. They are what binds a
+ * late event to this user: PaymentPoint echoes back the email and phone it was
+ * given, and those can since have changed on the account or changed hands.
+ */
+function bindingOf(identity, nin) {
+  return {
+    nin_idx: nin.idx,
+    email_idx: blindIndex(identity.email, 'email'),
+    phone_idx: blindIndex(identity.phoneNumber, 'mobile'),
+  };
+}
+
+/**
+ * What one create call means, as { kind, outcome, customerId, account }:
+ *
+ *   created  an account number came back - in the answer, or even in an
+ *            error body that quotes the existing one
+ *   pending  it may exist, or does: a timeout, a 5xx, an unreadable 2xx, a
+ *            success with no account, or "already exists"
+ *   refused  provably opened nothing: their refusal of the request, our keys,
+ *            their throttle, or a request that never left
+ */
+function classifyCreate({ raw, error, preferBankCode }) {
+  const body = raw || error?.paymentpoint || null;
+  const found = body ? paymentpoint.extractVirtualAccount(body, { preferBankCode }) : { customerId: '', account: null, accounts: 0 };
+  const base = {
+    customerId: found.customerId,
+    account: found.account,
+    accounts: found.accounts,
+    shape: body ? paymentpoint.describeShape(body) : null,
+  };
+
+  if (found.account) return { ...base, kind: 'created', outcome: 'created' };
+  if (!error) return { ...base, kind: 'pending', outcome: found.customerId ? 'provider_pending' : 'no_account' };
+
+  const status = Number(error.statusCode) || 0;
+  if (['timeout', 'network', 'unreadable'].includes(error.kind)) return { ...base, kind: 'pending', outcome: error.kind };
+  if (['config', 'unreachable'].includes(error.kind)) return { ...base, kind: 'refused', outcome: 'unavailable' };
+  // A 5xx or 408 can be their upstream failing after the account was made. An
+  // error without a kind is one we cannot read, so it is assumed the same.
+  if (status >= 500 || status === 408 || (!error.kind && !status)) return { ...base, kind: 'pending', outcome: 'server_error' };
+  if (status === 409 || paymentpoint.isDuplicateWording(error.message, ...(error.providerErrors || []))) {
+    return { ...base, kind: 'pending', outcome: 'exists_at_provider' };
   }
+  return { ...base, kind: 'refused', outcome: [401, 402, 403, 404, 429].includes(status) ? 'unavailable' : 'refused' };
+}
+
+// A provider can quote a NIN, a phone or an email back in its error text.
+function redactReason(text) {
+  return String(text || '')
+    .replace(/[^\s@]+@[^\s@]+/g, '[email]')
+    .replace(/\d{6,}/g, '[digits]')
+    .slice(0, 200);
+}
+
+/**
+ * The trace of one create call: how long it took, what it was taken to mean,
+ * and the shape of the body - key names and counts, never a value. One live
+ * attempt with this line is what shows where PaymentPoint put the account.
+ */
+function logProviderAnswer({ userId, attempt, raw, error, verdict, elapsedMs }) {
+  const line = {
+    user_id: Number(userId),
+    attempt_id: attempt?.id ?? null,
+    elapsed_ms: elapsedMs,
+    verdict: verdict.kind,
+    outcome: verdict.outcome,
+    has_customer_id: Boolean(verdict.customerId),
+    accounts_found: verdict.accounts ?? 0,
+    shape: verdict.shape,
+    ...(error ? { error_kind: error.kind || null, http_status: Number(error.statusCode) || null, reason: redactReason(error.message) } : {}),
+  };
+  (verdict.kind === 'created' ? console.log : console.warn)('funding.virtual_account.provider_answer', line);
+}
+
+/** Ops, once per attempt. Ids only - the provider's words can quote a name. */
+async function pageOpsOnce(row, message, reason) {
+  const stamped = await stampOnce(row, 'alerted_at');
+  if (!stamped.changed) return false;
+  paymentFailure({
+    provider: 'paymentpoint',
+    action: 'virtual_account',
+    reference: stamped.row?.tx_ref || row.tx_ref,
+    userId: row.user_id,
+    message,
+    context: { reason, row_id: row.id },
+  });
+  return true;
+}
+
+const UNRECORDED_ACCOUNT =
+  'PaymentPoint already holds a PalmPay account for this customer that VoltPay never recorded. ' +
+  "Export PaymentPoint's customer list and run: npm run funding:reconcile -- --file <export> --apply";
+
+/**
+ * One send to PaymentPoint for this user - the first, or a repeat on their
+ * pending attempt. Record first, then ask: the row exists before the call, so
+ * an answer lost to a timeout, a restart or a deploy still leaves the attempt
+ * to match a late account to. Returns { refusal } when PaymentPoint refused
+ * the request outright, for the customer to read.
+ */
+async function openAccount({ user, pending, identity, nin }) {
+  const request = createRequest(identity, nin);
+  const binding = bindingOf(identity, nin);
+  const sentAt = new Date().toISOString();
+  const before = payloadOf(pending);
+  const previous = pending ? { nin_idx: before.nin_idx ?? null, email_idx: before.email_idx ?? null, phone_idx: before.phone_idx ?? null } : null;
+
+  let attempt;
+  if (pending) {
+    const touched = await transition(pending, r =>
+      isPendingRow(r)
+        ? {
+            raw_payload: {
+              ...payloadOf(r),
+              ...binding,
+              last_sent_at: sentAt,
+              last_outcome: 'sending',
+              sends: Number(payloadOf(r).sends || 0) + 1,
+              nudged_at: null,
+            },
+          }
+        : null,
+    );
+    // Finished meanwhile - a webhook brought the account - so nothing to ask.
+    if (!touched.changed) return {};
+    attempt = touched.row;
+  } else {
+    attempt = await createAttempt(user.id, { ...binding, requested_at: sentAt, last_sent_at: sentAt, sends: 1 });
+  }
+
+  const started = Date.now();
+  let raw = null;
+  let error = null;
+  try {
+    ({ raw } = await paymentpoint.createVirtualAccount(request));
+  } catch (e) {
+    error = e;
+  }
+  const verdict = classifyCreate({ raw, error, preferBankCode: request.bankCode[0] });
+  logProviderAnswer({ userId: user.id, attempt, raw, error, verdict, elapsedMs: Date.now() - started });
+
+  if (verdict.kind === 'created') {
+    const out = await attachAccount(attempt, { customerId: verdict.customerId, account: verdict.account });
+    if (out.conflict) {
+      await dropAttempt(attempt);
+      throw httpError(409, 'conflict', 'We could not finish setting up your account. Please contact support.');
+    }
+    return {};
+  }
+
+  if (verdict.kind === 'refused') {
+    // This send opened nothing. A first attempt leaves nothing behind; a
+    // repeat keeps the row, because the earlier send's outcome is still open.
+    if (pending) await markPending(attempt, { outcome: verdict.outcome, restore: previous });
+    else await dropAttempt(attempt);
+    return { refusal: error };
+  }
+
+  const marked = await markPending(attempt, {
+    outcome: verdict.outcome,
+    customerId: verdict.customerId,
+    shape: verdict.shape,
+  });
+  if (verdict.outcome === 'exists_at_provider') {
+    await pageOpsOnce(marked.row || attempt, UNRECORDED_ACCOUNT, verdict.outcome);
+  }
+  return {};
 }
 
 // Opening an account calls PaymentPoint once and cannot be undone, so two
@@ -436,23 +847,48 @@ async function withAccountLock(userId, fn) {
 
 /** Everything the Fund Account screen draws, in one payload. */
 async function accountState(user) {
-  const [account, slip] = await Promise.all([loadAccount(user.id), approvedSlip(user.id)]);
+  const [reg, slip] = await Promise.all([loadRegistration(user.id), approvedSlip(user.id)]);
+  const pending = !reg.account && reg.pending ? pendingView(reg.pending) : null;
   return {
     // The shape every build of the app reads: one card per entry in
     // `bankAccounts`, and `nin_required` to decide whether to ask for a NIN.
     provider: PROVIDER,
     customer: null,
-    bankAccounts: account ? [account.view] : [],
+    bankAccounts: reg.account ? [reg.account.view] : [],
     nin_required: !slip,
     nin_on_file: Boolean(slip),
     // False when the server has no PaymentPoint keys, so the screen can say
     // so instead of offering a button that can only fail.
     available: paymentPointConfigured(),
+    // 'ready' | 'pending' | 'none'. An older app ignores both and sees an
+    // empty `bankAccounts` while pending; its tap is answered account_pending.
+    account_status: reg.account ? 'ready' : pending ? 'pending' : 'none',
+    pending,
   };
 }
 
 function sendState(res, state, message) {
   return res.json({ remark: 'virtual_account', status: 'success', message: [message], data: state });
+}
+
+/**
+ * "Still being set up" - for a tap the hold refuses, or a send whose answer
+ * left it pending. A 4xx on purpose: every installed build shows a 4xx's
+ * message, while a 2xx other than 200 printed the raw map. The state rides
+ * along in `data` for the builds that draw it.
+ */
+function sendPending(res, state) {
+  return res.status(409).json({
+    remark: 'account_pending',
+    status: 'error',
+    message: [state.pending?.message || pendingMessage('timeout')],
+    data: state,
+  });
+}
+
+function stateMessage(state) {
+  if (state.bankAccounts.length) return 'Virtual account is ready';
+  return state.pending ? 'Virtual account is being set up' : 'No virtual account yet';
 }
 
 // A provider's own refusal is often the most useful thing to show ("Invalid
@@ -501,12 +937,8 @@ function sendFailure(res, e, { userId }) {
   console.error('funding.virtual_account.open failed', {
     user_id: Number(userId),
     status: Number(e?.statusCode) || null,
-    // A provider can quote a NIN, a phone or an email back in its error text.
-    // None of those reach a log line.
-    reason: String(e?.message || e)
-      .replace(/[^\s@]+@[^\s@]+/g, '[email]')
-      .replace(/\d{6,}/g, '[digits]')
-      .slice(0, 200),
+    kind: e?.kind || null,
+    reason: redactReason(e?.message || e),
   });
   const out = providerFailure(e);
   return res.status(out.status).json({ remark: out.remark, status: 'error', message: [out.message], data: null });
@@ -519,6 +951,8 @@ function sendFailure(res, e, { userId }) {
  *                                NIN is required unless an approved NIN slip
  *                                already covers it. Any `provider` a client
  *                                sends is ignored - there is only one.
+ *                                200 with the account, 409 account_pending
+ *                                while PalmPay finishes, or the refusal.
  */
 async function virtualAccount(req, res) {
   const user = req.user;
@@ -538,11 +972,12 @@ async function virtualAccount(req, res) {
   try {
     if (String(req.method || '').toUpperCase() !== 'POST') {
       const state = await accountState(user);
-      return sendState(res, state, state.bankAccounts.length ? 'Virtual account is ready' : 'No virtual account yet');
+      return sendState(res, state, stateMessage(state));
     }
 
     // One user, one account: a second tap returns the first.
-    if (await loadAccount(user.id)) {
+    const reg = await loadRegistration(user.id);
+    if (reg.account) {
       return sendState(res, await accountState(user), 'Your funding account is ready');
     }
 
@@ -550,14 +985,24 @@ async function virtualAccount(req, res) {
       throw httpError(503, 'provider_unavailable', 'PalmPay accounts are not available right now. Please try again later.');
     }
 
+    // An earlier send may still be opening the account at PaymentPoint, and
+    // asking again inside the hold would only race it. Answered before the
+    // NIN is read, so a tap from an older build is told to wait, not to type.
+    if (reg.pending && !pendingView(reg.pending).can_retry) {
+      return sendPending(res, await accountState(user));
+    }
+
     const identity = customerIdentity(user);
     const nin = await resolveNin(user, req.body?.nin);
 
+    let refusal = null;
     await withAccountLock(user.id, async () => {
       // Re-read under the lock: a request that looked before another one
-      // committed must find that account, not open a second.
-      if (await loadAccount(user.id)) return;
-      await saveRegistration(user.id, await openPaymentPointAccount(identity, nin));
+      // committed must find that account or attempt, not open a second.
+      const fresh = await loadRegistration(user.id);
+      if (fresh.account) return;
+      if (fresh.pending && !pendingView(fresh.pending).can_retry) return;
+      ({ refusal } = await openAccount({ user, pending: fresh.pending, identity, nin }));
     });
 
     // The one ledger-visible write that does not move money, so it is the one
@@ -568,7 +1013,12 @@ async function virtualAccount(req, res) {
     // for the account.
     cache.dropUserActivity(user.id);
 
-    return sendState(res, await accountState(user), 'Virtual account created successfully');
+    if (refusal) throw refusal;
+
+    const state = await accountState(user);
+    if (state.bankAccounts.length) return sendState(res, state, 'Virtual account created successfully');
+    if (state.pending) return sendPending(res, state);
+    return sendState(res, state, stateMessage(state));
   } catch (e) {
     return sendFailure(res, e, { userId: user.id });
   }
@@ -765,6 +1215,328 @@ async function notifyCredit({ userId, txRef, amount, senderName }) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Accounts PaymentPoint holds that we did not record
+// ---------------------------------------------------------------------------
+
+/** Blind indexes of every stored form of a Nigerian number. */
+function mobileIndexes(phone) {
+  const ng = normalizeNgPhone(phone);
+  if (!ng) return [];
+  return [...new Set([ng.local, ng.msisdn, ng.local.slice(1)])].map(v => blindIndex(v, 'mobile')).filter(Boolean);
+}
+
+/**
+ * The one VoltPay user a PaymentPoint customer's email and phone lead to.
+ *
+ * Both, or nobody: the email and the phone must each lead to exactly one user
+ * - through an attempt that sent them, or the account as it is today - and it
+ * must be the same one. One identifier alone can have changed hands since it
+ * was sent, and money credited to the wrong person is worse than money that
+ * waits for one. The email we mint for an account without one
+ * (`user<id>@voltpay.local`) names its user outright. Never a name.
+ * Returns { userId, via }, { conflict: true } or null.
+ */
+async function userForContact({ email, phone } = {}) {
+  const minted = /^user(\d+)@voltpay\.local$/i.exec(String(email || '').trim());
+  if (minted) {
+    const user = await prisma.user.findUnique({ where: { id: Number(minted[1]) }, select: { id: true, status: true } });
+    return user && !isDeleted(user) ? { userId: Number(user.id), via: 'minted_email' } : null;
+  }
+
+  const emailIdx = email ? blindIndex(email, 'email') : null;
+  const phoneIdxs = phone ? mobileIndexes(phone) : [];
+  if (!emailIdx || !phoneIdxs.length) return null;
+
+  const [sentEmail, sentPhone, byEmail, byPhone] = await Promise.all([
+    prisma.fundingTransaction.findMany({
+      where: { status: REGISTRATION_STATUS, raw_payload: { path: ['email_idx'], equals: emailIdx } },
+      select: { user_id: true },
+      take: 10,
+    }),
+    prisma.fundingTransaction.findMany({
+      where: { status: REGISTRATION_STATUS, OR: phoneIdxs.map(idx => ({ raw_payload: { path: ['phone_idx'], equals: idx } })) },
+      select: { user_id: true },
+      take: 10,
+    }),
+    prisma.user.findMany({ where: { email_idx: emailIdx }, select: { id: true, status: true }, take: 2 }),
+    prisma.user.findMany({ where: { OR: phoneIdxs.map(idx => ({ mobile_idx: idx })) }, select: { id: true, status: true }, take: 5 }),
+  ]);
+
+  const live = users => users.filter(u => !isDeleted(u)).map(u => Number(u.id));
+  const viaEmail = new Set([...sentEmail.map(r => Number(r.user_id)), ...live(byEmail)]);
+  const viaPhone = new Set([...sentPhone.map(r => Number(r.user_id)), ...live(byPhone)]);
+  const everyone = new Set([...viaEmail, ...viaPhone]);
+  if (everyone.size > 1) return { conflict: true };
+  if (viaEmail.size !== 1 || viaPhone.size !== 1) return null;
+
+  const [userId] = everyone;
+  const user = await prisma.user.findUnique({ where: { id: userId }, select: { id: true, status: true } });
+  return user && !isDeleted(user) ? { userId, via: 'email_and_phone' } : null;
+}
+
+/**
+ * Whose a PaymentPoint customer is: by the key we hold (`ppcust_`), by the
+ * account number on a registration, then by userForContact. Returns
+ * { userId, row, via } - `row` the user's registration or pending attempt,
+ * when there is one - or { conflict: true }, or null.
+ */
+async function placeCustomer({ customerId, accountNumber, contact = {} }) {
+  if (customerId) {
+    const row = await prisma.fundingTransaction.findUnique({ where: { tx_ref: `ppcust_${customerId}` } });
+    if (row?.status === REGISTRATION_STATUS) return { userId: Number(row.user_id), row, via: 'customer_id' };
+  }
+  if (accountNumber) {
+    const row = await prisma.fundingTransaction.findFirst({
+      where: { status: REGISTRATION_STATUS, raw_payload: { path: ['account_number'], equals: accountNumber } },
+    });
+    if (row) return { userId: Number(row.user_id), row, via: 'account_number' };
+  }
+  const who = await userForContact(contact);
+  if (!who?.userId) return who;
+  const reg = await loadRegistration(who.userId);
+  return { userId: who.userId, row: reg.account?.row || reg.pending || null, via: who.via };
+}
+
+/**
+ * Write down that `customerId` (and `account`, when known) is this user's,
+ * on `row` or a new one. A user whose account is already showing keeps it -
+ * one account on screen - and only learns a customer id it never had.
+ * Returns { attached } - true when the user's account just became ready.
+ */
+async function recordCustomer({ userId, row, customerId, account }) {
+  if (row && accountView(row)) {
+    if (customerId && !payloadOf(row).customer_id && String(row.tx_ref).startsWith(ATTEMPT_PREFIX)) {
+      await keyAndWrite(row, customerId, r =>
+        accountView(r) && !payloadOf(r).customer_id ? { raw_payload: { ...payloadOf(r), customer_id: customerId } } : null,
+      );
+    }
+    return { attached: false };
+  }
+
+  const target = row || (await createAttempt(userId, { requested_at: new Date().toISOString(), sends: 0, last_outcome: 'provider_pending' }));
+  if (!account) {
+    await markPending(target, { outcome: 'provider_pending', customerId });
+    return { attached: false };
+  }
+  const out = await attachAccount(target, { customerId, account });
+  if (out.conflict && !row) await dropAttempt(target);
+  return { attached: Boolean(out.changed), conflict: Boolean(out.conflict) };
+}
+
+function notifyAccountReady(userId) {
+  return notifyUser({
+    userId: Number(userId),
+    subject: 'Your account number is ready',
+    message: 'Your PalmPay account number is ready. Open Fund Account to see it and fund your wallet.',
+    type: 'funding_account',
+    data: { type: 'funding_account' },
+    pushData: { type: 'funding_account' },
+    // One account per user, so once per user ever - a redelivered event or a
+    // second reconcile run cannot announce it twice.
+    clientMessageId: `va_ready:${Number(userId)}`,
+  }).catch(() => false);
+}
+
+/**
+ * Link an account PaymentPoint holds to the VoltPay user it belongs to - from
+ * an account event, or a row of PaymentPoint's export (`--apply` only).
+ * Outcomes: linked, would_link, already_linked, has_other_account,
+ * unmatched, conflict, invalid.
+ */
+async function linkProviderAccount({ customerId = '', account, contact = {} }, { apply = false } = {}) {
+  if (!account?.accountNumber) return { outcome: 'invalid' };
+  const placed = await placeCustomer({ customerId, accountNumber: account.accountNumber, contact });
+  if (!placed) return { outcome: 'unmatched' };
+  if (placed.conflict) return { outcome: 'conflict' };
+
+  const { userId, via } = placed;
+  const showing = placed.row && accountView(placed.row) ? placed.row : (await loadRegistration(userId)).account?.row;
+  if (showing) {
+    const same = accountView(showing).accountNumber === account.accountNumber;
+    if (same && apply) await recordCustomer({ userId, row: showing, customerId, account });
+    return { outcome: same ? 'already_linked' : 'has_other_account', userId, via };
+  }
+  if (!apply) return { outcome: 'would_link', userId, via };
+
+  const recorded = await recordCustomer({ userId, row: placed.row, customerId, account });
+  if (recorded.conflict) return { outcome: 'conflict', userId };
+  if (recorded.attached) {
+    await notifyAccountReady(userId);
+    cache.dropUserActivity(userId);
+  }
+  return { outcome: recorded.attached ? 'linked' : 'already_linked', userId, via };
+}
+
+/**
+ * A webhook that carries an account and no money: PaymentPoint finishing an
+ * account after its create call answered - or after that answer was lost.
+ * True when it was one, whether or not it could be placed.
+ */
+async function accountEvent(body) {
+  const found = paymentpoint.extractVirtualAccount(body, { preferBankCode: parsePaymentPointBankCodes()[0] });
+  if (!found.account) return false;
+
+  const envelope = body?.data && typeof body.data === 'object' ? body.data : body;
+  const result = await linkProviderAccount(
+    { customerId: found.customerId, account: found.account, contact: paymentpoint.customerContact(envelope) },
+    { apply: true },
+  );
+  console.log('PaymentPoint webhook: account event', {
+    outcome: result.outcome,
+    user_id: result.userId ?? null,
+    has_customer_id: Boolean(found.customerId),
+  });
+  if (result.outcome === 'unmatched' || result.outcome === 'conflict') {
+    paymentFailure({
+      provider: 'paymentpoint',
+      action: 'virtual_account',
+      reference: found.customerId ? `ppcust_${found.customerId}` : null,
+      message: `PaymentPoint sent an account we could not place (${result.outcome}). Check PaymentPoint's dashboard, then npm run funding:reconcile.`,
+      context: { outcome: result.outcome },
+    });
+  }
+  return true;
+}
+
+/** Best effort: the credit never waits on this, and the next payment retries it. */
+async function recordFromPayment({ userId, row, customerId, receiver }) {
+  try {
+    const recorded = await recordCustomer({ userId, row, customerId, account: receiver });
+    if (recorded.attached) {
+      notifyAccountReady(userId);
+      cache.dropUserActivity(userId);
+    }
+  } catch (e) {
+    console.error('PaymentPoint webhook: could not record customer', { user_id: Number(userId), reason: redactReason(e?.message) });
+  }
+}
+
+/**
+ * Whose wallet a payment for `customerId` credits, as a row with `user_id`,
+ * or null.
+ *
+ * Usually the `ppcust_` registration. A pending one learns its account from
+ * the payment, which names the account it landed in. A customer id we hold
+ * nothing for is an account PaymentPoint opened after its create call
+ * stopped waiting: placed by that account number, or by the email AND phone
+ * PaymentPoint was sent, and recorded so the next payment is one lookup.
+ * Nobody is credited on a guess - ops are paged with ids and the amount, and
+ * the money waits at PaymentPoint for a person.
+ */
+async function ownerOfPayment(payload, customerId, { reference, amount }) {
+  const receiver = paymentpoint.receiverAccount(payload);
+  const known = await prisma.fundingTransaction.findUnique({ where: { tx_ref: `ppcust_${customerId}` } });
+  if (known) {
+    if (isPendingRow(known) && receiver) await recordFromPayment({ userId: known.user_id, row: known, customerId, receiver });
+    return known;
+  }
+
+  const placed = await placeCustomer({
+    customerId: '',
+    accountNumber: receiver?.accountNumber || '',
+    contact: paymentpoint.customerContact(payload),
+  });
+
+  if (!placed?.userId) {
+    console.log('PaymentPoint webhook: payment for a customer we cannot place', {
+      customer_id: String(customerId),
+      conflict: Boolean(placed?.conflict),
+    });
+    paymentFailure({
+      provider: 'paymentpoint',
+      action: 'funding',
+      reference,
+      amount: amount.toString(),
+      message: placed?.conflict
+        ? 'Payment for a PaymentPoint customer whose details lead to more than one VoltPay user - not credited'
+        : 'Payment for a PaymentPoint customer with no VoltPay registration - not credited',
+      context: { customer_id: String(customerId) },
+    });
+    return null;
+  }
+
+  await recordFromPayment({ userId: placed.userId, row: placed.row, customerId, receiver });
+  console.log('PaymentPoint webhook: payment placed', { user_id: placed.userId, via: placed.via });
+  return { user_id: placed.userId };
+}
+
+// ---- the sweep ----------------------------------------------------------------
+
+const nudgeAfterMs = () => Math.max(60_000, Number(process.env.FUNDING_VA_NUDGE_AFTER_MS) || 10 * 60_000);
+const alertAfterMs = () => Math.max(60_000, Number(process.env.FUNDING_VA_ALERT_AFTER_MS) || 30 * 60_000);
+
+// Outcomes a customer's own retry can finish. Not the two where PaymentPoint
+// has the account or is making it: tapping again cannot help there.
+const RETRYABLE = new Set(['timeout', 'network', 'server_error', 'unreadable', 'no_account', 'refused', 'unavailable']);
+
+function notifyRetry(userId, rowId, sends) {
+  return notifyUser({
+    userId: Number(userId),
+    subject: 'Finish getting your account number',
+    message: 'PalmPay has not confirmed your account number yet. Open Fund Account and tap Try Again to finish.',
+    type: 'funding_account',
+    data: { type: 'funding_account' },
+    pushData: { type: 'funding_account' },
+    clientMessageId: `va_retry:${rowId}:${Number(sends) || 0}`,
+  }).catch(() => false);
+}
+
+/**
+ * The part of finishing a pending account that needs neither PaymentPoint's
+ * webhook nor the customer: tell a customer whose retry would finish it (the
+ * NIN is theirs to send again - it is never stored), and page ops about any
+ * attempt nothing has resolved, once each. The webhook and the customer's tap
+ * are what actually finish them. A 5-minute timer in server.js.
+ */
+async function sweepPendingAccounts({ now = Date.now(), limit = 200 } = {}) {
+  // Newest first. A row stays pending after it has been nudged and paged, so
+  // oldest-first would let finished-with rows fill the window for good.
+  const rows = await prisma.fundingTransaction.findMany({
+    where: { status: REGISTRATION_STATUS, raw_payload: { path: ['state'], equals: PENDING } },
+    orderBy: { id: 'desc' },
+    take: limit,
+  });
+
+  const out = { pending: 0, nudged: 0, alerted: 0 };
+  const overdue = [];
+  for (const row of rows) {
+    if (!isPendingRow(row)) continue;
+    out.pending += 1;
+    const p = payloadOf(row);
+    const age = now - msOf(p.requested_at, msOf(row.created_at, now));
+    let current = row;
+
+    if (age >= nudgeAfterMs() && !p.nudged_at && RETRYABLE.has(outcomeOf(row, now)) && pendingView(row, now).can_retry) {
+      const stamped = await stampOnce(current, 'nudged_at');
+      if (stamped.changed) {
+        out.nudged += 1;
+        current = stamped.row;
+        await notifyRetry(row.user_id, row.id, p.sends);
+      }
+    }
+
+    if (current && age >= alertAfterMs() && !payloadOf(current).alerted_at) {
+      const stamped = await stampOnce(current, 'alerted_at');
+      if (stamped.changed) overdue.push(current);
+    }
+  }
+
+  if (overdue.length) {
+    out.alerted = overdue.length;
+    paymentFailure({
+      provider: 'paymentpoint',
+      action: 'virtual_account',
+      reference: `va:${overdue.length}`,
+      message:
+        `${overdue.length} PalmPay account request(s) unresolved after ${Math.round(alertAfterMs() / 60_000)} min. ` +
+        "PaymentPoint may hold accounts we never recorded: export PaymentPoint's customers and run npm run funding:reconcile -- --file <export>",
+      context: { row_ids: overdue.slice(0, 20).map(r => r.id) },
+    });
+  }
+  return out;
+}
+
 async function webhook(req, res) {
   try {
     if (!prisma.fundingTransaction) {
@@ -798,6 +1570,15 @@ async function webhook(req, res) {
 
     const root = req.body || {};
     const payload = root?.data && typeof root.data === 'object' ? root.data : root;
+
+    // An account and nothing payment-shaped: PaymentPoint finishing an account
+    // opened with a NIN. Checked before the payment test, which an event
+    // saying `status: success` would otherwise pass and then be dropped for
+    // having no amount.
+    if (!looksLikePayment(root) && !looksLikePayment(payload) && (await accountEvent(root))) {
+      return res.status(200).json({ received: true });
+    }
+
     if (!isSuccessfulPaymentPointPayload(root) && !isSuccessfulPaymentPointPayload(payload)) {
       console.log('PaymentPoint webhook ignored (not successful)', {
         keys: Object.keys(payload || {}),
@@ -821,15 +1602,7 @@ async function webhook(req, res) {
       payload?.id ||
       payload?.reference;
 
-    const grossAmountDec = normalizeAmountToDecimal(
-      payload?.amount_paid ??
-        payload?.amountPaid ??
-        payload?.amount ??
-        payload?.transaction_amount ??
-        payload?.transactionAmount ??
-        payload?.transaction?.amount ??
-        payload?.transaction?.transaction_amount
-    );
+    const grossAmountDec = grossAmountOf(payload);
 
     const settlementAmountDec = normalizeAmountToDecimal(
       payload?.settlement_amount ?? payload?.settlementAmount ?? payload?.settled_amount ?? payload?.settledAmount
@@ -854,16 +1627,12 @@ async function webhook(req, res) {
       return res.status(200).json({ received: true });
     }
 
-    const virtualRef = `ppcust_${String(customerId)}`;
-    const vaRecord = await prisma.fundingTransaction.findUnique({ where: { tx_ref: virtualRef } });
+    const tx_ref = `pp_${String(transactionId)}`;
+    const vaRecord = await ownerOfPayment(payload, String(customerId), { reference: tx_ref, amount: creditAmountDec });
     if (!vaRecord) {
-      console.log('PaymentPoint webhook ignored (virtual account not found)', {
-        virtualRef,
-      });
       return res.status(200).json({ received: true });
     }
 
-    const tx_ref = `pp_${String(transactionId)}`;
     const creditAmount = creditAmountDec;
     const grossAmount = grossAmountDec || creditAmount;
     const feeAmount = settlementFeeDec || new Prisma.Decimal('0.00');
@@ -945,6 +1714,13 @@ module.exports = {
   formatNaira,
   // exported for test/fundingNin.test.js
   cleanNin,
+  // the 5-minute timer in server.js
+  sweepPendingAccounts,
+  // scripts/reconcile-paymentpoint-accounts.js
+  linkProviderAccount,
+  pendingView,
+  isPendingRow,
+  REGISTRATION_STATUS,
   // exported for test/fundingAccounts.test.js
-  __test: { accountView, providerFailure, readableProviderText },
+  __test: { accountView, providerFailure, readableProviderText, classifyCreate, userForContact },
 };
